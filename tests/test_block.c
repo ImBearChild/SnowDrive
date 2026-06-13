@@ -179,6 +179,55 @@ void test_block_read_capacity(void) {
   TEST_ASSERT_EQUAL_UINT32(512, block_size);
 }
 
+void test_block_read_capacity_16(void) {
+  uint8_t cdb[16];
+  memset(cdb, 0, 16);
+  cdb[0] = SNOWSCSI_OP_SERVICE_ACTION_IN;
+  cdb[1] = 0x10;
+  cdb[10] = 0x00;
+  cdb[11] = 0x00;
+  cdb[12] = 0x00;
+  cdb[13] = 0x20;
+
+  uint32_t xfer;
+  snowscsi_result_t r = snowscsi_do_cmd(dev, cdb, 16, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_DATA_IN, r);
+  TEST_ASSERT_EQUAL(32, (int)xfer);
+
+  uint8_t buf[32];
+  int n = snowscsi_read_data(dev, buf, 32);
+  TEST_ASSERT_EQUAL(32, n);
+
+  /* 1MB / 512 = 2048 sectors, max_lba = 2047 = 0x00000000000007FF */
+  uint8_t expected_lba[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xFF};
+  TEST_ASSERT_EQUAL_MEMORY(expected_lba, buf, 8);
+
+  /* Block length = 512 = 0x00000200 */
+  uint8_t expected_blk[4] = {0x00, 0x00, 0x02, 0x00};
+  TEST_ASSERT_EQUAL_MEMORY(expected_blk, buf + 8, 4);
+
+  /* Bytes 12-31: protection / reserved — all zero */
+  uint8_t zeros[20];
+  memset(zeros, 0, 20);
+  TEST_ASSERT_EQUAL_MEMORY(zeros, buf + 12, 20);
+}
+
+void test_block_read_capacity_16_unknown_sa(void) {
+  uint8_t cdb[16];
+  memset(cdb, 0, 16);
+  cdb[0] = SNOWSCSI_OP_SERVICE_ACTION_IN;
+  cdb[1] = 0xFF;
+
+  uint32_t xfer;
+  snowscsi_result_t r = snowscsi_do_cmd(dev, cdb, 16, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_CHECK_CONDITION, r);
+
+  snowscsi_sense_t s;
+  snowscsi_device_get_sense(dev, &s);
+  TEST_ASSERT_EQUAL(SNOWSCSI_SENSE_ILLEGAL_REQUEST, s.key);
+  TEST_ASSERT_EQUAL_HEX8(SNOWSCSI_ASC_INVALID_FIELD, s.asc);
+}
+
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -191,5 +240,7 @@ int main(void) {
   RUN_TEST(test_block_test_unit_ready);
   RUN_TEST(test_block_request_sense);
   RUN_TEST(test_block_read_capacity);
+  RUN_TEST(test_block_read_capacity_16);
+  RUN_TEST(test_block_read_capacity_16_unknown_sa);
   return UNITY_END();
 }

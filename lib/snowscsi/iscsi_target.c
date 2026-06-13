@@ -273,7 +273,6 @@ static int send_scsi_response(const snowscsi_transport_ops_t *t, void *ctx,
   uint32_t data_len = 0;
   if (scsi_status == SNOWSCSI_ISCSI_SCSI_STATUS_CHECK_CONDITION && sense) {
     build_sense_data(sense_buf, sense);
-    snowscsi_iscsi_bhs_set_sense_len(bhs, 18);
     data_len = 18;
   }
 
@@ -628,20 +627,30 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
                            snowscsi_device_t **devs, int num_devs,
                            uint32_t *stat_sn, uint32_t *cmd_sn) {
   uint8_t lun = snowscsi_iscsi_bhs_get_lun(bhs);
+  uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
+  uint8_t cdb[16];
+  uint8_t cdb_len;
+  snowscsi_iscsi_bhs_get_cdb(bhs, cdb, &cdb_len);
+  uint8_t opcode = cdb_len > 0 ? cdb[0] : 0;
+
   if (lun >= (uint8_t)num_devs) {
-    /* Invalid LUN — just reject with format error */
+    SNOW_LOGW("invalid LUN %u for opcode=0x%02x itt=0x%x", lun, opcode, itt);
     return send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR,
                        *stat_sn, *cmd_sn + 1);
   }
 
   snowscsi_device_t *dev = devs[lun];
-  uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
-  uint8_t cdb[16];
-  uint8_t cdb_len;
-  snowscsi_iscsi_bhs_get_cdb(bhs, cdb, &cdb_len);
 
   uint32_t transfer_len = 0;
   snowscsi_result_t r = snowscsi_do_cmd(dev, cdb, cdb_len, &transfer_len);
+
+  SNOW_LOGD("scsi_cmd: %s(0x%02x) lun=%u itt=0x%x result=%s%s",
+            snowscsi_cdb_opcode_name(opcode), opcode, lun, itt,
+            r == SNOWSCSI_STATUS ? "STATUS" :
+            r == SNOWSCSI_DATA_IN ? "DATA_IN" :
+            r == SNOWSCSI_DATA_OUT ? "DATA_OUT" :
+            r == SNOWSCSI_CHECK_CONDITION ? "CHECK_CONDITION" : "UNKNOWN",
+            r == SNOWSCSI_CHECK_CONDITION ? " (see block log for sense)" : "");
 
   switch (r) {
   case SNOWSCSI_STATUS:
@@ -657,9 +666,11 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
   }
 
   case SNOWSCSI_DATA_IN:
+    SNOW_LOGV("scsi_cmd: DATA_IN transfer_len=%u", transfer_len);
     return handle_data_in(t, ctx, conn, dev, itt, stat_sn, cmd_sn);
 
   case SNOWSCSI_DATA_OUT:
+    SNOW_LOGV("scsi_cmd: DATA_OUT transfer_len=%u", transfer_len);
     return handle_data_out(t, ctx, conn, dev, itt, stat_sn, cmd_sn,
                            transfer_len);
   }

@@ -210,8 +210,7 @@ void snowscsi_iscsi_bhs_set_lun(uint8_t bhs[48], uint8_t lun) {
 
 void snowscsi_iscsi_bhs_get_cdb(const uint8_t bhs[48], uint8_t *cdb,
                                 uint8_t *cdb_len) {
-  *cdb_len =
-      snowscsi_iscsi_cdb_len_from_opcode(snowscsi_iscsi_bhs_get_opcode(bhs));
+  *cdb_len = snowscsi_iscsi_cdb_len_from_opcode(bhs[32]);
   uint8_t len = *cdb_len;
   if (len > 16)
     len = 16;

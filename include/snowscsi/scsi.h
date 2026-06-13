@@ -11,6 +11,7 @@
 #define SNOWSCSI_OP_READ_CAPACITY_10 0x25
 #define SNOWSCSI_OP_READ_10 0x28
 #define SNOWSCSI_OP_WRITE_10 0x2A
+#define SNOWSCSI_OP_SERVICE_ACTION_IN 0x9E
 
 /* ── Sense Keys ────────────────────────────────────────────────── */
 
@@ -51,5 +52,7 @@ void snowscsi_sense_clear(snowscsi_sense_t *s);
 uint8_t snowscsi_cdb_get_opcode(const uint8_t *cdb);
 uint32_t snowscsi_cdb_get_lba10(const uint8_t *cdb);
 uint16_t snowscsi_cdb_get_transfer_len10(const uint8_t *cdb);
+
+const char *snowscsi_cdb_opcode_name(uint8_t opcode);
 
 #endif

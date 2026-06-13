@@ -63,7 +63,6 @@ void test_iscsi_scsi_resp_fields(void) {
   snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_SCSI_RESP);
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
   snowscsi_iscsi_bhs_set_status(bhs, SNOWSCSI_ISCSI_SCSI_STATUS_GOOD);
-  snowscsi_iscsi_bhs_set_sense_len(bhs, 18);
   snowscsi_iscsi_bhs_resp_set_stat_sn(bhs, stat_sn);
   snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(bhs, exp_cmd_sn);
   snowscsi_iscsi_bhs_resp_set_max_cmd_sn(bhs, max_cmd_sn);
@@ -74,7 +73,7 @@ void test_iscsi_scsi_resp_fields(void) {
                          snowscsi_iscsi_bhs_get_opcode(bhs));
   TEST_ASSERT_EQUAL_UINT32(itt, snowscsi_iscsi_bhs_get_itt(bhs));
   TEST_ASSERT_EQUAL_HEX8(SNOWSCSI_ISCSI_SCSI_STATUS_GOOD, bhs[3]);
-  TEST_ASSERT_EQUAL_HEX8(18, bhs[2]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[2]);
   TEST_ASSERT_EQUAL_UINT32(stat_sn, snowscsi_iscsi_bhs_resp_get_stat_sn(bhs));
   TEST_ASSERT_EQUAL_UINT32(exp_cmd_sn,
                            snowscsi_iscsi_bhs_resp_get_exp_cmd_sn(bhs));

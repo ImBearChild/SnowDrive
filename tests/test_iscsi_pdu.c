@@ -242,8 +242,8 @@ void test_iscsi_pdu_cdb(void) {
   uint8_t bhs[48];
   memset(bhs, 0, 48);
 
-  /* Set a READ(10) opcode + CDB (LBA=1, transfer_len=1) */
-  snowscsi_iscsi_bhs_set_opcode(bhs, 0x28); /* READ(10) */
+  /* iSCSI PDU opcode is SCSI_CMD (0x01), CDB opcode is READ(10) at BHS[32] */
+  snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_SCSI_CMD);
   /* cdb[0]=0x28 opcode, cdb[1]=0 reserved,
    * cdb[2-5]=LBA (big-endian, LBA=1), cdb[6]=0 reserved,
    * cdb[7-8]=transfer_len (big-endian, len=1), cdb[9]=0 */
@@ -365,6 +365,38 @@ void test_iscsi_pdu_reject(void) {
   TEST_ASSERT_EQUAL_HEX8(SNOWSCSI_ISCSI_REJECT_CMD_SN, bhs[2]);
 }
 
+void test_iscsi_pdu_cdb_service_action_in(void) {
+  uint8_t bhs[48];
+  memset(bhs, 0, 48);
+
+  snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_SCSI_CMD);
+  /* SERVICE ACTION IN (0x9e) with READ CAPACITY 16 (0x10) */
+  bhs[32] = 0x9e;
+  bhs[33] = 0x10;
+  bhs[34] = 0x00;
+  bhs[35] = 0x00;
+  bhs[36] = 0x00;
+  bhs[37] = 0x00;
+  bhs[38] = 0x00;
+  bhs[39] = 0x00;
+  bhs[40] = 0x00;
+  bhs[41] = 0x00;
+  bhs[42] = 0x00;
+  bhs[43] = 0x00;
+  bhs[44] = 0x00;
+  bhs[45] = 0x20;
+  bhs[46] = 0x00;
+  bhs[47] = 0x00;
+
+  uint8_t cdb[16];
+  uint8_t cdb_len;
+  snowscsi_iscsi_bhs_get_cdb(bhs, cdb, &cdb_len);
+  TEST_ASSERT_EQUAL_UINT8(16, cdb_len);
+  TEST_ASSERT_EQUAL_HEX8(0x9E, cdb[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x10, cdb[1]);
+  TEST_ASSERT_EQUAL_HEX8(0x20, cdb[13]);
+}
+
 /* ── test_iscsi_pdu_cdb_len_from_opcode ────────────────────────── */
 
 void test_iscsi_pdu_cdb_len_from_opcode(void) {
@@ -477,6 +509,7 @@ int main(void) {
   RUN_TEST(test_iscsi_pdu_t_bit);
   RUN_TEST(test_iscsi_pdu_lun);
   RUN_TEST(test_iscsi_pdu_cdb);
+  RUN_TEST(test_iscsi_pdu_cdb_service_action_in);
   RUN_TEST(test_iscsi_pdu_scsi_status);
   RUN_TEST(test_iscsi_pdu_scsi_sense_len);
   RUN_TEST(test_iscsi_pdu_data_sn);
