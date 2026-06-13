@@ -44,6 +44,36 @@ feat(api)!: change snowscsi_do_cmd return type
 BREAKING CHANGE: snowscsi_do_cmd now returns snowscsi_result_t instead of int.
 ```
 
+## Building
+
+```bash
+cmake -B build && cmake --build build
+```
+
+To build with tests:
+
+```bash
+cmake -B build -DBUILD_TESTS=ON && cmake --build build
+```
+
+## Testing
+
+```bash
+cd build && ctest --output-on-failure
+```
+
+Run a specific test:
+
+```bash
+cd build && ./tests/test_block
+```
+
+## Pre-commit Workflow
+
+1. Build: `cmake --build build`
+2. Run all tests: `cd build && ctest --output-on-failure`
+3. Format code (see Code Formatting section)
+
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org/).
