@@ -8,25 +8,136 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── Fixed login negotiation parameters ───────────────────────────
- *  We do not parse initiator keys; we always respond with this fixed
- *  set. The initiator MUST accept them.
- *  Each key=value pair is null-terminated.                               */
+#define LOGIN_RESP_MAX 4096
 
-static const char LOGIN_PARAMS[] =
-    "TargetName=iqn.2025-01.local.snowscsi:target\0"
-    "TargetAlias=SnowSCSI\0"
-    "MaxConnections=1\0"
-    "InitialR2T=Yes\0"
-    "ImmediateData=Yes\0"
-    "MaxRecvDataSegmentLength=8192\0"
-    "MaxBurstLength=262144\0"
-    "FirstBurstLength=65536\0"
-    "MaxOutstandingR2T=1\0"
-    "ErrorRecoveryLevel=0\0"
-    "TargetPortalGroupTag=1\0";
+/* ── Login parameter negotiation ─────────────────────────────────── */
 
-static const uint32_t LOGIN_PARAMS_LEN = sizeof(LOGIN_PARAMS) - 1;
+typedef struct {
+  const char *key;
+  const char *value; /* NULL = accept initiator value */
+  bool always;       /* output this key even if initiator didn't send it */
+} login_param_t;
+
+static const login_param_t LOGIN_TABLE[] = {
+    {"TargetName", "iqn.1970-01.local.snowscsi:target", true},
+    {"TargetAlias", "SnowSCSI", true},
+    {"AuthMethod", "None", false},
+    {"HeaderDigest", "None", false},
+    {"DataDigest", "None", false},
+    {"InitialR2T", NULL, false},
+    {"ImmediateData", "Yes", false},
+    {"MaxBurstLength", NULL, false},
+    {"FirstBurstLength", NULL, false},
+    {"MaxRecvDataSegmentLength", NULL, false},
+    {"MaxOutstandingR2T", "1", false},
+    {"ErrorRecoveryLevel", "0", false},
+    {"MaxConnections", "1", false},
+    {"TargetPortalGroupTag", "1", false},
+    {"DataPDUInOrder", NULL, false},
+    {"DataSequenceInOrder", NULL, false},
+    {"DefaultTime2Wait", NULL, false},
+    {"DefaultTime2Retain", NULL, false},
+    {"IFMarker", NULL, false},
+    {"OFMarker", NULL, false},
+};
+
+enum { LOGIN_TABLE_SIZE = sizeof(LOGIN_TABLE) / sizeof(LOGIN_TABLE[0]) };
+
+static bool is_initiator_only(const char *key) {
+  const char *list[] = {"InitiatorName", "SessionType", NULL};
+  for (int i = 0; list[i]; i++)
+    if (strcmp(key, list[i]) == 0)
+      return true;
+  return false;
+}
+
+static int login_find_key(const char *key) {
+  for (int i = 0; i < (int)LOGIN_TABLE_SIZE; i++)
+    if (strcmp(key, LOGIN_TABLE[i].key) == 0)
+      return i;
+  return -1;
+}
+
+static char *login_build_resp(const uint8_t *idata, uint32_t ilen,
+                              uint32_t *out_len) {
+  char *buf = malloc(LOGIN_RESP_MAX);
+  if (!buf)
+    return NULL;
+
+  uint32_t w = 0;
+
+#define APPEND_KV(k, v)                                                        \
+  do {                                                                         \
+    size_t kl = strlen(k), vl = strlen(v);                                     \
+    if (w + kl + 1 + vl + 1 <= LOGIN_RESP_MAX) {                               \
+      memcpy(buf + w, k, kl);                                                  \
+      w += (uint32_t)kl;                                                       \
+      buf[w++] = '=';                                                          \
+      memcpy(buf + w, v, vl);                                                  \
+      w += (uint32_t)vl;                                                       \
+      buf[w++] = '\0';                                                         \
+    }                                                                          \
+  } while (0)
+
+  bool sent[LOGIN_TABLE_SIZE];
+  memset(sent, 0, sizeof(sent));
+
+  const uint8_t *p = idata;
+  const uint8_t *end = idata + ilen;
+  while (p < end) {
+    const uint8_t *eq = (const uint8_t *)memchr(p, '=', (size_t)(end - p));
+    if (!eq)
+      break;
+    const uint8_t *nul =
+        (const uint8_t *)memchr(eq + 1, '\0', (size_t)(end - eq - 1));
+    if (!nul) {
+      nul = end;
+    }
+
+    size_t klen = (size_t)(eq - p);
+    size_t vlen = (size_t)(nul - eq - 1);
+
+    char *k = (char *)malloc(klen + 1);
+    char *v = (char *)malloc(vlen + 1);
+    if (!k || !v) {
+      free(k);
+      free(v);
+      break;
+    }
+    memcpy(k, p, klen);
+    k[klen] = '\0';
+    memcpy(v, eq + 1, vlen);
+    v[vlen] = '\0';
+
+    int idx = login_find_key(k);
+    if (idx >= 0) {
+      sent[idx] = true;
+      const char *usev = LOGIN_TABLE[idx].value;
+      if (usev == NULL) {
+        APPEND_KV(k, v);
+      } else {
+        APPEND_KV(k, usev);
+      }
+    } else if (!is_initiator_only(k)) {
+      APPEND_KV(k, "Reject");
+    }
+
+    free(k);
+    free(v);
+
+    p = nul + 1;
+    if (nul == end)
+      break;
+  }
+
+  for (int i = 0; i < (int)LOGIN_TABLE_SIZE; i++) {
+    if (LOGIN_TABLE[i].always && !sent[i])
+      APPEND_KV(LOGIN_TABLE[i].key, LOGIN_TABLE[i].value);
+  }
+
+  *out_len = w;
+  return buf;
+}
 
 /* ── I/O helpers ────────────────────────────────────────────────── */
 
@@ -62,6 +173,16 @@ static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
       remain -= chunk;
     }
   }
+
+  /* Consume PDU padding to 4-byte boundary (RFC 3720 §3.1) */
+  uint32_t pdu_len = 48 + dsl;
+  uint32_t pad = (4 - (pdu_len & 3)) & 3;
+  if (pad > 0) {
+    uint8_t junk[4];
+    if (t_recv(t, ctx, conn, junk, pad) < 0)
+      return -1;
+  }
+
   return 0;
 }
 
@@ -70,11 +191,22 @@ static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
 static int send_pdu(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
                     const uint8_t bhs[48], const void *data,
                     uint32_t data_len) {
-  if (t_send(t, ctx, conn, bhs, 48) < 0)
+  /* Assemble complete PDU in a single buffer (BHS + data + padding)
+   * to avoid TCP framing issues from multiple send calls. */
+  uint32_t total = 48 + data_len;
+  uint32_t pad = (4 - (total & 3)) & 3;
+  uint32_t buf_len = total + pad;
+  uint8_t buf[48 + SNOWSCSI_ISCSI_MAX_DATA_SEGMENT + 3];
+  if (buf_len > sizeof(buf))
     return -1;
-  if (data_len > 0 && t_send(t, ctx, conn, data, data_len) < 0)
-    return -1;
-  return 0;
+
+  memcpy(buf, bhs, 48);
+  if (data_len > 0)
+    memcpy(buf + 48, data, data_len);
+  if (pad > 0)
+    memset(buf + total, 0, pad);
+
+  return t_send(t, ctx, conn, buf, buf_len);
 }
 
 /* ── Build sense data (18 bytes, fixed format) ──────────────────── */
@@ -99,6 +231,7 @@ static int send_scsi_response(const snowscsi_transport_ops_t *t, void *ctx,
 
   snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_SCSI_RESP);
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
+  bhs[1] |= 0x80; /* libiscsi expects this bit set on SCSI Response */
 
   uint32_t exp_cmd_sn = *cmd_sn + 1;
   snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(bhs, exp_cmd_sn);
@@ -144,11 +277,10 @@ static int send_data_in(const snowscsi_transport_ops_t *t, void *ctx,
   if (with_status) {
     bhs[1] |= SNOWSCSI_ISCSI_FLAG_DATA_STATUS;
     snowscsi_iscsi_bhs_set_status(bhs, SNOWSCSI_ISCSI_SCSI_STATUS_GOOD);
-    /* Data-In uses notify-style offsets: StatSN=24-27, ExpCmdSN=28-31,
-     * MaxCmdSN=32-35 */
-    snowscsi_iscsi_bhs_notify_set_stat_sn(bhs, stat_sn);
-    snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(bhs, exp_cmd_sn);
-    snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, exp_cmd_sn);
+    /* Data-In with S=1: StatSN=36-39, ExpCmdSN=40-43, MaxCmdSN=44-47 */
+    snowscsi_iscsi_bhs_data_in_set_stat_sn(bhs, stat_sn);
+    snowscsi_iscsi_bhs_data_in_set_exp_cmd_sn(bhs, exp_cmd_sn);
+    snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(bhs, exp_cmd_sn);
   }
 
   return send_pdu(t, ctx, conn, bhs, data, data_len);
@@ -221,44 +353,125 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
     return -1;
 
   uint8_t op = snowscsi_iscsi_bhs_get_opcode(bhs);
+  uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
+  fprintf(stderr, "do_login: op=0x%02x dsl=%u\n", op, dsl);
+  fprintf(stderr, "  ver-max=%u ver-min=%u\n", bhs[2], bhs[3]);
+  fprintf(stderr, "  ISID=%02x%02x%02x%02x%02x%02x\n", bhs[8], bhs[9], bhs[10],
+          bhs[11], bhs[12], bhs[13]);
+  fprintf(stderr, "  TSIH=%u ITT=0x%08x CID=0x%08x CmdSN=%u ExpStatSN=%u\n",
+          ((uint32_t)bhs[16] << 24) | ((uint32_t)bhs[17] << 16) |
+              ((uint32_t)bhs[18] << 8) | (uint32_t)bhs[19],
+          ((uint32_t)bhs[20] << 24) | ((uint32_t)bhs[21] << 16) |
+              ((uint32_t)bhs[22] << 8) | (uint32_t)bhs[23],
+          ((uint32_t)bhs[24] << 24) | ((uint32_t)bhs[25] << 16) |
+              ((uint32_t)bhs[26] << 8) | (uint32_t)bhs[27],
+          ((uint32_t)bhs[28] << 24) | ((uint32_t)bhs[29] << 16) |
+              ((uint32_t)bhs[30] << 8) | (uint32_t)bhs[31],
+          ((uint32_t)bhs[32] << 24) | ((uint32_t)bhs[33] << 16) |
+              ((uint32_t)bhs[34] << 8) | (uint32_t)bhs[35]);
+  fprintf(stderr, "  T=%d CSG=%u NSG=%u\n", snowscsi_iscsi_bhs_get_t_bit(bhs),
+          snowscsi_iscsi_bhs_get_csg(bhs), snowscsi_iscsi_bhs_get_nsg(bhs));
   if (op != SNOWSCSI_ISCSI_OP_LOGIN_REQ)
     return -1;
 
-  /* Discard DataSegment (we don't parse initiator keys) */
-  uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
-  if (dsl > 0) {
-    uint8_t *discard = malloc(dsl);
-    if (discard) {
-      t_recv(t, ctx, conn, discard, dsl);
-      free(discard);
+  /* Read initiator DataSegment for parameter negotiation */
+  uint8_t *idata = NULL;
+  if (dsl > 0 && dsl <= LOGIN_RESP_MAX) {
+    idata = malloc(dsl);
+    if (idata) {
+      if (t_recv(t, ctx, conn, idata, dsl) < 0) {
+        free(idata);
+        return -1;
+      }
+      for (uint32_t i = 0; i < dsl; i++)
+        if (idata[i] == '\0')
+          fprintf(stderr, "\n");
+        else
+          fputc(idata[i], stderr);
     }
   }
+  fprintf(stderr, "\n--- end params ---\n");
 
+  /* Discard PDU padding (RFC 3720 §3.1: pad to 4-byte boundary) */
+  uint32_t pdu_len = 48 + dsl;
+  uint32_t pad = (4 - (pdu_len & 3)) & 3;
+  if (pad > 0) {
+    uint8_t junk[4];
+    t_recv(t, ctx, conn, junk, pad);
+  }
+
+  uint32_t resp_len = 0;
+  char *resp =
+      login_build_resp(idata ? idata : (const uint8_t *)"", dsl, &resp_len);
+  free(idata);
+  if (!resp)
+    return -1;
+
+  /* Pad response data to 4-byte boundary so no PDU padding remains.
+   * This avoids a common iSCSI interop issue where the client reads
+   * DataSegmentLength bytes but leaves padding in the socket buffer,
+   * corrupting all subsequent PDU reads. */
+  uint32_t pdu_total = 48 + resp_len;
+  uint32_t resp_pad = (4 - (pdu_total & 3)) & 3;
+  if (resp_pad > 0) {
+    memset(resp + resp_len, 0, resp_pad);
+    resp_len += resp_pad;
+  }
+
+  fprintf(stderr, "do_login: resp params (len=%u):\n", resp_len);
+  for (uint32_t i = 0; i < resp_len; i++)
+    if (resp[i] == '\0')
+      fprintf(stderr, "\n");
+    else
+      fputc(resp[i], stderr);
+  fprintf(stderr, "\n--- end resp ---\n");
+
+  uint8_t req_csg = snowscsi_iscsi_bhs_get_csg(bhs);
   uint8_t req_nsg = snowscsi_iscsi_bhs_get_nsg(bhs);
+  fprintf(stderr, "do_login: req_csg=%u req_nsg=%u\n", req_csg, req_nsg);
+
   uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
 
-  /* Build Login Response — skip to Full Feature Phase (NSG=3) */
+  /* Save CmdSN before memset overwrites bhs (Bug 1 fix) */
+  uint32_t login_cmd_sn = snowscsi_iscsi_bhs_get_cmd_sn(bhs);
+
+  uint8_t isid[6];
+  memcpy(isid, &bhs[8], 6);
+  uint8_t tsih[2];
+  memcpy(tsih, &bhs[14], 2);
+  uint16_t cid = ((uint16_t)bhs[22] << 8) | bhs[23];
+
   memset(bhs, 0, 48);
+  memcpy(&bhs[8], isid, 6);
+  memcpy(&bhs[14], tsih, 2);
+
   snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_LOGIN_RESP);
   snowscsi_iscsi_bhs_set_t_bit(bhs, true);
 
-  /* CSG = nsg from request (accept their transition),
-   * NSG = 3  (Full Feature Phase) */
-  bhs[1] = (uint8_t)(((req_nsg & 0x03) << SNOWSCSI_ISCSI_FLAG_CSG_SHIFT) |
-                     (SNOWSCSI_ISCSI_STAGE_FULL_FEATURE
-                      << SNOWSCSI_ISCSI_FLAG_NSG_SHIFT));
+  bhs[1] |= (uint8_t)(((req_csg & 0x03) << SNOWSCSI_ISCSI_FLAG_CSG_SHIFT) |
+                      (SNOWSCSI_ISCSI_STAGE_FULL_FEATURE
+                       << SNOWSCSI_ISCSI_FLAG_NSG_SHIFT));
 
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
-  snowscsi_iscsi_bhs_set_data_seg_len(bhs, LOGIN_PARAMS_LEN);
+  bhs[22] = (uint8_t)(cid >> 8);
+  bhs[23] = (uint8_t)(cid & 0xFF);
+  snowscsi_iscsi_bhs_set_data_seg_len(bhs, resp_len);
+  /* ExpCmdSN = initial CmdSN from Login Request (first command uses same CmdSN) */
   snowscsi_iscsi_bhs_notify_set_stat_sn(bhs, 0);
-  snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(bhs, 0);
-  snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, 0);
+  snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(bhs, login_cmd_sn);
+  snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, login_cmd_sn);
 
-  if (send_pdu(t, ctx, conn, bhs, LOGIN_PARAMS, LOGIN_PARAMS_LEN) < 0)
+  if (send_pdu(t, ctx, conn, bhs, resp, resp_len) < 0) {
+    free(resp);
     return -1;
+  }
 
-  *out_cmd_sn = 0;
-  *out_stat_sn = 1; /* next response uses StatSN=1 */
+  free(resp);
+
+  fprintf(stderr, "do_login: sent Login Response, entering command loop\n");
+
+  *out_cmd_sn = login_cmd_sn;
+  *out_stat_sn = 1;
   return 0;
 }
 
@@ -477,10 +690,12 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
 
     /* Command loop */
     int running = 1;
+    fprintf(stderr, "cmd_loop: waiting for first PDU\n");
     while (running) {
       uint8_t bhs[48];
 
       if (recv_bhs(t, transport_ctx, conn, bhs) < 0) {
+        fprintf(stderr, "cmd_loop: recv_bhs failed, disconnecting\n");
         running = 0;
         break;
       }
@@ -490,13 +705,17 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       switch (op) {
 
       case SNOWSCSI_ISCSI_OP_SCSI_CMD: {
-        /* Validate CmdSN */
+        /* Validate CmdSN — accept any command >= expected (RFC 7143 §3.2.2.1)
+         */
         uint32_t recv_cmd_sn = snowscsi_iscsi_bhs_get_cmd_sn(bhs);
-        if (recv_cmd_sn != cmd_sn) {
+        if ((int32_t)(recv_cmd_sn - cmd_sn) < 0) {
           send_reject(t, transport_ctx, conn, SNOWSCSI_ISCSI_REJECT_CMD_SN,
                       stat_sn, cmd_sn + 1);
           break;
         }
+
+        /* Advance cmd_sn so responses use the correct ExpCmdSN */
+        cmd_sn = recv_cmd_sn;
 
         if (handle_scsi_cmd(t, transport_ctx, conn, bhs, devs, num_devs,
                             &stat_sn, &cmd_sn) < 0) {
@@ -520,6 +739,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         memset(lbhs, 0, 48);
         snowscsi_iscsi_bhs_set_opcode(lbhs, SNOWSCSI_ISCSI_OP_LOGOUT_RESP);
         snowscsi_iscsi_bhs_set_itt(lbhs, itt);
+        lbhs[1] = 0x80; /* response PDU flag */
         snowscsi_iscsi_bhs_resp_set_stat_sn(lbhs, stat_sn);
         snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(lbhs, cmd_sn + 1);
         snowscsi_iscsi_bhs_resp_set_max_cmd_sn(lbhs, cmd_sn + 1);
@@ -529,10 +749,34 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         break;
       }
 
-      case SNOWSCSI_ISCSI_OP_LOGIN_REQ:
-        /* Initiator wants to re-login — just reply again */
-        do_login(t, transport_ctx, conn, &cmd_sn, &stat_sn);
+      case SNOWSCSI_ISCSI_OP_LOGIN_REQ: {
+        /* recv_bhs() consumed BHS + DataSegment but not padding.
+         * Consume padding then send a minimal Login Response. */
+        uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
+        uint32_t pdu_len = 48 + dsl;
+        uint32_t pad = (4 - (pdu_len & 3)) & 3;
+        if (pad > 0) {
+          uint8_t junk[4];
+          t_recv(t, transport_ctx, conn, junk, pad);
+        }
+        uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
+        uint8_t req_csg = snowscsi_iscsi_bhs_get_csg(bhs);
+        uint8_t lbhs[48];
+        memset(lbhs, 0, 48);
+        snowscsi_iscsi_bhs_set_opcode(lbhs, SNOWSCSI_ISCSI_OP_LOGIN_RESP);
+        snowscsi_iscsi_bhs_set_t_bit(lbhs, true);
+        lbhs[1] |=
+            (uint8_t)(((req_csg & 0x03) << SNOWSCSI_ISCSI_FLAG_CSG_SHIFT) |
+                      (SNOWSCSI_ISCSI_STAGE_FULL_FEATURE
+                       << SNOWSCSI_ISCSI_FLAG_NSG_SHIFT));
+        snowscsi_iscsi_bhs_set_itt(lbhs, itt);
+        snowscsi_iscsi_bhs_notify_set_stat_sn(lbhs, stat_sn);
+        snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(lbhs, cmd_sn);
+        snowscsi_iscsi_bhs_notify_set_max_cmd_sn(lbhs, cmd_sn);
+        send_pdu(t, transport_ctx, conn, lbhs, NULL, 0);
+        stat_sn++;
         break;
+      }
 
       default:
         /* Unknown/unsupported PDU */

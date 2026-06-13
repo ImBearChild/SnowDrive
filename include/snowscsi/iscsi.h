@@ -52,8 +52,8 @@
 #define SNOWSCSI_ISCSI_FLAG_T_BIT 0x80
 #define SNOWSCSI_ISCSI_FLAG_F_BIT 0x80 /* Final bit in Data PDUs */
 
-/* CSG/NSG fields: byte 1 bits 3-2 = CSG, bits 1-0 = NSG */
-#define SNOWSCSI_ISCSI_FLAG_CSG_SHIFT 2
+/* CSG/NSG fields: byte 1 bits 6-5 = CSG, bits 3-0 = NSG */
+#define SNOWSCSI_ISCSI_FLAG_CSG_SHIFT 5
 #define SNOWSCSI_ISCSI_FLAG_NSG_SHIFT 0
 
 /* ── Generic BHS field accessors ─────────────────────────────────
@@ -115,10 +115,18 @@ void snowscsi_iscsi_bhs_get_cdb(const uint8_t bhs[48], uint8_t *cdb,
 void snowscsi_iscsi_bhs_set_status(uint8_t bhs[48], uint8_t status);
 void snowscsi_iscsi_bhs_set_sense_len(uint8_t bhs[48], uint8_t len);
 
-/* ── Data-In specific — DataSN at bytes 36-39 ───────────────────── */
+/* ── Data-In specific — DataSN at bytes 28-31 (RFC 7143 §10.7) ── */
 
 void snowscsi_iscsi_bhs_set_data_sn(uint8_t bhs[48], uint32_t sn);
 uint32_t snowscsi_iscsi_bhs_get_data_sn(const uint8_t bhs[48]);
+
+/* ── Data-In status fields (S=1) — StatSN at bytes 36-39,
+ *    ExpCmdSN at bytes 40-43, MaxCmdSN at bytes 44-47. ──────────── */
+
+void snowscsi_iscsi_bhs_data_in_set_stat_sn(uint8_t bhs[48], uint32_t sn);
+uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]);
+void snowscsi_iscsi_bhs_data_in_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn);
+void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn);
 
 /* ── Data-Out specific — Buffer Offset at bytes 40-43 ───────────── */
 

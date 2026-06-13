@@ -4,10 +4,11 @@
 
 /* ── BHS byte offsets ────────────────────────────────────────────
  *
- * Common across all PDUs:
+ * Common across all PDUs (RFC 3720 §3.1):
  *   byte 0  — Opcode (bits 5-0) + Immediate/Rsvd (bit 6-7)
  *   byte 1  — Flags (PDU-specific)
- *   bytes 4-6 — DataSegmentLength (3 bytes, big-endian)
+ *   byte 4  — TotalAHSLength
+ *   bytes 5-7 — DataSegmentLength (3 bytes, big-endian)
  *   bytes 16-19 — Initiator Task Tag (4 bytes, big-endian)
  *
  * Login Request / SCSI Command / Logout Request:
@@ -23,7 +24,10 @@
  * "Notification-style" PDUs (Login Response, NOP-In, R2T, Reject):
  *   bytes 24-27 — StatSN
  *   bytes 28-31 — ExpCmdSN
- *   bytes 32-35 — MaxCmdSN                                                  */
+ *   bytes 32-35 — MaxCmdSN
+ *
+ * T bit (Login PDU, RFC 3720 §10.12):
+ *   byte 1  — bit 7                                                  */
 
 /* ── Internal helper: encode uint32 big-endian ──────────────────── */
 
@@ -59,16 +63,18 @@ void snowscsi_iscsi_bhs_set_flags(uint8_t bhs[48], uint8_t flags) {
   bhs[1] = flags;
 }
 
-/* ── DataSegmentLength ──────────────────────────────────────────── */
+/* ── DataSegmentLength ────────────────────────────────────────────
+ * RFC 3720 §3.1: 24-bit big-endian field at bytes 5-7. Byte 4 is
+ * TotalAHSLength and must not be overwritten.                      */
 
 uint32_t snowscsi_iscsi_bhs_get_data_seg_len(const uint8_t bhs[48]) {
-  return ((uint32_t)bhs[4] << 16) | ((uint32_t)bhs[5] << 8) | (uint32_t)bhs[6];
+  return ((uint32_t)bhs[5] << 16) | ((uint32_t)bhs[6] << 8) | (uint32_t)bhs[7];
 }
 
 void snowscsi_iscsi_bhs_set_data_seg_len(uint8_t bhs[48], uint32_t len) {
-  bhs[4] = (len >> 16) & 0xFF;
-  bhs[5] = (len >> 8) & 0xFF;
-  bhs[6] = len & 0xFF;
+  bhs[5] = (len >> 16) & 0xFF;
+  bhs[6] = (len >> 8) & 0xFF;
+  bhs[7] = len & 0xFF;
 }
 
 /* ── Initiator Task Tag ─────────────────────────────────────────── */
@@ -152,24 +158,25 @@ uint8_t snowscsi_iscsi_bhs_get_csg(const uint8_t bhs[48]) {
 }
 
 uint8_t snowscsi_iscsi_bhs_get_nsg(const uint8_t bhs[48]) {
-  return (bhs[1] >> SNOWSCSI_ISCSI_FLAG_NSG_SHIFT) & 0x03;
+  return (bhs[1] >> SNOWSCSI_ISCSI_FLAG_NSG_SHIFT) & 0x0F;
 }
 
 void snowscsi_iscsi_bhs_set_nsg(uint8_t bhs[48], uint8_t nsg) {
-  bhs[1] = (bhs[1] & ~0x03) | (nsg & 0x03);
+  bhs[1] = (bhs[1] & ~0x0F) | (nsg & 0x0F);
 }
 
-/* ── T bit ──────────────────────────────────────────────────────── */
+/* ── T bit ────────────────────────────────────────────────────────
+ * RFC 3720 §10.12: T (Transit) bit is byte 1, bit 7 of Login PDUs. */
 
 bool snowscsi_iscsi_bhs_get_t_bit(const uint8_t bhs[48]) {
-  return (bhs[0] & SNOWSCSI_ISCSI_FLAG_T_BIT) != 0;
+  return (bhs[1] & SNOWSCSI_ISCSI_FLAG_T_BIT) != 0;
 }
 
 void snowscsi_iscsi_bhs_set_t_bit(uint8_t bhs[48], bool t) {
   if (t)
-    bhs[0] |= SNOWSCSI_ISCSI_FLAG_T_BIT;
+    bhs[1] |= SNOWSCSI_ISCSI_FLAG_T_BIT;
   else
-    bhs[0] &= ~SNOWSCSI_ISCSI_FLAG_T_BIT;
+    bhs[1] &= ~SNOWSCSI_ISCSI_FLAG_T_BIT;
 }
 
 /* ── LUN ────────────────────────────────────────────────────────── */
@@ -208,14 +215,33 @@ void snowscsi_iscsi_bhs_set_sense_len(uint8_t bhs[48], uint8_t len) {
   bhs[2] = len;
 }
 
-/* ── DataSN ─────────────────────────────────────────────────────── */
+/* ── DataSN — bytes 28-31 in Data-In PDU (RFC 7143 §10.7) ──────── */
 
 void snowscsi_iscsi_bhs_set_data_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[36], sn);
+  put_be32(&bhs[28], sn);
 }
 
 uint32_t snowscsi_iscsi_bhs_get_data_sn(const uint8_t bhs[48]) {
+  return get_be32(&bhs[28]);
+}
+
+/* ── Data-In status fields (S=1) — StatSN at bytes 36-39,
+ *    ExpCmdSN at bytes 40-43, MaxCmdSN at bytes 44-47. ──────────── */
+
+void snowscsi_iscsi_bhs_data_in_set_stat_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[36], sn);
+}
+
+uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]) {
   return get_be32(&bhs[36]);
+}
+
+void snowscsi_iscsi_bhs_data_in_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[40], sn);
+}
+
+void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[44], sn);
 }
 
 /* ── Buffer Offset (Data-Out) ───────────────────────────────────── */

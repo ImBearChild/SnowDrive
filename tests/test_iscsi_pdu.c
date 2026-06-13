@@ -44,9 +44,11 @@ void test_iscsi_pdu_data_seg_len(void) {
 
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, 0x123456);
   TEST_ASSERT_EQUAL_UINT32(0x123456, snowscsi_iscsi_bhs_get_data_seg_len(bhs));
-  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[4]);
-  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[5]);
-  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[6]);
+  /* RFC 3720 §3.1: DataSegmentLength at bytes 5-7; byte 4 is TotalAHSLength */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[4]);
+  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[5]);
+  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[6]);
+  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[7]);
 
   /* Zero */
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, 0);
@@ -189,8 +191,8 @@ void test_iscsi_pdu_login_csg_nsg(void) {
   uint8_t bhs[48];
   memset(bhs, 0, 48);
 
-  /* Set CSG=1 (bits 3-2), NSG=3 (bits 1-0) */
-  bhs[1] = (1 << 2) | 3;
+  /* Set CSG=1 (bits 6-5), NSG=3 (bits 3-0) */
+  bhs[1] = (1 << 5) | 3;
 
   TEST_ASSERT_EQUAL_UINT8(1, snowscsi_iscsi_bhs_get_csg(bhs));
   TEST_ASSERT_EQUAL_UINT8(3, snowscsi_iscsi_bhs_get_nsg(bhs));
@@ -212,10 +214,13 @@ void test_iscsi_pdu_t_bit(void) {
 
   snowscsi_iscsi_bhs_set_t_bit(bhs, true);
   TEST_ASSERT_TRUE(snowscsi_iscsi_bhs_get_t_bit(bhs));
-  TEST_ASSERT_EQUAL_HEX8(0x80, bhs[0] & 0x80);
+  /* RFC 3720 §10.12: T bit is byte 1, bit 7 */
+  TEST_ASSERT_EQUAL_HEX8(0x80, bhs[1] & 0x80);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[0]);
 
   snowscsi_iscsi_bhs_set_t_bit(bhs, false);
   TEST_ASSERT_FALSE(snowscsi_iscsi_bhs_get_t_bit(bhs));
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[1]);
 }
 
 /* ── test_iscsi_pdu_lun ────────────────────────────────────────── */
@@ -291,11 +296,11 @@ void test_iscsi_pdu_data_sn(void) {
   snowscsi_iscsi_bhs_set_data_sn(bhs, 0x12345678);
   TEST_ASSERT_EQUAL_UINT32(0x12345678, snowscsi_iscsi_bhs_get_data_sn(bhs));
 
-  /* DataSN at bytes 36-39 */
-  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[36]);
-  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[37]);
-  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[38]);
-  TEST_ASSERT_EQUAL_HEX8(0x78, bhs[39]);
+  /* DataSN at bytes 28-31 (RFC 7143 §10.7) */
+  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[28]);
+  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[29]);
+  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[30]);
+  TEST_ASSERT_EQUAL_HEX8(0x78, bhs[31]);
 }
 
 /* ── test_iscsi_pdu_buffer_offset ──────────────────────────────── */
@@ -379,6 +384,78 @@ void test_iscsi_pdu_cdb_len_from_opcode(void) {
   TEST_ASSERT_EQUAL_UINT8(12, snowscsi_iscsi_cdb_len_from_opcode(0xA0));
 }
 
+/* ── test_iscsi_pdu_data_seg_len_rfc_read ─────────────────────────
+ *  Place known bytes at RFC 3720 §3.1 offsets (5-7) and verify the
+ *  getter reads from the correct position — without using the setter. */
+
+void test_iscsi_pdu_data_seg_len_rfc_read(void) {
+  uint8_t bhs[48];
+  memset(bhs, 0, 48);
+
+  /* RFC 3720 §3.1: DataSegmentLength at bytes 5-7 */
+  bhs[5] = 0xAB;
+  bhs[6] = 0xCD;
+  bhs[7] = 0xEF;
+
+  TEST_ASSERT_EQUAL_UINT32(0xABCDEF, snowscsi_iscsi_bhs_get_data_seg_len(bhs));
+}
+
+/* ── test_iscsi_pdu_data_seg_len_rfc_write ────────────────────────
+ *  Call the setter, then verify each byte directly (not via getter)
+ *  against RFC 3720 positions. Byte 4 (TotalAHSLength) must remain 0. */
+
+void test_iscsi_pdu_data_seg_len_rfc_write(void) {
+  uint8_t bhs[48];
+  memset(bhs, 0, 48);
+
+  snowscsi_iscsi_bhs_set_data_seg_len(bhs, 0xABCDEF);
+
+  /* Byte 4 is TotalAHSLength — must not be overwritten */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[4]);
+  /* DataSegmentLength MSB at byte 5 */
+  TEST_ASSERT_EQUAL_HEX8(0xAB, bhs[5]);
+  /* DataSegmentLength middle at byte 6 */
+  TEST_ASSERT_EQUAL_HEX8(0xCD, bhs[6]);
+  /* DataSegmentLength LSB at byte 7 */
+  TEST_ASSERT_EQUAL_HEX8(0xEF, bhs[7]);
+}
+
+/* ── test_iscsi_pdu_t_bit_rfc_read ────────────────────────────────
+ *  Place T bit at RFC 3720 §10.12 position (byte 1, bit 7) and
+ *  verify the getter reads from the correct byte.                   */
+
+void test_iscsi_pdu_t_bit_rfc_read(void) {
+  uint8_t bhs[48];
+  memset(bhs, 0, 48);
+
+  /* T bit set on byte 1 */
+  bhs[1] = 0x80;
+  TEST_ASSERT_TRUE(snowscsi_iscsi_bhs_get_t_bit(bhs));
+
+  /* T bit clear, but set on byte 0 — should not be read as T bit */
+  bhs[0] = 0x80;
+  bhs[1] = 0x00;
+  TEST_ASSERT_FALSE(snowscsi_iscsi_bhs_get_t_bit(bhs));
+}
+
+/* ── test_iscsi_pdu_t_bit_rfc_write ───────────────────────────────
+ *  Call the setter, then verify byte positions directly.             */
+
+void test_iscsi_pdu_t_bit_rfc_write(void) {
+  uint8_t bhs[48];
+  memset(bhs, 0, 48);
+
+  snowscsi_iscsi_bhs_set_t_bit(bhs, true);
+
+  /* T bit at byte 1, bit 7 */
+  TEST_ASSERT_EQUAL_HEX8(0x80, bhs[1]);
+  /* Byte 0 must not be affected */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[0]);
+
+  snowscsi_iscsi_bhs_set_t_bit(bhs, false);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[1]);
+}
+
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -407,5 +484,9 @@ int main(void) {
   RUN_TEST(test_iscsi_pdu_ttt);
   RUN_TEST(test_iscsi_pdu_reject);
   RUN_TEST(test_iscsi_pdu_cdb_len_from_opcode);
+  RUN_TEST(test_iscsi_pdu_data_seg_len_rfc_read);
+  RUN_TEST(test_iscsi_pdu_data_seg_len_rfc_write);
+  RUN_TEST(test_iscsi_pdu_t_bit_rfc_read);
+  RUN_TEST(test_iscsi_pdu_t_bit_rfc_write);
   return UNITY_END();
 }
