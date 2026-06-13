@@ -14,4 +14,6 @@ target_include_directories(libsnowscsi
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_link_libraries(libsnowscsi PUBLIC snowcommon)
+
 set_target_properties(libsnowscsi PROPERTIES OUTPUT_NAME snowscsi)

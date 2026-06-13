@@ -1,3 +1,6 @@
+#define SNOWLOG_TAG "snowscsi"
+#include "snowlog.h"
+
 #include <snowscsi/block.h>
 #include <snowscsi/device.h>
 #include <snowscsi/iscsi.h>
@@ -17,7 +20,7 @@ int main(int argc, char *argv[]) {
 
   snowscsi_device_t *dev = snowscsi_block_open_ram(16 * 1024 * 1024);
   if (!dev) {
-    fprintf(stderr, "snowscsi: failed to create 16MB RAM disk\n");
+    SNOW_LOGE("failed to create 16MB RAM disk");
     return 1;
   }
 

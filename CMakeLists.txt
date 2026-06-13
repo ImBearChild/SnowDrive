@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD 11)
 enable_testing()
 
 # Libraries
+add_subdirectory(lib/common)
 add_subdirectory(lib/snow9660)
 add_subdirectory(lib/snowscsi)
 

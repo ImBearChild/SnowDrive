@@ -4,6 +4,9 @@
 #include <snowscsi/iscsi.h>
 #include <snowscsi/scsi.h>
 
+#define SNOWLOG_TAG "iscsi"
+#include "snowlog.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -354,23 +357,23 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
 
   uint8_t op = snowscsi_iscsi_bhs_get_opcode(bhs);
   uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
-  fprintf(stderr, "do_login: op=0x%02x dsl=%u\n", op, dsl);
-  fprintf(stderr, "  ver-max=%u ver-min=%u\n", bhs[2], bhs[3]);
-  fprintf(stderr, "  ISID=%02x%02x%02x%02x%02x%02x\n", bhs[8], bhs[9], bhs[10],
-          bhs[11], bhs[12], bhs[13]);
-  fprintf(stderr, "  TSIH=%u ITT=0x%08x CID=0x%08x CmdSN=%u ExpStatSN=%u\n",
-          ((uint32_t)bhs[16] << 24) | ((uint32_t)bhs[17] << 16) |
-              ((uint32_t)bhs[18] << 8) | (uint32_t)bhs[19],
-          ((uint32_t)bhs[20] << 24) | ((uint32_t)bhs[21] << 16) |
-              ((uint32_t)bhs[22] << 8) | (uint32_t)bhs[23],
-          ((uint32_t)bhs[24] << 24) | ((uint32_t)bhs[25] << 16) |
-              ((uint32_t)bhs[26] << 8) | (uint32_t)bhs[27],
-          ((uint32_t)bhs[28] << 24) | ((uint32_t)bhs[29] << 16) |
-              ((uint32_t)bhs[30] << 8) | (uint32_t)bhs[31],
-          ((uint32_t)bhs[32] << 24) | ((uint32_t)bhs[33] << 16) |
-              ((uint32_t)bhs[34] << 8) | (uint32_t)bhs[35]);
-  fprintf(stderr, "  T=%d CSG=%u NSG=%u\n", snowscsi_iscsi_bhs_get_t_bit(bhs),
-          snowscsi_iscsi_bhs_get_csg(bhs), snowscsi_iscsi_bhs_get_nsg(bhs));
+  SNOW_LOGD("do_login: op=0x%02x dsl=%u", op, dsl);
+  SNOW_LOGD("  ver-max=%u ver-min=%u", bhs[2], bhs[3]);
+  SNOW_LOGD("  ISID=%02x%02x%02x%02x%02x%02x", bhs[8], bhs[9], bhs[10], bhs[11],
+            bhs[12], bhs[13]);
+  SNOW_LOGD("  TSIH=%u ITT=0x%08x CID=0x%08x CmdSN=%u ExpStatSN=%u",
+            ((uint32_t)bhs[16] << 24) | ((uint32_t)bhs[17] << 16) |
+                ((uint32_t)bhs[18] << 8) | (uint32_t)bhs[19],
+            ((uint32_t)bhs[20] << 24) | ((uint32_t)bhs[21] << 16) |
+                ((uint32_t)bhs[22] << 8) | (uint32_t)bhs[23],
+            ((uint32_t)bhs[24] << 24) | ((uint32_t)bhs[25] << 16) |
+                ((uint32_t)bhs[26] << 8) | (uint32_t)bhs[27],
+            ((uint32_t)bhs[28] << 24) | ((uint32_t)bhs[29] << 16) |
+                ((uint32_t)bhs[30] << 8) | (uint32_t)bhs[31],
+            ((uint32_t)bhs[32] << 24) | ((uint32_t)bhs[33] << 16) |
+                ((uint32_t)bhs[34] << 8) | (uint32_t)bhs[35]);
+  SNOW_LOGD("  T=%d CSG=%u NSG=%u", snowscsi_iscsi_bhs_get_t_bit(bhs),
+            snowscsi_iscsi_bhs_get_csg(bhs), snowscsi_iscsi_bhs_get_nsg(bhs));
   if (op != SNOWSCSI_ISCSI_OP_LOGIN_REQ)
     return -1;
 
@@ -383,14 +386,15 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
         free(idata);
         return -1;
       }
-      for (uint32_t i = 0; i < dsl; i++)
-        if (idata[i] == '\0')
-          fprintf(stderr, "\n");
-        else
-          fputc(idata[i], stderr);
+      if (snowlog_get_level() >= SNOWLOG_DEBUG)
+        for (uint32_t i = 0; i < dsl; i++)
+          if (idata[i] == '\0')
+            fputc('\n', stderr);
+          else
+            fputc(idata[i], stderr);
     }
   }
-  fprintf(stderr, "\n--- end params ---\n");
+  SNOW_LOGD("--- end params ---");
 
   /* Discard PDU padding (RFC 3720 §3.1: pad to 4-byte boundary) */
   uint32_t pdu_len = 48 + dsl;
@@ -418,17 +422,19 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
     resp_len += resp_pad;
   }
 
-  fprintf(stderr, "do_login: resp params (len=%u):\n", resp_len);
-  for (uint32_t i = 0; i < resp_len; i++)
-    if (resp[i] == '\0')
-      fprintf(stderr, "\n");
-    else
-      fputc(resp[i], stderr);
-  fprintf(stderr, "\n--- end resp ---\n");
+  if (snowlog_get_level() >= SNOWLOG_DEBUG) {
+    fprintf(stderr, "[D][iscsi] do_login: resp params (len=%u):\n", resp_len);
+    for (uint32_t i = 0; i < resp_len; i++)
+      if (resp[i] == '\0')
+        fputc('\n', stderr);
+      else
+        fputc(resp[i], stderr);
+    fprintf(stderr, "[D][iscsi] --- end resp ---\n");
+  }
 
   uint8_t req_csg = snowscsi_iscsi_bhs_get_csg(bhs);
   uint8_t req_nsg = snowscsi_iscsi_bhs_get_nsg(bhs);
-  fprintf(stderr, "do_login: req_csg=%u req_nsg=%u\n", req_csg, req_nsg);
+  SNOW_LOGD("do_login: req_csg=%u req_nsg=%u", req_csg, req_nsg);
 
   uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
 
@@ -456,7 +462,8 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   bhs[22] = (uint8_t)(cid >> 8);
   bhs[23] = (uint8_t)(cid & 0xFF);
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, resp_len);
-  /* ExpCmdSN = initial CmdSN from Login Request (first command uses same CmdSN) */
+  /* ExpCmdSN = initial CmdSN from Login Request (first command uses same CmdSN)
+   */
   snowscsi_iscsi_bhs_notify_set_stat_sn(bhs, 0);
   snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(bhs, login_cmd_sn);
   snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, login_cmd_sn);
@@ -468,7 +475,7 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
 
   free(resp);
 
-  fprintf(stderr, "do_login: sent Login Response, entering command loop\n");
+  SNOW_LOGI("do_login: sent Login Response, entering command loop");
 
   *out_cmd_sn = login_cmd_sn;
   *out_stat_sn = 1;
@@ -666,16 +673,16 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
   /* Listen */
   intptr_t listener = t->listen(transport_ctx, addr, port);
   if (listener < 0) {
-    fprintf(stderr, "iSCSI: failed to listen on %s:%u\n", host, port);
+    SNOW_LOGE("iSCSI: failed to listen on %s:%u", host, port);
     return -1;
   }
 
-  fprintf(stderr, "iSCSI target listening on %s:%u\n", host, port);
+  SNOW_LOGI("iSCSI target listening on %s:%u", host, port);
 
   while (1) {
     intptr_t conn = t->accept(transport_ctx, listener);
     if (conn < 0) {
-      fprintf(stderr, "iSCSI: accept failed\n");
+      SNOW_LOGE("iSCSI: accept failed");
       t->stop(transport_ctx, listener);
       return -1;
     }
@@ -690,12 +697,12 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
 
     /* Command loop */
     int running = 1;
-    fprintf(stderr, "cmd_loop: waiting for first PDU\n");
+    SNOW_LOGI("cmd_loop: waiting for first PDU");
     while (running) {
       uint8_t bhs[48];
 
       if (recv_bhs(t, transport_ctx, conn, bhs) < 0) {
-        fprintf(stderr, "cmd_loop: recv_bhs failed, disconnecting\n");
+        SNOW_LOGE("cmd_loop: recv_bhs failed, disconnecting");
         running = 0;
         break;
       }
