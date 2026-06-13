@@ -4,6 +4,9 @@ add_library(libsnowscsi STATIC
     device.c
     backend_ram.c
     block.c
+    iscsi_pdu.c
+    iscsi_target.c
+    transport_bsd.c
 )
 
 target_include_directories(libsnowscsi
