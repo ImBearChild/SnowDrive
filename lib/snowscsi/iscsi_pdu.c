@@ -4,10 +4,10 @@
 
 /* ── BHS byte offsets ────────────────────────────────────────────
  *
- * Common across all PDUs (RFC 3720 §3.1):
- *   byte 0  — Opcode (bits 5-0) + Immediate/Rsvd (bit 6-7)
- *   byte 1  — Flags (PDU-specific)
- *   byte 4  — TotalAHSLength
+ * Common across all PDUs (RFC 7143 §11.2):
+ *   byte 0   — Opcode (bits 5-0) + Immediate/Rsvd (bits 6-7)
+ *   byte 1   — Flags (PDU-specific)
+ *   byte 4   — TotalAHSLength
  *   bytes 5-7 — DataSegmentLength (3 bytes, big-endian)
  *   bytes 16-19 — Initiator Task Tag (4 bytes, big-endian)
  *
@@ -15,18 +15,33 @@
  *   bytes 24-27 — CmdSN
  *   bytes 28-31 — ExpStatSN (Login/SCSI Cmd) / reserved (Logout)
  *
- * "Response-style" PDUs (SCSI Response, Logout Response,
- * Data-In with S=1):
- *   bytes 20-23 — ExpCmdSN
- *   bytes 24-27 — MaxCmdSN
- *   bytes 36-39 — StatSN
- *
- * "Notification-style" PDUs (Login Response, NOP-In, R2T, Reject):
+ * SCSI Response (RFC 7143 §11.4) & Logout Response (§11.15):
+ *   bytes 20-23 — Reserved (SCSI: SNACK Tag or Reserved)
  *   bytes 24-27 — StatSN
  *   bytes 28-31 — ExpCmdSN
  *   bytes 32-35 — MaxCmdSN
  *
- * T bit (Login PDU, RFC 3720 §10.12):
+ * Login Response (§11.13), NOP-In (§11.19), R2T (§11.8), Reject (§11.17):
+ *   bytes 24-27 — StatSN
+ *   bytes 28-31 — ExpCmdSN
+ *   bytes 32-35 — MaxCmdSN
+ *
+ * Data-In (RFC 7143 §11.7):
+ *   bytes 20-23 — Target Transfer Tag or 0xffffffff
+ *   bytes 24-27 — StatSN or Reserved
+ *   bytes 28-31 — ExpCmdSN
+ *   bytes 32-35 — MaxCmdSN
+ *   bytes 36-39 — DataSN
+ *   bytes 40-43 — Buffer Offset
+ *   bytes 44-47 — Residual Count
+ *
+ * R2T (RFC 7143 §11.8) additional fields:
+ *   bytes 20-23 — Target Transfer Tag
+ *   bytes 36-39 — R2TSN
+ *   bytes 40-43 — Buffer Offset
+ *   bytes 44-47 — Desired Data Transfer Length
+ *
+ * T bit (Login PDU):
  *   byte 1  — bit 7                                                  */
 
 /* ── Internal helper: encode uint32 big-endian ──────────────────── */
@@ -99,34 +114,34 @@ uint32_t snowscsi_iscsi_bhs_get_exp_stat_sn(const uint8_t bhs[48]) {
   return get_be32(&bhs[28]);
 }
 
-/* ── Response-style StatSN ──────────────────────────────────────── */
+/* ── SCSI / Logout Response StatSN ──────────────────────────────── */
 
 void snowscsi_iscsi_bhs_resp_set_stat_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[36], sn);
-}
-
-uint32_t snowscsi_iscsi_bhs_resp_get_stat_sn(const uint8_t bhs[48]) {
-  return get_be32(&bhs[36]);
-}
-
-/* ── Response-style ExpCmdSN ────────────────────────────────────── */
-
-void snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[20], sn);
-}
-
-uint32_t snowscsi_iscsi_bhs_resp_get_exp_cmd_sn(const uint8_t bhs[48]) {
-  return get_be32(&bhs[20]);
-}
-
-/* ── Response-style MaxCmdSN ────────────────────────────────────── */
-
-void snowscsi_iscsi_bhs_resp_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn) {
   put_be32(&bhs[24], sn);
 }
 
-uint32_t snowscsi_iscsi_bhs_resp_get_max_cmd_sn(const uint8_t bhs[48]) {
+uint32_t snowscsi_iscsi_bhs_resp_get_stat_sn(const uint8_t bhs[48]) {
   return get_be32(&bhs[24]);
+}
+
+/* ── SCSI / Logout Response ExpCmdSN ────────────────────────────── */
+
+void snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[28], sn);
+}
+
+uint32_t snowscsi_iscsi_bhs_resp_get_exp_cmd_sn(const uint8_t bhs[48]) {
+  return get_be32(&bhs[28]);
+}
+
+/* ── SCSI / Logout Response MaxCmdSN ────────────────────────────── */
+
+void snowscsi_iscsi_bhs_resp_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[32], sn);
+}
+
+uint32_t snowscsi_iscsi_bhs_resp_get_max_cmd_sn(const uint8_t bhs[48]) {
+  return get_be32(&bhs[32]);
 }
 
 /* ── Notification-style StatSN ──────────────────────────────────── */
@@ -215,33 +230,33 @@ void snowscsi_iscsi_bhs_set_sense_len(uint8_t bhs[48], uint8_t len) {
   bhs[2] = len;
 }
 
-/* ── DataSN — bytes 28-31 in Data-In PDU (RFC 7143 §10.7) ──────── */
+/* ── DataSN — bytes 36-39 in Data-In PDU (RFC 7143 §11.7) ──────── */
 
 void snowscsi_iscsi_bhs_set_data_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[28], sn);
-}
-
-uint32_t snowscsi_iscsi_bhs_get_data_sn(const uint8_t bhs[48]) {
-  return get_be32(&bhs[28]);
-}
-
-/* ── Data-In status fields (S=1) — StatSN at bytes 36-39,
- *    ExpCmdSN at bytes 40-43, MaxCmdSN at bytes 44-47. ──────────── */
-
-void snowscsi_iscsi_bhs_data_in_set_stat_sn(uint8_t bhs[48], uint32_t sn) {
   put_be32(&bhs[36], sn);
 }
 
-uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]) {
+uint32_t snowscsi_iscsi_bhs_get_data_sn(const uint8_t bhs[48]) {
   return get_be32(&bhs[36]);
 }
 
+/* ── Data-In status fields (S=1) — StatSN at bytes 24-27,
+ *    ExpCmdSN at bytes 28-31, MaxCmdSN at bytes 32-35. ──────────── */
+
+void snowscsi_iscsi_bhs_data_in_set_stat_sn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[24], sn);
+}
+
+uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]) {
+  return get_be32(&bhs[24]);
+}
+
 void snowscsi_iscsi_bhs_data_in_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[40], sn);
+  put_be32(&bhs[28], sn);
 }
 
 void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn) {
-  put_be32(&bhs[44], sn);
+  put_be32(&bhs[32], sn);
 }
 
 /* ── Buffer Offset (Data-Out) ───────────────────────────────────── */
@@ -258,7 +273,13 @@ void snowscsi_iscsi_bhs_set_r2t_buffer_offset(uint8_t bhs[48],
 }
 
 void snowscsi_iscsi_bhs_set_desired_data_len(uint8_t bhs[48], uint32_t len) {
-  put_be32(&bhs[20], len);
+  put_be32(&bhs[44], len);
+}
+
+/* ── R2T specific — R2TSN at bytes 36-39 ───────────────────────── */
+
+void snowscsi_iscsi_bhs_r2t_set_r2tsn(uint8_t bhs[48], uint32_t sn) {
+  put_be32(&bhs[36], sn);
 }
 
 /* ── Target Transfer Tag ────────────────────────────────────────── */

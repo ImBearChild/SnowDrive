@@ -75,9 +75,9 @@ void snowscsi_iscsi_bhs_set_itt(uint8_t bhs[48], uint32_t itt);
 uint32_t snowscsi_iscsi_bhs_get_cmd_sn(const uint8_t bhs[48]);
 uint32_t snowscsi_iscsi_bhs_get_exp_stat_sn(const uint8_t bhs[48]);
 
-/* ── Response-style fields — at bytes 20-23 (ExpCmdSN), 24-27
- * (MaxCmdSN), 36-39 (StatSN).
- * Applies to: SCSI Response, Logout Response, Data-In (with S=1) ── */
+/* ── Response-style fields — at bytes 24-27 (StatSN), 28-31
+ * (ExpCmdSN), 32-35 (MaxCmdSN).
+ * Applies to: SCSI Response (§11.4), Logout Response (§11.15) ───── */
 
 void snowscsi_iscsi_bhs_resp_set_stat_sn(uint8_t bhs[48], uint32_t sn);
 void snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn);
@@ -115,13 +115,13 @@ void snowscsi_iscsi_bhs_get_cdb(const uint8_t bhs[48], uint8_t *cdb,
 void snowscsi_iscsi_bhs_set_status(uint8_t bhs[48], uint8_t status);
 void snowscsi_iscsi_bhs_set_sense_len(uint8_t bhs[48], uint8_t len);
 
-/* ── Data-In specific — DataSN at bytes 28-31 (RFC 7143 §10.7) ── */
+/* ── Data-In specific — DataSN at bytes 36-39 (RFC 7143 §11.7) ─── */
 
 void snowscsi_iscsi_bhs_set_data_sn(uint8_t bhs[48], uint32_t sn);
 uint32_t snowscsi_iscsi_bhs_get_data_sn(const uint8_t bhs[48]);
 
-/* ── Data-In status fields (S=1) — StatSN at bytes 36-39,
- *    ExpCmdSN at bytes 40-43, MaxCmdSN at bytes 44-47. ──────────── */
+/* ── Data-In status fields (S=1) — StatSN at bytes 24-27,
+ *    ExpCmdSN at bytes 28-31, MaxCmdSN at bytes 32-35. ──────────── */
 
 void snowscsi_iscsi_bhs_data_in_set_stat_sn(uint8_t bhs[48], uint32_t sn);
 uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]);
@@ -133,10 +133,11 @@ void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn);
 uint32_t snowscsi_iscsi_bhs_get_buffer_offset(const uint8_t bhs[48]);
 
 /* ── R2T specific — Buffer Offset bytes 40-43, Desired Data
- * Transfer Length bytes 20-23 ───────────────────────────────────── */
+ * Transfer Length bytes 44-47, R2TSN bytes 36-39 ────────────────── */
 
 void snowscsi_iscsi_bhs_set_r2t_buffer_offset(uint8_t bhs[48], uint32_t offset);
 void snowscsi_iscsi_bhs_set_desired_data_len(uint8_t bhs[48], uint32_t len);
+void snowscsi_iscsi_bhs_r2t_set_r2tsn(uint8_t bhs[48], uint32_t sn);
 
 /* ── NOP specific — Target Transfer Tag at bytes 20-23 ──────────── */
 

@@ -104,11 +104,11 @@ void test_iscsi_pdu_resp_stat_sn(void) {
   snowscsi_iscsi_bhs_resp_set_stat_sn(bhs, 42);
   TEST_ASSERT_EQUAL_UINT32(42, snowscsi_iscsi_bhs_resp_get_stat_sn(bhs));
 
-  /* Verify byte offset: StatSN for resp PDUs is at bytes 36-39 */
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[36]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[37]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[38]);
-  TEST_ASSERT_EQUAL_HEX8(0x2A, bhs[39]);
+  /* Verify byte offset: StatSN for SCSI/Logout resp is at bytes 24-27 */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[24]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[25]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[26]);
+  TEST_ASSERT_EQUAL_HEX8(0x2A, bhs[27]);
 }
 
 /* ── test_iscsi_pdu_resp_exp_cmd_sn ────────────────────────────── */
@@ -120,11 +120,11 @@ void test_iscsi_pdu_resp_exp_cmd_sn(void) {
   snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(bhs, 99);
   TEST_ASSERT_EQUAL_UINT32(99, snowscsi_iscsi_bhs_resp_get_exp_cmd_sn(bhs));
 
-  /* ExpCmdSN for resp PDUs is at bytes 20-23 */
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[20]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[21]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[22]);
-  TEST_ASSERT_EQUAL_HEX8(0x63, bhs[23]);
+  /* ExpCmdSN for SCSI/Logout resp is at bytes 28-31 */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[28]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[29]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[30]);
+  TEST_ASSERT_EQUAL_HEX8(0x63, bhs[31]);
 }
 
 /* ── test_iscsi_pdu_resp_max_cmd_sn ────────────────────────────── */
@@ -136,11 +136,11 @@ void test_iscsi_pdu_resp_max_cmd_sn(void) {
   snowscsi_iscsi_bhs_resp_set_max_cmd_sn(bhs, 100);
   TEST_ASSERT_EQUAL_UINT32(100, snowscsi_iscsi_bhs_resp_get_max_cmd_sn(bhs));
 
-  /* MaxCmdSN for resp PDUs is at bytes 24-27 */
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[24]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[25]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[26]);
-  TEST_ASSERT_EQUAL_HEX8(0x64, bhs[27]);
+  /* MaxCmdSN for SCSI/Logout resp is at bytes 32-35 */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[32]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[33]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[34]);
+  TEST_ASSERT_EQUAL_HEX8(0x64, bhs[35]);
 }
 
 /* ── test_iscsi_pdu_notify_stat_sn ─────────────────────────────── */
@@ -296,11 +296,11 @@ void test_iscsi_pdu_data_sn(void) {
   snowscsi_iscsi_bhs_set_data_sn(bhs, 0x12345678);
   TEST_ASSERT_EQUAL_UINT32(0x12345678, snowscsi_iscsi_bhs_get_data_sn(bhs));
 
-  /* DataSN at bytes 28-31 (RFC 7143 §10.7) */
-  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[28]);
-  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[29]);
-  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[30]);
-  TEST_ASSERT_EQUAL_HEX8(0x78, bhs[31]);
+  /* DataSN at bytes 36-39 (RFC 7143 §11.7) */
+  TEST_ASSERT_EQUAL_HEX8(0x12, bhs[36]);
+  TEST_ASSERT_EQUAL_HEX8(0x34, bhs[37]);
+  TEST_ASSERT_EQUAL_HEX8(0x56, bhs[38]);
+  TEST_ASSERT_EQUAL_HEX8(0x78, bhs[39]);
 }
 
 /* ── test_iscsi_pdu_buffer_offset ──────────────────────────────── */
@@ -331,10 +331,11 @@ void test_iscsi_pdu_r2t(void) {
   TEST_ASSERT_EQUAL_HEX8(0x00, bhs[43]);
 
   snowscsi_iscsi_bhs_set_desired_data_len(bhs, 65536);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[20]);
-  TEST_ASSERT_EQUAL_HEX8(0x01, bhs[21]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[22]);
-  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[23]);
+  /* Desired Data Transfer Length at bytes 44-47 (RFC 7143 §11.8) */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[44]);
+  TEST_ASSERT_EQUAL_HEX8(0x01, bhs[45]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[46]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[47]);
 }
 
 /* ── test_iscsi_pdu_ttt ────────────────────────────────────────── */

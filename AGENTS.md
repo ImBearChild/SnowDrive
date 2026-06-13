@@ -10,14 +10,18 @@ required for cross session memory. These files are ephemeral — clean them up w
 they are no longer relevant to active work, and must never appear in staged changes or commits.
 
 Agent should download standard files (RFC, ISO9960, etc) to `__REF_XXX.md` and refer
-to them when necessary. As an instance, agent should download
-[RFC7143](https://www.rfc-editor.org/rfc/rfc7143.txt) to `__REF_RFC7143.md` and refer
-to it when writing code on iSCSI parts.
+to them when necessary. Those files can be download even agent is required not to modify any files,
+since those files are reference and will not track by git.
+
+As an instance, agent should download
+[RFC3720](https://www.rfc-editor.org/rfc/rfc3720.txt) to `__REF_RFC3720.md` and refer
+to it when writing code on iSCSI parts. 
 
 ## Critical Rules
 
 - Commit messages must follow the Conventional Commits format documented in
   `HACKING.md`.
+- DO NOT FOLLOW RFC 7143, which is not accept by mainstream, follow RFC 3720 instead.
 
 ## Pre-commit Workflow
 

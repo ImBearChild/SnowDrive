@@ -261,7 +261,7 @@ static int send_scsi_response(const snowscsi_transport_ops_t *t, void *ctx,
 
   snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_SCSI_RESP);
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
-  bhs[1] |= 0x80; /* libiscsi expects this bit set on SCSI Response */
+  bhs[1] |= 0x80; /* libiscsi requires F bit set on SCSI Response */
 
   uint32_t exp_cmd_sn = *cmd_sn + 1;
   snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(bhs, exp_cmd_sn);
@@ -331,8 +331,9 @@ static int send_r2t(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   snowscsi_iscsi_bhs_notify_set_stat_sn(bhs, stat_sn);
   snowscsi_iscsi_bhs_notify_set_exp_cmd_sn(bhs, exp_cmd_sn);
   snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, exp_cmd_sn);
-  snowscsi_iscsi_bhs_set_desired_data_len(bhs, desired_len);
+  snowscsi_iscsi_bhs_r2t_set_r2tsn(bhs, ttt); /* R2TSN = TTT for simplicity */
   snowscsi_iscsi_bhs_set_r2t_buffer_offset(bhs, buffer_offset);
+  snowscsi_iscsi_bhs_set_desired_data_len(bhs, desired_len);
 
   return send_pdu(t, ctx, conn, bhs, NULL, 0);
 }
@@ -709,17 +710,16 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
   while (1) {
     intptr_t conn = t->accept(transport_ctx, listener);
     if (conn < 0) {
-      SNOW_LOGE("iSCSI: accept failed");
-      t->stop(transport_ctx, listener);
-      return -1;
+      SNOW_LOGW("iSCSI: accept failed, retrying");
+      continue;
     }
 
     /* Login */
     uint32_t cmd_sn = 0, stat_sn = 0;
     if (do_login(t, transport_ctx, conn, &cmd_sn, &stat_sn) < 0) {
+      SNOW_LOGW("iSCSI: login failed, disconnecting");
       t->disconnect(transport_ctx, conn);
-      t->stop(transport_ctx, listener);
-      return -1;
+      continue;
     }
 
     /* Command loop */
@@ -729,7 +729,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       uint8_t bhs[48];
 
       if (recv_bhs(t, transport_ctx, conn, bhs) < 0) {
-        SNOW_LOGE("cmd_loop: recv_bhs failed, disconnecting");
+        SNOW_LOGW("cmd_loop: recv_bhs failed, disconnecting");
         running = 0;
         break;
       }

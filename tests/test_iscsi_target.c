@@ -142,15 +142,15 @@ void test_iscsi_r2t_fields(void) {
   snowscsi_iscsi_bhs_set_r2t_buffer_offset(bhs, buffer_offset);
   snowscsi_iscsi_bhs_set_desired_data_len(bhs, desired_len);
 
-  /* Verify — R2T uses bytes 20-23 for Desired Data Transfer
-   * Length (same offset as TTT in other PDUs) */
+  /* Verify — R2T: TTT at bytes 20-23, Desired Data Transfer
+   * Length at bytes 44-47 (RFC 7143 §11.8) */
   TEST_ASSERT_EQUAL_HEX8(SNOWSCSI_ISCSI_OP_R2T,
                          snowscsi_iscsi_bhs_get_opcode(bhs));
   TEST_ASSERT_EQUAL_UINT32(itt, snowscsi_iscsi_bhs_get_itt(bhs));
   TEST_ASSERT_EQUAL_UINT32(stat_sn, snowscsi_iscsi_bhs_notify_get_stat_sn(bhs));
 
-  /* Desired Data Transfer Length at bytes 20-23 (= desired_len, 512) */
-  TEST_ASSERT_EQUAL_UINT32(desired_len, snowscsi_iscsi_bhs_get_ttt(bhs));
+  /* TTT at bytes 20-23 (= ttt, 1) — no longer overwritten by desired_len */
+  TEST_ASSERT_EQUAL_UINT32(ttt, snowscsi_iscsi_bhs_get_ttt(bhs));
 
   /* Buffer Offset at bytes 40-43 = 0 */
   TEST_ASSERT_EQUAL_HEX8(0x00, bhs[40]);
