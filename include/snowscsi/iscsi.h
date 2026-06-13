@@ -150,6 +150,7 @@ uint8_t snowscsi_iscsi_bhs_get_reject_reason(const uint8_t bhs[48]);
 
 /* ── Utility ───────────────────────────────────────────────────── */
 
+const char *snowscsi_iscsi_opcode_name(uint8_t opcode);
 uint8_t snowscsi_iscsi_cdb_len_from_opcode(uint8_t opcode);
 
 /* ── Transport abstraction ─────────────────────────────────────── */

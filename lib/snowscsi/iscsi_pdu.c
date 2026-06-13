@@ -281,6 +281,24 @@ uint8_t snowscsi_iscsi_bhs_get_reject_reason(const uint8_t bhs[48]) {
   return bhs[2];
 }
 
+/* ── Opcode name ────────────────────────────────────────────────── */
+
+const char *snowscsi_iscsi_opcode_name(uint8_t opcode) {
+  static const char *names[] = {
+      [0x00] = "NOP_OUT",       [0x01] = "SCSI_CMD",
+      [0x02] = "SCSI_TASK_REQ", [0x03] = "LOGIN_REQ",
+      [0x04] = "TEXT_REQ",      [0x05] = "SCSI_DATA_OUT",
+      [0x06] = "LOGOUT_REQ",    [0x20] = "NOP_IN",
+      [0x21] = "SCSI_RESP",     [0x22] = "SCSI_TASK_RESP",
+      [0x23] = "LOGIN_RESP",    [0x24] = "TEXT_RESP",
+      [0x25] = "SCSI_DATA_IN",  [0x26] = "LOGOUT_RESP",
+      [0x31] = "R2T",           [0x3F] = "REJECT",
+  };
+  if (opcode <= 0x3F && names[opcode])
+    return names[opcode];
+  return "UNKNOWN";
+}
+
 /* ── CDB length from opcode group code ──────────────────────────── */
 
 uint8_t snowscsi_iscsi_cdb_len_from_opcode(uint8_t opcode) {

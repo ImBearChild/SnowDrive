@@ -154,6 +154,31 @@ static int t_send(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   return t->send(ctx, conn, buf, len);
 }
 
+/* ── log BHS at verbose level ───────────────────────────────────── */
+
+static void log_bhs(const char *dir, const uint8_t bhs[48]) {
+  uint8_t op = snowscsi_iscsi_bhs_get_opcode(bhs);
+  uint8_t flags = bhs[1];
+  uint8_t ahs = bhs[4];
+  uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
+  uint8_t lun = snowscsi_iscsi_bhs_get_lun(bhs);
+  uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
+
+  /* Format opcode-specific 28 bytes (bhs[20..47]) as hex */
+  char spec[28 * 3 + 1];
+  for (int i = 0; i < 28; i++) {
+    uint8_t b = bhs[20 + i];
+    spec[i * 3] = "0123456789abcdef"[b >> 4];
+    spec[i * 3 + 1] = "0123456789abcdef"[b & 0xF];
+    spec[i * 3 + 2] = ' ';
+  }
+  spec[28 * 3 - 1] = '\0';
+
+  SNOW_LOGV(
+      "%s op=%s(0x%02x) flags=0x%02x ahs=%u dsl=%u lun=%u itt=0x%04x spec=%s",
+      dir, snowscsi_iscsi_opcode_name(op), op, flags, ahs, dsl, lun, itt, spec);
+}
+
 /* ── receive BHS + discard any DataSegment ──────────────────────── */
 
 static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
@@ -161,6 +186,7 @@ static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   int r = t_recv(t, ctx, conn, bhs, 48);
   if (r < 0)
     return -1;
+  log_bhs("RX", bhs);
 
   /* Discard DataSegment (we never expect or parse initiator data
    * besides the CDB in the SCSI Command BHS) */
@@ -203,6 +229,7 @@ static int send_pdu(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   if (buf_len > sizeof(buf))
     return -1;
 
+  log_bhs("TX", bhs);
   memcpy(buf, bhs, 48);
   if (data_len > 0)
     memcpy(buf + 48, data, data_len);
