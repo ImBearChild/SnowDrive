@@ -2,7 +2,7 @@
 
 This file contains instructions **exclusively for AI agents**. Human-oriented
 documentation (build, test, format, commit conventions) lives in `HACKING.md` —
-read it before making changes.
+agents must read it before making changes.
 
 ## Cross-session Memory
 

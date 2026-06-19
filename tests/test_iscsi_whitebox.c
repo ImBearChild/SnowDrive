@@ -124,11 +124,47 @@ void test_whitebox_read_capacity(void) {
   iscsi_destroy_context(iscsi);
 }
 
-/* ── test_whitebox_read ──────────────────────────────────────────── */
+/* ── test_whitebox_write_read ─────────────────────────────────────── */
 
-void test_whitebox_read(void) {
-  /* TOOD: implement after write-through via iSCSI is available */
-  TEST_IGNORE_MESSAGE("write-through test not yet implemented");
+void test_whitebox_write_read(void) {
+  struct iscsi_context *iscsi = NULL;
+  for (int i = 0; i < 20; i++) {
+    iscsi = libiscsi_connect(PORTAL, TARGET);
+    if (iscsi)
+      break;
+    usleep(100000);
+  }
+  if (!iscsi)
+    TEST_FAIL_MESSAGE("failed to connect to snowscsi");
+
+  unsigned char pattern[65536];
+  for (int i = 0; i < 65536; i++)
+    pattern[i] = (unsigned char)(i & 0xFF);
+
+#define NLOOPS 100
+#define CHUNK_BLOCKS 128 /* 64KB / 512 */
+
+  for (int i = 0; i < NLOOPS; i++) {
+    struct scsi_task *task =
+        iscsi_write10_sync(iscsi, 0, i * CHUNK_BLOCKS, pattern, 65536, 512,
+                           0, 0, 0, 0, 0);
+    TEST_ASSERT_NOT_NULL(task);
+    TEST_ASSERT_EQUAL(SCSI_STATUS_GOOD, task->status);
+    scsi_free_scsi_task(task);
+  }
+
+  for (int i = 0; i < NLOOPS; i++) {
+    struct scsi_task *task =
+        iscsi_read10_sync(iscsi, 0, i * CHUNK_BLOCKS, 65536, 512,
+                          0, 0, 0, 0, 0);
+    TEST_ASSERT_NOT_NULL(task);
+    TEST_ASSERT_EQUAL(SCSI_STATUS_GOOD, task->status);
+    TEST_ASSERT_EQUAL(65536, task->datain.size);
+    TEST_ASSERT_EQUAL_MEMORY(pattern, task->datain.data, 65536);
+    scsi_free_scsi_task(task);
+  }
+
+  iscsi_destroy_context(iscsi);
 }
 
 /* ── main ────────────────────────────────────────────────────────── */
@@ -137,7 +173,7 @@ int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_whitebox_inquiry);
   RUN_TEST(test_whitebox_read_capacity);
-  RUN_TEST(test_whitebox_read);
+  RUN_TEST(test_whitebox_write_read);
   int result = UNITY_END();
 
   if (g_server_thread) {
