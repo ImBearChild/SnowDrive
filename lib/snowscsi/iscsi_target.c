@@ -472,6 +472,12 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   memcpy(isid, &bhs[8], 6);
   uint8_t tsih[2];
   memcpy(tsih, &bhs[14], 2);
+  /* New session: request TSIH is 0; target MUST generate non-zero TSIH
+   * in the Login Final-Response (RFC 3720 §10.13.3) */
+  if (tsih[0] == 0 && tsih[1] == 0) {
+    tsih[0] = 0;
+    tsih[1] = 1;
+  }
   uint16_t cid = ((uint16_t)bhs[22] << 8) | bhs[23];
 
   memset(bhs, 0, 48);

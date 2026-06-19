@@ -243,10 +243,46 @@ void test_login_resp_bhs_rfc(void) {
   /* ISID echoed (bytes 8-13) */
   TEST_ASSERT_EQUAL_UINT8_ARRAY(g_mock.req_bhs + 8, bhs + 8, 6);
 
+  /* TSIH (bytes 14-15): non-zero for new session Login Final-Response
+   * (§10.13.3) */
+  uint16_t tsih = (uint16_t)bhs[14] << 8 | bhs[15];
+  TEST_ASSERT_NOT_EQUAL_UINT16(0, tsih);
+
+  /* Initiator Task Tag (bytes 16-19): echoed from request */
+  TEST_ASSERT_EQUAL_UINT8_ARRAY(g_mock.req_bhs + 16, bhs + 16, 4);
+
+  /* Bytes 20-23: reserved, MUST be 0 */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[20]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[21]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[22]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[23]);
+
   /* StatSN = 0 (first response) */
   uint32_t stat_sn = (uint32_t)bhs[24] << 24 | (uint32_t)bhs[25] << 16 |
                      (uint32_t)bhs[26] << 8 | bhs[27];
   TEST_ASSERT_EQUAL_UINT32(0, stat_sn);
+
+  /* ExpCmdSN (bytes 28-31): equals CmdSN from Login Request */
+  uint32_t req_cmd_sn = (uint32_t)g_mock.req_bhs[28] << 24 |
+                        (uint32_t)g_mock.req_bhs[29] << 16 |
+                        (uint32_t)g_mock.req_bhs[30] << 8 |
+                        g_mock.req_bhs[31];
+  uint32_t exp_cmd_sn = (uint32_t)bhs[28] << 24 | (uint32_t)bhs[29] << 16 |
+                        (uint32_t)bhs[30] << 8 | bhs[31];
+  TEST_ASSERT_EQUAL_UINT32(req_cmd_sn, exp_cmd_sn);
+
+  /* MaxCmdSN (bytes 32-35): equals CmdSN from Login Request */
+  uint32_t max_cmd_sn = (uint32_t)bhs[32] << 24 | (uint32_t)bhs[33] << 16 |
+                        (uint32_t)bhs[34] << 8 | bhs[35];
+  TEST_ASSERT_EQUAL_UINT32(req_cmd_sn, max_cmd_sn);
+
+  /* Status-Class (byte 36) = 0 (Success); Status-Detail (byte 37) = 0 */
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[36]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, bhs[37]);
+
+  /* Bytes 38-47: reserved, MUST be 0 */
+  for (int i = 38; i < 48; i++)
+    TEST_ASSERT_EQUAL_HEX8_MESSAGE(0x00, bhs[i], "reserved byte not zero");
 }
 
 /* Verify no disallowed keys appear in the Login Response text */
@@ -270,6 +306,10 @@ void test_login_resp_no_skipped_keys(void) {
   /* AuthMethod — initiator didn't send it and always=false */
   TEST_ASSERT_FALSE_MESSAGE(resp_has_key(text, dsl, "AuthMethod"),
                             "AuthMethod must not appear (stage mismatch)");
+
+  /* TargetAddress — only appears on redirect, never in normal accept */
+  TEST_ASSERT_FALSE_MESSAGE(resp_has_key(text, dsl, "TargetAddress"),
+                            "TargetAddress must not appear (no redirect)");
 }
 
 /* Verify required keys are present in the Login Response text */
@@ -289,50 +329,60 @@ void test_login_resp_has_required_keys(void) {
   TEST_ASSERT_EQUAL_STRING("1", tpgt);
 }
 
-/* Verify echoed key values match the initiator's proposal */
-void test_login_resp_echoed_values(void) {
+/* Verify ALL keys proposed by the initiator are echoed back */
+void test_login_resp_echoes_all_keys(void) {
   uint32_t dsl = ((uint32_t)g_mock.resp[5] << 16) |
                  ((uint32_t)g_mock.resp[6] << 8) | g_mock.resp[7];
   const uint8_t *text = g_mock.resp + 48;
 
-  /* Keys with NULL in LOGIN_TABLE (echo) */
+  /* Keys echoed because LOGIN_TABLE entry has value=NULL */
   const char *v = resp_value(text, dsl, "InitialR2T");
-  TEST_ASSERT_NOT_NULL_MESSAGE(v, "InitialR2T missing");
+  TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("No", v);
-
   v = resp_value(text, dsl, "MaxBurstLength");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("16776192", v);
-
   v = resp_value(text, dsl, "FirstBurstLength");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("262144", v);
-
   v = resp_value(text, dsl, "MaxRecvDataSegmentLength");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("262144", v);
+  v = resp_value(text, dsl, "DataPDUInOrder");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("Yes", v);
+  v = resp_value(text, dsl, "DataSequenceInOrder");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("Yes", v);
+  v = resp_value(text, dsl, "DefaultTime2Wait");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("2", v);
+  v = resp_value(text, dsl, "DefaultTime2Retain");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("0", v);
+  v = resp_value(text, dsl, "IFMarker");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("No", v);
+  v = resp_value(text, dsl, "OFMarker");
+  TEST_ASSERT_NOT_NULL(v);
+  TEST_ASSERT_EQUAL_STRING("No", v);
 
-  /* Keys with hardcoded value in LOGIN_TABLE */
+  /* Keys echoed because LOGIN_TABLE entry has hardcoded value */
   v = resp_value(text, dsl, "HeaderDigest");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("None", v);
-
   v = resp_value(text, dsl, "DataDigest");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("None", v);
-
   v = resp_value(text, dsl, "ImmediateData");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("Yes", v);
-
   v = resp_value(text, dsl, "MaxOutstandingR2T");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("1", v);
-
   v = resp_value(text, dsl, "MaxConnections");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("1", v);
-
   v = resp_value(text, dsl, "ErrorRecoveryLevel");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("0", v);
@@ -354,7 +404,7 @@ int main(void) {
   RUN_TEST(test_login_resp_bhs_rfc);
   RUN_TEST(test_login_resp_no_skipped_keys);
   RUN_TEST(test_login_resp_has_required_keys);
-  RUN_TEST(test_login_resp_echoed_values);
+  RUN_TEST(test_login_resp_echoes_all_keys);
   RUN_TEST(test_login_resp_data_length);
   return UNITY_END();
 }
