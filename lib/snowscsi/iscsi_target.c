@@ -26,11 +26,11 @@ static const login_param_t LOGIN_TABLE[] = {
     {"AuthMethod", "None", false},
     {"HeaderDigest", "None", false},
     {"DataDigest", "None", false},
-    {"InitialR2T", NULL, false},
+    {"InitialR2T", "Yes", false},
     {"ImmediateData", "Yes", false},
     {"MaxBurstLength", NULL, false},
     {"FirstBurstLength", NULL, false},
-    {"MaxRecvDataSegmentLength", NULL, false},
+    {"MaxRecvDataSegmentLength", "8192", false},
     {"MaxOutstandingR2T", "1", false},
     {"ErrorRecoveryLevel", "0", false},
     {"MaxConnections", "1", false},
@@ -356,16 +356,9 @@ static int send_r2t(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, exp_cmd_sn);
   snowscsi_iscsi_bhs_r2t_set_r2tsn(bhs, ttt); /* R2TSN = TTT for simplicity */
   snowscsi_iscsi_bhs_set_r2t_buffer_offset(bhs, buffer_offset);
+  snowscsi_iscsi_bhs_set_desired_data_len(bhs, desired_len);
 
-  /* Desired Data Transfer Length in data segment (RFC 3720 §10.8) */
-  uint8_t desired_be32[4];
-  desired_be32[0] = (uint8_t)(desired_len >> 24);
-  desired_be32[1] = (uint8_t)(desired_len >> 16);
-  desired_be32[2] = (uint8_t)(desired_len >> 8);
-  desired_be32[3] = (uint8_t)(desired_len);
-  snowscsi_iscsi_bhs_set_data_seg_len(bhs, sizeof(desired_be32));
-
-  return send_pdu(t, ctx, conn, bhs, desired_be32, sizeof(desired_be32));
+  return send_pdu(t, ctx, conn, bhs, NULL, 0);
 }
 
 /* ── Send Reject PDU ────────────────────────────────────────────── */
@@ -637,7 +630,7 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
 
   /* Send R2T for the remaining data */
   uint32_t remaining = transfer_len - received;
-  if (send_r2t(t, ctx, conn, itt, 1, *stat_sn, *cmd_sn + 1, received,
+  if (send_r2t(t, ctx, conn, itt, 0, *stat_sn, *cmd_sn + 1, received,
                remaining) < 0)
     return -1;
 
@@ -821,19 +814,20 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       /* For SCSI Command write PDUs with immediate data, read it now and
        * pass to the command handler.  For everything else, skip the data
        * segment. */
-      uint8_t imm_data_buf[SNOWSCSI_ISCSI_MAX_DATA_SEGMENT];
+      uint8_t *imm_data = NULL;
       uint32_t imm_data_len = 0;
       bool is_write = (op == SNOWSCSI_ISCSI_OP_SCSI_CMD) &&
                       (bhs[1] & 0x20);             /* W bit in byte 1 */
 
       if (op == SNOWSCSI_ISCSI_OP_SCSI_CMD && is_write && dsl > 0) {
-        if (dsl > sizeof(imm_data_buf)) {
+        imm_data = malloc(dsl);
+        if (!imm_data) {
           skip_dseg(t, transport_ctx, conn, dsl);
-          send_reject(t, transport_ctx, conn,
-                      SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, stat_sn, cmd_sn + 1);
+          running = 0;
           break;
         }
-        if (read_dseg(t, transport_ctx, conn, imm_data_buf, dsl) < 0) {
+        if (read_dseg(t, transport_ctx, conn, imm_data, dsl) < 0) {
+          free(imm_data);
           running = 0;
           break;
         }
@@ -861,9 +855,10 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         cmd_sn = recv_cmd_sn;
 
         if (handle_scsi_cmd(t, transport_ctx, conn, bhs, devs, num_devs,
-                            &stat_sn, &cmd_sn, imm_data_buf, imm_data_len) < 0) {
+                            &stat_sn, &cmd_sn, imm_data, imm_data_len) < 0) {
           running = 0;
         }
+        free(imm_data);
         break;
       }
 

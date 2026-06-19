@@ -336,9 +336,9 @@ void test_login_resp_echoes_all_keys(void) {
   const uint8_t *text = g_mock.resp + 48;
 
   /* Keys echoed because LOGIN_TABLE entry has value=NULL */
-  const char *v = resp_value(text, dsl, "InitialR2T");
+  const char *  v = resp_value(text, dsl, "InitialR2T");
   TEST_ASSERT_NOT_NULL(v);
-  TEST_ASSERT_EQUAL_STRING("No", v);
+  TEST_ASSERT_EQUAL_STRING("Yes", v);
   v = resp_value(text, dsl, "MaxBurstLength");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("16776192", v);
@@ -347,7 +347,7 @@ void test_login_resp_echoes_all_keys(void) {
   TEST_ASSERT_EQUAL_STRING("262144", v);
   v = resp_value(text, dsl, "MaxRecvDataSegmentLength");
   TEST_ASSERT_NOT_NULL(v);
-  TEST_ASSERT_EQUAL_STRING("262144", v);
+  TEST_ASSERT_EQUAL_STRING("8192", v);
   v = resp_value(text, dsl, "DataPDUInOrder");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("Yes", v);
