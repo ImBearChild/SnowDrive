@@ -23,6 +23,11 @@ add_executable(test_iscsi_target test_iscsi_target.c)
 target_link_libraries(test_iscsi_target PRIVATE libsnowscsi unity)
 add_test(NAME iscsi_target COMMAND test_iscsi_target)
 
+find_package(Threads REQUIRED)
+add_executable(test_iscsi_login_rfc test_iscsi_login_rfc.c)
+target_link_libraries(test_iscsi_login_rfc PRIVATE libsnowscsi unity Threads::Threads)
+add_test(NAME iscsi_login_rfc COMMAND test_iscsi_login_rfc)
+
 find_package(PkgConfig)
 if(PkgConfig_FOUND)
     pkg_check_modules(LIBISCSI libiscsi)
