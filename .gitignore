@@ -76,4 +76,4 @@ dkms.conf
 .cache/
 
 # Local notes
-__*.md
+__*
