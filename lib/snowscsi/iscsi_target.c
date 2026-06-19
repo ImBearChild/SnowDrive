@@ -605,8 +605,8 @@ static int handle_data_in(const snowscsi_transport_ops_t *t, void *ctx,
 static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
                            intptr_t conn, snowscsi_device_t *dev, uint32_t itt,
                            uint32_t *stat_sn, uint32_t *cmd_sn,
-                           uint32_t transfer_len,
-                           const uint8_t *imm_data, uint32_t imm_data_len) {
+                           uint32_t transfer_len, const uint8_t *imm_data,
+                           uint32_t imm_data_len) {
   uint8_t bhs[48];
   uint8_t data_buf[SNOWSCSI_ISCSI_MAX_DATA_SEGMENT];
 
@@ -817,7 +817,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       uint8_t *imm_data = NULL;
       uint32_t imm_data_len = 0;
       bool is_write = (op == SNOWSCSI_ISCSI_OP_SCSI_CMD) &&
-                      (bhs[1] & 0x20);             /* W bit in byte 1 */
+                      (bhs[1] & 0x20); /* W bit in byte 1 */
 
       if (op == SNOWSCSI_ISCSI_OP_SCSI_CMD && is_write && dsl > 0) {
         imm_data = malloc(dsl);

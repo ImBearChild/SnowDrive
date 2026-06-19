@@ -1,5 +1,38 @@
 # Contributing to SnowDrive
 
+## Project Structure
+
+SCSI device emulation toolkit — two C libraries and two CLI tools.
+
+| Component | Description |
+|-----------|-------------|
+| **libsnow9660** | ISO9660 + Joliet filesystem library |
+| **libsnowscsi** | SCSI device emulation + iSCSI target protocol |
+| **snow9660** | CLI — `list` command prints ISO directory tree |
+| **snowscsi** | CLI — `serve` command starts iSCSI target |
+
+```
+snowdrive/
+├── include/
+│   ├── snow9660/          # libsnow9660 public headers
+│   └── snowscsi/          # libsnowscsi public headers
+├── lib/
+│   ├── snow9660/          # libsnow9660 implementation
+│   ├── snowscsi/          # libsnowscsi implementation
+│   └── common/            # Shared utilities (snowlog, snowhex)
+├── src/                   # CLI tools
+├── tests/                 # Unit tests (Unity)
+├── CMakeLists.txt         # Top-level build
+└── HACKING.md
+```
+
+Library dependency chain:
+
+```
+snow9660 CLI ── libsnow9660 ── snowcommon
+snowscsi CLI ── libsnowscsi ── snowcommon
+```
+
 ## Commit Messages
 
 This project follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
@@ -91,7 +124,7 @@ This project uses `clang-format` for C code formatting. The default style is LLV
 Format all C source and header files:
 
 ```bash
-clang-format -i *.c *.h
+find ./include/ ./src/ ./lib/ ./tests/ \( -name '*.c' -o -name '*.h' \) -exec clang-format -i --verbose {} +
 ```
 
 Format a specific file:

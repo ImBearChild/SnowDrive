@@ -1,8 +1,8 @@
 #include "device_internal.h"
 
 #define SNOWLOG_TAG "block"
-#include "snowlog.h"
 #include "snowhex.h"
+#include "snowlog.h"
 
 #include <stdlib.h>
 #include <string.h>

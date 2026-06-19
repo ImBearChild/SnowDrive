@@ -5,8 +5,8 @@
 #include <snowscsi/iscsi.h>
 
 #include <pthread.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 /* ── Build initiator text keys ──────────────────────────────────────
@@ -20,40 +20,40 @@
  *  bytes including the final \0 from the last fragment.
  */
 #define REQ_TEXT                                                               \
-  "InitiatorName=iqn.1994-05.com.redhat:702f27e1da14\0"                       \
-  "InitiatorAlias=develop\0"                                                  \
-  "TargetName=iqn.1970-01.local.snowscsi:target\0"                            \
-  "SessionType=Normal\0"                                                      \
-  "HeaderDigest=None\0"                                                       \
-  "DataDigest=None\0"                                                         \
-  "DefaultTime2Wait=2\0"                                                      \
-  "DefaultTime2Retain=0\0"                                                    \
-  "IFMarker=No\0"                                                             \
-  "OFMarker=No\0"                                                             \
-  "ErrorRecoveryLevel=0\0"                                                    \
-  "InitialR2T=No\0"                                                           \
-  "ImmediateData=Yes\0"                                                       \
-  "MaxBurstLength=16776192\0"                                                 \
-  "FirstBurstLength=262144\0"                                                 \
-  "MaxOutstandingR2T=1\0"                                                     \
-  "MaxConnections=1\0"                                                        \
-  "DataPDUInOrder=Yes\0"                                                      \
-  "DataSequenceInOrder=Yes\0"                                                 \
+  "InitiatorName=iqn.1994-05.com.redhat:702f27e1da14\0"                        \
+  "InitiatorAlias=develop\0"                                                   \
+  "TargetName=iqn.1970-01.local.snowscsi:target\0"                             \
+  "SessionType=Normal\0"                                                       \
+  "HeaderDigest=None\0"                                                        \
+  "DataDigest=None\0"                                                          \
+  "DefaultTime2Wait=2\0"                                                       \
+  "DefaultTime2Retain=0\0"                                                     \
+  "IFMarker=No\0"                                                              \
+  "OFMarker=No\0"                                                              \
+  "ErrorRecoveryLevel=0\0"                                                     \
+  "InitialR2T=No\0"                                                            \
+  "ImmediateData=Yes\0"                                                        \
+  "MaxBurstLength=16776192\0"                                                  \
+  "FirstBurstLength=262144\0"                                                  \
+  "MaxOutstandingR2T=1\0"                                                      \
+  "MaxConnections=1\0"                                                         \
+  "DataPDUInOrder=Yes\0"                                                       \
+  "DataSequenceInOrder=Yes\0"                                                  \
   "MaxRecvDataSegmentLength=262144\0"
 
 /* ── Mock transport context ──────────────────────────────────────── */
 
 typedef struct {
-  uint8_t req_bhs[48];                /* Login Request BHS */
-  const char *req_text;               /* null-separated key=value pairs */
-  uint32_t req_dsl;                   /* DataSegmentLength of text */
+  uint8_t req_bhs[48];  /* Login Request BHS */
+  const char *req_text; /* null-separated key=value pairs */
+  uint32_t req_dsl;     /* DataSegmentLength of text */
 
-  uint8_t resp[48 + 8192 + 3];        /* captured Login Response */
-  size_t  resp_len;
+  uint8_t resp[48 + 8192 + 3]; /* captured Login Response */
+  size_t resp_len;
 
-  int     recv_call_nr;               /* which recv call we are on */
-  int     accept_called;              /* ensure only one connection */
-  bool    stop;                       /* signal mock_accept to stop */
+  int recv_call_nr;  /* which recv call we are on */
+  int accept_called; /* ensure only one connection */
+  bool stop;         /* signal mock_accept to stop */
 } mock_ctx_t;
 
 static mock_ctx_t g_mock;
@@ -61,15 +61,17 @@ static mock_ctx_t g_mock;
 /* ── Mock transport callbacks ────────────────────────────────────── */
 
 static intptr_t mock_listen(void *ctx, const char *addr, uint16_t port) {
-  (void)ctx; (void)addr; (void)port;
-  return 42;                          /* dummy listener fd */
+  (void)ctx;
+  (void)addr;
+  (void)port;
+  return 42; /* dummy listener fd */
 }
 
 static intptr_t mock_accept(void *ctx, intptr_t listener) {
   (void)listener;
   mock_ctx_t *m = (mock_ctx_t *)ctx;
   if (m->accept_called++ == 0)
-    return 1;                         /* one fake connection */
+    return 1; /* one fake connection */
 
   /* Block until the test finishes */
   while (!m->stop)
@@ -78,7 +80,8 @@ static intptr_t mock_accept(void *ctx, intptr_t listener) {
 }
 
 static int mock_recv(void *ctx, intptr_t conn, void *buf, size_t len) {
-  (void)conn; (void)len;
+  (void)conn;
+  (void)len;
   mock_ctx_t *m = (mock_ctx_t *)ctx;
   int n = m->recv_call_nr++;
 
@@ -112,25 +115,27 @@ static int mock_send(void *ctx, intptr_t conn, const void *buf, size_t len) {
 }
 
 static void mock_disconnect(void *ctx, intptr_t conn) {
-  (void)ctx; (void)conn;
+  (void)ctx;
+  (void)conn;
 }
 
 static void mock_stop(void *ctx, intptr_t listener) {
-  (void)ctx; (void)listener;
+  (void)ctx;
+  (void)listener;
 }
 
 static const snowscsi_transport_ops_t MOCK_TRANSPORT = {
-    .listen     = mock_listen,
-    .accept     = mock_accept,
-    .recv       = mock_recv,
-    .send       = mock_send,
+    .listen = mock_listen,
+    .accept = mock_accept,
+    .recv = mock_recv,
+    .send = mock_send,
     .disconnect = mock_disconnect,
-    .stop       = mock_stop,
+    .stop = mock_stop,
 };
 
 /* ── Server thread ───────────────────────────────────────────────── */
 
-static pthread_t       g_server;
+static pthread_t g_server;
 static snowscsi_device_t *g_dev;
 
 static void *server_thread(void *arg) {
@@ -145,11 +150,11 @@ static void *server_thread(void *arg) {
 /* Build a Login Request BHS that matches what the Linux initiator sends */
 static void build_login_req_bhs(uint8_t bhs[48], uint32_t dsl) {
   memset(bhs, 0, 48);
-  bhs[0] = SNOWSCSI_ISCSI_OP_LOGIN_REQ | 0x40;          /* I bit set */
+  bhs[0] = SNOWSCSI_ISCSI_OP_LOGIN_REQ | 0x40; /* I bit set */
   bhs[1] = 0x80 | (SNOWSCSI_ISCSI_STAGE_OP_PARAM << 2) |
            SNOWSCSI_ISCSI_STAGE_FULL_FEATURE;
-  bhs[2] = 0;                     /* Version-max */
-  bhs[3] = 0;                     /* Version-min */
+  bhs[2] = 0; /* Version-max */
+  bhs[3] = 0; /* Version-min */
   bhs[5] = (uint8_t)((dsl >> 16) & 0xFF);
   bhs[6] = (uint8_t)((dsl >> 8) & 0xFF);
   bhs[7] = (uint8_t)(dsl & 0xFF);
@@ -198,7 +203,7 @@ void setUp(void) {
   build_login_req_bhs(g_mock.req_bhs, g_mock.req_dsl);
 
   pthread_create(&g_server, NULL, server_thread, NULL);
-  usleep(200000);   /* give the server time to process the login */
+  usleep(200000); /* give the server time to process the login */
 }
 
 void tearDown(void) {
@@ -265,8 +270,7 @@ void test_login_resp_bhs_rfc(void) {
   /* ExpCmdSN (bytes 28-31): equals CmdSN from Login Request */
   uint32_t req_cmd_sn = (uint32_t)g_mock.req_bhs[28] << 24 |
                         (uint32_t)g_mock.req_bhs[29] << 16 |
-                        (uint32_t)g_mock.req_bhs[30] << 8 |
-                        g_mock.req_bhs[31];
+                        (uint32_t)g_mock.req_bhs[30] << 8 | g_mock.req_bhs[31];
   uint32_t exp_cmd_sn = (uint32_t)bhs[28] << 24 | (uint32_t)bhs[29] << 16 |
                         (uint32_t)bhs[30] << 8 | bhs[31];
   TEST_ASSERT_EQUAL_UINT32(req_cmd_sn, exp_cmd_sn);
@@ -336,7 +340,7 @@ void test_login_resp_echoes_all_keys(void) {
   const uint8_t *text = g_mock.resp + 48;
 
   /* Keys echoed because LOGIN_TABLE entry has value=NULL */
-  const char *  v = resp_value(text, dsl, "InitialR2T");
+  const char *v = resp_value(text, dsl, "InitialR2T");
   TEST_ASSERT_NOT_NULL(v);
   TEST_ASSERT_EQUAL_STRING("Yes", v);
   v = resp_value(text, dsl, "MaxBurstLength");
