@@ -15,8 +15,8 @@ snowscsi_result_t snowscsi_do_cmd(snowscsi_device_t *dev, const uint8_t *cdb,
   dev->write_backend_offset = 0;
 
   snowscsi_result_t r = dev->handle_cmd(dev, cdb, cdb_len, transfer_len);
-  SNOW_LOGV("do_cmd: opcode=0x%02x result=%d transfer_len=%u",
-            cdb ? cdb[0] : 0, (int)r, transfer_len ? *transfer_len : 0);
+  SNOW_LOGV("do_cmd: opcode=0x%02x result=%d transfer_len=%u", cdb ? cdb[0] : 0,
+            (int)r, transfer_len ? *transfer_len : 0);
   if (r != SNOWSCSI_CHECK_CONDITION)
     snowscsi_sense_clear(&dev->sense);
   return r;

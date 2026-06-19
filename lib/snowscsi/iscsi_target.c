@@ -591,7 +591,8 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
 
     uint8_t op = snowscsi_iscsi_bhs_get_opcode(bhs);
     if (op != SNOWSCSI_ISCSI_OP_SCSI_DATA_OUT) {
-      /* Unexpected PDU during data phase */
+      SNOW_LOGW("handle_data_out: expected SCSI_DATA_OUT, got %s(0x%02x)",
+                snowscsi_iscsi_opcode_name(op), op);
       send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
                   *cmd_sn + 1);
       return -1;
@@ -822,7 +823,8 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       }
 
       default:
-        /* Unknown/unsupported PDU */
+        SNOW_LOGW("unexpected iSCSI PDU opcode=%s(0x%02x)",
+                  snowscsi_iscsi_opcode_name(op), op);
         send_reject(t, transport_ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR,
                     stat_sn, cmd_sn + 1);
         break;

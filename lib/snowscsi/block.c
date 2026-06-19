@@ -2,6 +2,7 @@
 
 #define SNOWLOG_TAG "block"
 #include "snowlog.h"
+#include "snowhex.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -223,7 +224,12 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
   }
 
   default:
-    SNOW_LOGW("unknown opcode 0x%02x", opcode);
+    SNOW_LOGI("unknown opcode 0x%02x", opcode);
+    {
+      char _hex[16 * 3 + 1];
+      snowhex_format(cdb, cdb_len, _hex, sizeof(_hex));
+      SNOW_LOGV("cdb=%s", _hex);
+    }
     snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
                        SNOWSCSI_ASC_INVALID_COMMAND, 0x00);
     goto check_condition;
