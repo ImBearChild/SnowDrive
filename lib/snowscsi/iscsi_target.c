@@ -22,7 +22,6 @@ typedef struct {
 } login_param_t;
 
 static const login_param_t LOGIN_TABLE[] = {
-    {"TargetName", "iqn.1970-01.local.snowscsi:target", true},
     {"TargetAlias", "SnowSCSI", true},
     {"AuthMethod", "None", false},
     {"HeaderDigest", "None", false},
@@ -35,7 +34,7 @@ static const login_param_t LOGIN_TABLE[] = {
     {"MaxOutstandingR2T", "1", false},
     {"ErrorRecoveryLevel", "0", false},
     {"MaxConnections", "1", false},
-    {"TargetPortalGroupTag", "1", false},
+    {"TargetPortalGroupTag", "1", true},
     {"DataPDUInOrder", NULL, false},
     {"DataSequenceInOrder", NULL, false},
     {"DefaultTime2Wait", NULL, false},
@@ -46,8 +45,9 @@ static const login_param_t LOGIN_TABLE[] = {
 
 enum { LOGIN_TABLE_SIZE = sizeof(LOGIN_TABLE) / sizeof(LOGIN_TABLE[0]) };
 
-static bool is_initiator_only(const char *key) {
-  const char *list[] = {"InitiatorName", "SessionType", NULL};
+static bool is_skip_key(const char *key) {
+  static const char *list[] = {"InitiatorName", "InitiatorAlias", "SessionType",
+                               "TargetName", NULL};
   for (int i = 0; list[i]; i++)
     if (strcmp(key, list[i]) == 0)
       return true;
@@ -121,7 +121,7 @@ static char *login_build_resp(const uint8_t *idata, uint32_t ilen,
       } else {
         APPEND_KV(k, usev);
       }
-    } else if (!is_initiator_only(k)) {
+    } else if (!is_skip_key(k)) {
       APPEND_KV(k, "Reject");
     }
 
@@ -477,6 +477,8 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   memset(bhs, 0, 48);
   memcpy(&bhs[8], isid, 6);
   memcpy(&bhs[14], tsih, 2);
+  bhs[2] = 0; /* Version-max (RFC 3720 §10.12.4) */
+  bhs[3] = 0; /* Version-active */
 
   snowscsi_iscsi_bhs_set_opcode(bhs, SNOWSCSI_ISCSI_OP_LOGIN_RESP);
   snowscsi_iscsi_bhs_set_t_bit(bhs, true);
@@ -646,10 +648,11 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
 
   SNOW_LOGD("scsi_cmd: %s(0x%02x) lun=%u itt=0x%x result=%s%s",
             snowscsi_cdb_opcode_name(opcode), opcode, lun, itt,
-            r == SNOWSCSI_STATUS ? "STATUS" :
-            r == SNOWSCSI_DATA_IN ? "DATA_IN" :
-            r == SNOWSCSI_DATA_OUT ? "DATA_OUT" :
-            r == SNOWSCSI_CHECK_CONDITION ? "CHECK_CONDITION" : "UNKNOWN",
+            r == SNOWSCSI_STATUS            ? "STATUS"
+            : r == SNOWSCSI_DATA_IN         ? "DATA_IN"
+            : r == SNOWSCSI_DATA_OUT        ? "DATA_OUT"
+            : r == SNOWSCSI_CHECK_CONDITION ? "CHECK_CONDITION"
+                                            : "UNKNOWN",
             r == SNOWSCSI_CHECK_CONDITION ? " (see block log for sense)" : "");
 
   switch (r) {
@@ -795,19 +798,14 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
       }
 
       case SNOWSCSI_ISCSI_OP_LOGIN_REQ: {
-        /* recv_bhs() consumed BHS + DataSegment but not padding.
-         * Consume padding then send a minimal Login Response. */
-        uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
-        uint32_t pdu_len = 48 + dsl;
-        uint32_t pad = (4 - (pdu_len & 3)) & 3;
-        if (pad > 0) {
-          uint8_t junk[4];
-          t_recv(t, transport_ctx, conn, junk, pad);
-        }
+        /* recv_bhs() already consumed BHS + DataSegment + padding,
+         * only a minimal Login Response needs to be sent. */
         uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
         uint8_t req_csg = snowscsi_iscsi_bhs_get_csg(bhs);
         uint8_t lbhs[48];
         memset(lbhs, 0, 48);
+        lbhs[2] = 0; /* Version-max (RFC 3720 §10.12.4) */
+        lbhs[3] = 0; /* Version-active */
         snowscsi_iscsi_bhs_set_opcode(lbhs, SNOWSCSI_ISCSI_OP_LOGIN_RESP);
         snowscsi_iscsi_bhs_set_t_bit(lbhs, true);
         lbhs[1] |=

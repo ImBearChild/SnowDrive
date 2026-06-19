@@ -173,11 +173,11 @@ uint8_t snowscsi_iscsi_bhs_get_csg(const uint8_t bhs[48]) {
 }
 
 uint8_t snowscsi_iscsi_bhs_get_nsg(const uint8_t bhs[48]) {
-  return (bhs[1] >> SNOWSCSI_ISCSI_FLAG_NSG_SHIFT) & 0x0F;
+  return (bhs[1] >> SNOWSCSI_ISCSI_FLAG_NSG_SHIFT) & 0x03;
 }
 
 void snowscsi_iscsi_bhs_set_nsg(uint8_t bhs[48], uint8_t nsg) {
-  bhs[1] = (bhs[1] & ~0x0F) | (nsg & 0x0F);
+  bhs[1] = (bhs[1] & ~0x03) | (nsg & 0x03);
 }
 
 /* ── T bit ────────────────────────────────────────────────────────

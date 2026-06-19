@@ -52,8 +52,10 @@
 #define SNOWSCSI_ISCSI_FLAG_T_BIT 0x80
 #define SNOWSCSI_ISCSI_FLAG_F_BIT 0x80 /* Final bit in Data PDUs */
 
-/* CSG/NSG fields: byte 1 bits 6-5 = CSG, bits 3-0 = NSG */
-#define SNOWSCSI_ISCSI_FLAG_CSG_SHIFT 5
+/* CSG/NSG fields (RFC 3720 §10.12–10.13):
+ *   byte 1 bits 3-2 = CSG (2 bits), bits 1-0 = NSG (2 bits)
+ *   (MSB0 diagram: bits 4-5=CSG, bits 6-7=NSG) */
+#define SNOWSCSI_ISCSI_FLAG_CSG_SHIFT 2
 #define SNOWSCSI_ISCSI_FLAG_NSG_SHIFT 0
 
 /* ── Generic BHS field accessors ─────────────────────────────────

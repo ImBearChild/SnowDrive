@@ -191,8 +191,8 @@ void test_iscsi_pdu_login_csg_nsg(void) {
   uint8_t bhs[48];
   memset(bhs, 0, 48);
 
-  /* Set CSG=1 (bits 6-5), NSG=3 (bits 3-0) */
-  bhs[1] = (1 << 5) | 3;
+  /* Set CSG=1 (bits 3-2), NSG=3 (bits 1-0) — RFC 3720 §10.12 */
+  bhs[1] = (1 << 2) | 3;
 
   TEST_ASSERT_EQUAL_UINT8(1, snowscsi_iscsi_bhs_get_csg(bhs));
   TEST_ASSERT_EQUAL_UINT8(3, snowscsi_iscsi_bhs_get_nsg(bhs));
