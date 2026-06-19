@@ -179,18 +179,25 @@ static void log_bhs(const char *dir, const uint8_t bhs[48]) {
       dir, snowscsi_iscsi_opcode_name(op), op, flags, ahs, dsl, lun, itt, spec);
 }
 
-/* ── receive BHS + discard any DataSegment ──────────────────────── */
+/* ── BHS + data-segment helpers ─────────────────────────────────── */
 
+/* Receive only the BHS (48 bytes), return DataSegmentLength via *out_dsl. */
 static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
-                    uint8_t bhs[48]) {
+                    uint8_t bhs[48], uint32_t *out_dsl) {
   int r = t_recv(t, ctx, conn, bhs, 48);
   if (r < 0)
     return -1;
   log_bhs("RX", bhs);
-
-  /* Discard DataSegment (we never expect or parse initiator data
-   * besides the CDB in the SCSI Command BHS) */
   uint32_t dsl = snowscsi_iscsi_bhs_get_data_seg_len(bhs);
+  if (out_dsl)
+    *out_dsl = dsl;
+  return 0;
+}
+
+/* Skip (discard) DataSegment + padding for a PDU we don't need the data
+ * from.  dsl is the DataSegmentLength returned by recv_bhs. */
+static int skip_dseg(const snowscsi_transport_ops_t *t, void *ctx,
+                     intptr_t conn, uint32_t dsl) {
   if (dsl > 0) {
     uint8_t discard[8192];
     uint32_t remain = dsl;
@@ -202,8 +209,6 @@ static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
       remain -= chunk;
     }
   }
-
-  /* Consume PDU padding to 4-byte boundary (RFC 3720 §3.1) */
   uint32_t pdu_len = 48 + dsl;
   uint32_t pad = (4 - (pdu_len & 3)) & 3;
   if (pad > 0) {
@@ -211,7 +216,24 @@ static int recv_bhs(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
     if (t_recv(t, ctx, conn, junk, pad) < 0)
       return -1;
   }
+  return 0;
+}
 
+/* Read DataSegment into buf, then consume padding.  dsl is the
+ * DataSegmentLength returned by recv_bhs.  buf must be >= dsl bytes. */
+static int read_dseg(const snowscsi_transport_ops_t *t, void *ctx,
+                     intptr_t conn, uint8_t *buf, uint32_t dsl) {
+  if (dsl > 0) {
+    if (t_recv(t, ctx, conn, buf, dsl) < 0)
+      return -1;
+  }
+  uint32_t pdu_len = 48 + dsl;
+  uint32_t pad = (4 - (pdu_len & 3)) & 3;
+  if (pad > 0) {
+    uint8_t junk[4];
+    if (t_recv(t, ctx, conn, junk, pad) < 0)
+      return -1;
+  }
   return 0;
 }
 
@@ -334,9 +356,16 @@ static int send_r2t(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   snowscsi_iscsi_bhs_notify_set_max_cmd_sn(bhs, exp_cmd_sn);
   snowscsi_iscsi_bhs_r2t_set_r2tsn(bhs, ttt); /* R2TSN = TTT for simplicity */
   snowscsi_iscsi_bhs_set_r2t_buffer_offset(bhs, buffer_offset);
-  snowscsi_iscsi_bhs_set_desired_data_len(bhs, desired_len);
 
-  return send_pdu(t, ctx, conn, bhs, NULL, 0);
+  /* Desired Data Transfer Length in data segment (RFC 3720 §10.8) */
+  uint8_t desired_be32[4];
+  desired_be32[0] = (uint8_t)(desired_len >> 24);
+  desired_be32[1] = (uint8_t)(desired_len >> 16);
+  desired_be32[2] = (uint8_t)(desired_len >> 8);
+  desired_be32[3] = (uint8_t)(desired_len);
+  snowscsi_iscsi_bhs_set_data_seg_len(bhs, sizeof(desired_be32));
+
+  return send_pdu(t, ctx, conn, bhs, desired_be32, sizeof(desired_be32));
 }
 
 /* ── Send Reject PDU ────────────────────────────────────────────── */
@@ -583,13 +612,33 @@ static int handle_data_in(const snowscsi_transport_ops_t *t, void *ctx,
 static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
                            intptr_t conn, snowscsi_device_t *dev, uint32_t itt,
                            uint32_t *stat_sn, uint32_t *cmd_sn,
-                           uint32_t transfer_len) {
+                           uint32_t transfer_len,
+                           const uint8_t *imm_data, uint32_t imm_data_len) {
   uint8_t bhs[48];
   uint8_t data_buf[SNOWSCSI_ISCSI_MAX_DATA_SEGMENT];
 
-  /* Send R2T for the full transfer */
-  if (send_r2t(t, ctx, conn, itt, 1, *stat_sn, *cmd_sn + 1, 0, transfer_len) <
-      0)
+  /* Process immediate data if any */
+  uint32_t received = imm_data_len;
+  if (imm_data_len > 0) {
+    int done = snowscsi_write_data(dev, imm_data, imm_data_len);
+    if (done < 0) {
+      snowscsi_sense_t sense;
+      snowscsi_device_get_sense(dev, &sense);
+      return send_scsi_response(t, ctx, conn, itt, stat_sn, cmd_sn,
+                                SNOWSCSI_ISCSI_SCSI_STATUS_CHECK_CONDITION,
+                                &sense);
+    }
+    if (done == 1 || received >= transfer_len) {
+      SNOW_LOGV("handle_data_out: all data via immediate, done=%d", done);
+      return send_scsi_response(t, ctx, conn, itt, stat_sn, cmd_sn,
+                                SNOWSCSI_ISCSI_SCSI_STATUS_GOOD, NULL);
+    }
+  }
+
+  /* Send R2T for the remaining data */
+  uint32_t remaining = transfer_len - received;
+  if (send_r2t(t, ctx, conn, itt, 1, *stat_sn, *cmd_sn + 1, received,
+               remaining) < 0)
     return -1;
 
   /* Receive Data-Out PDUs until complete */
@@ -614,9 +663,17 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
         return -1;
     }
 
+    /* Consume DATA-OUT padding (RFC 3720 §3.1) */
+    uint32_t pdu_len = 48 + dsl;
+    uint32_t pad = (4 - (pdu_len & 3)) & 3;
+    if (pad > 0) {
+      uint8_t junk[4];
+      if (t_recv(t, ctx, conn, junk, pad) < 0)
+        return -1;
+    }
+
     int done = snowscsi_write_data(dev, dsl > 0 ? data_buf : NULL, dsl);
     if (done < 0) {
-      /* Write error — sense already set in dev */
       snowscsi_sense_t sense;
       snowscsi_device_get_sense(dev, &sense);
       return send_scsi_response(t, ctx, conn, itt, stat_sn, cmd_sn,
@@ -624,7 +681,6 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
                                 &sense);
     }
     if (done == 1) {
-      /* All data received — send GOOD response */
       return send_scsi_response(t, ctx, conn, itt, stat_sn, cmd_sn,
                                 SNOWSCSI_ISCSI_SCSI_STATUS_GOOD, NULL);
     }
@@ -636,7 +692,8 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
 static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
                            intptr_t conn, const uint8_t bhs[48],
                            snowscsi_device_t **devs, int num_devs,
-                           uint32_t *stat_sn, uint32_t *cmd_sn) {
+                           uint32_t *stat_sn, uint32_t *cmd_sn,
+                           const uint8_t *imm_data, uint32_t imm_data_len) {
   uint8_t lun = snowscsi_iscsi_bhs_get_lun(bhs);
   uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
   uint8_t cdb[16];
@@ -682,9 +739,10 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
     return handle_data_in(t, ctx, conn, dev, itt, stat_sn, cmd_sn);
 
   case SNOWSCSI_DATA_OUT:
-    SNOW_LOGV("scsi_cmd: DATA_OUT transfer_len=%u", transfer_len);
+    SNOW_LOGV("scsi_cmd: DATA_OUT transfer_len=%u imm_len=%u", transfer_len,
+              imm_data_len);
     return handle_data_out(t, ctx, conn, dev, itt, stat_sn, cmd_sn,
-                           transfer_len);
+                           transfer_len, imm_data, imm_data_len);
   }
 
   return -1;
@@ -750,14 +808,42 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
     SNOW_LOGI("cmd_loop: waiting for first PDU");
     while (running) {
       uint8_t bhs[48];
+      uint32_t dsl;
 
-      if (recv_bhs(t, transport_ctx, conn, bhs) < 0) {
+      if (recv_bhs(t, transport_ctx, conn, bhs, &dsl) < 0) {
         SNOW_LOGW("cmd_loop: recv_bhs failed, disconnecting");
         running = 0;
         break;
       }
 
       uint8_t op = snowscsi_iscsi_bhs_get_opcode(bhs);
+
+      /* For SCSI Command write PDUs with immediate data, read it now and
+       * pass to the command handler.  For everything else, skip the data
+       * segment. */
+      uint8_t imm_data_buf[SNOWSCSI_ISCSI_MAX_DATA_SEGMENT];
+      uint32_t imm_data_len = 0;
+      bool is_write = (op == SNOWSCSI_ISCSI_OP_SCSI_CMD) &&
+                      (bhs[1] & 0x20);             /* W bit in byte 1 */
+
+      if (op == SNOWSCSI_ISCSI_OP_SCSI_CMD && is_write && dsl > 0) {
+        if (dsl > sizeof(imm_data_buf)) {
+          skip_dseg(t, transport_ctx, conn, dsl);
+          send_reject(t, transport_ctx, conn,
+                      SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, stat_sn, cmd_sn + 1);
+          break;
+        }
+        if (read_dseg(t, transport_ctx, conn, imm_data_buf, dsl) < 0) {
+          running = 0;
+          break;
+        }
+        imm_data_len = dsl;
+      } else if (dsl > 0) {
+        if (skip_dseg(t, transport_ctx, conn, dsl) < 0) {
+          running = 0;
+          break;
+        }
+      }
 
       switch (op) {
 
@@ -775,7 +861,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         cmd_sn = recv_cmd_sn;
 
         if (handle_scsi_cmd(t, transport_ctx, conn, bhs, devs, num_devs,
-                            &stat_sn, &cmd_sn) < 0) {
+                            &stat_sn, &cmd_sn, imm_data_buf, imm_data_len) < 0) {
           running = 0;
         }
         break;
