@@ -269,11 +269,13 @@ static int send_scsi_response(const snowscsi_transport_ops_t *t, void *ctx,
   snowscsi_iscsi_bhs_resp_set_stat_sn(bhs, *stat_sn);
   snowscsi_iscsi_bhs_set_status(bhs, scsi_status);
 
-  uint8_t sense_buf[18];
+  uint8_t sense_buf[20];
   uint32_t data_len = 0;
   if (scsi_status == SNOWSCSI_ISCSI_SCSI_STATUS_CHECK_CONDITION && sense) {
-    build_sense_data(sense_buf, sense);
-    data_len = 18;
+    sense_buf[0] = 0;
+    sense_buf[1] = 18;
+    build_sense_data(sense_buf + 2, sense);
+    data_len = 20;
   }
 
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, data_len);
