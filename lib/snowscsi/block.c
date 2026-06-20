@@ -721,3 +721,16 @@ snowscsi_device_t *snowscsi_block_open_ram(uint64_t size) {
   }
   return dev;
 }
+
+snowscsi_device_t *snowscsi_block_open_file(const char *path) {
+  snowscsi_backend_t *b = snowscsi_backend_file_open(path, true);
+  if (!b)
+    return NULL;
+
+  snowscsi_device_t *dev = snowscsi_block_create(b, 512);
+  if (!dev) {
+    snowscsi_backend_destroy(b);
+    return NULL;
+  }
+  return dev;
+}

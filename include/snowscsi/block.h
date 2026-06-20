@@ -13,4 +13,6 @@ snowscsi_device_t *snowscsi_block_create(snowscsi_backend_t *backend,
 
 snowscsi_device_t *snowscsi_block_open_ram(uint64_t size);
 
+snowscsi_device_t *snowscsi_block_open_file(const char *path);
+
 #endif

@@ -3,6 +3,7 @@ add_library(libsnowscsi STATIC
     scsi.c
     device.c
     backend_ram.c
+    backend_file.c
     block.c
     iscsi_pdu.c
     iscsi_target.c

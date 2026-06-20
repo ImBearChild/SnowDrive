@@ -1,6 +1,7 @@
 #ifndef SNOWSCSI_BACKEND_H
 #define SNOWSCSI_BACKEND_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,6 +25,7 @@ typedef struct {
 /* ── Predefined Backends ───────────────────────────────────────── */
 
 snowscsi_backend_t *snowscsi_backend_ram_create(uint64_t size);
+snowscsi_backend_t *snowscsi_backend_file_open(const char *path, bool writable);
 void snowscsi_backend_destroy(snowscsi_backend_t *backend);
 
 #endif

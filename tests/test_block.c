@@ -1,8 +1,12 @@
 #include "unity.h"
+#include <snowscsi/backend.h>
 #include <snowscsi/block.h>
 #include <snowscsi/device.h>
 #include <snowscsi/scsi.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static snowscsi_device_t *dev;
 
@@ -778,6 +782,104 @@ void test_block_read_capacity_pmi_zero_lba_zero(void) {
   TEST_ASSERT_EQUAL(SNOWSCSI_DATA_IN, r);
 }
 
+/* ── File backend tests ────────────────────────────────────────── */
+
+void test_block_file_write_read_roundtrip(void) {
+  char tmpl[] = "/tmp/snowscsi_test_XXXXXX";
+  int fd = mkstemp(tmpl);
+  TEST_ASSERT(fd >= 0);
+  TEST_ASSERT_EQUAL(0, ftruncate(fd, 1024 * 1024));
+  close(fd);
+
+  /* Override dev with file-backed device */
+  snowscsi_device_destroy(dev);
+  dev = snowscsi_block_open_file(tmpl);
+  TEST_ASSERT_NOT_NULL(dev);
+
+  uint8_t cdb[10];
+  uint32_t xfer;
+
+  uint8_t pattern[512];
+  for (int i = 0; i < 512; i++)
+    pattern[i] = (uint8_t)(i & 0xFF);
+
+  /* WRITE(10) LBA=0, 1 sector */
+  make_cdb10(cdb, SNOWSCSI_OP_WRITE_10, 0, 1);
+  snowscsi_result_t r = snowscsi_do_cmd(dev, cdb, 10, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_DATA_OUT, r);
+  TEST_ASSERT_EQUAL(512, (int)xfer);
+  int done = snowscsi_write_data(dev, pattern, 512);
+  TEST_ASSERT_EQUAL(1, done);
+
+  /* READ(10) LBA=0, 1 sector */
+  make_cdb10(cdb, SNOWSCSI_OP_READ_10, 0, 1);
+  r = snowscsi_do_cmd(dev, cdb, 10, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_DATA_IN, r);
+
+  uint8_t buf[512];
+  int n = snowscsi_read_data(dev, buf, 512);
+  TEST_ASSERT_EQUAL(512, n);
+  TEST_ASSERT_EQUAL_MEMORY(pattern, buf, 512);
+
+  /* Sync to disk and verify file contents directly */
+  uint8_t cdb_sync[10];
+  memset(cdb_sync, 0, 10);
+  cdb_sync[0] = SNOWSCSI_OP_SYNCHRONIZE_CACHE_10;
+  r = snowscsi_do_cmd(dev, cdb_sync, 10, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_STATUS, r);
+
+  /* Read the file directly */
+  FILE *fp = fopen(tmpl, "rb");
+  TEST_ASSERT_NOT_NULL(fp);
+  uint8_t file_buf[512];
+  TEST_ASSERT_EQUAL(1, fread(file_buf, 512, 1, fp));
+  fclose(fp);
+  TEST_ASSERT_EQUAL_MEMORY(pattern, file_buf, 512);
+
+  unlink(tmpl);
+}
+
+void test_block_file_read_only(void) {
+  char tmpl[] = "/tmp/snowscsi_test_XXXXXX";
+  int fd = mkstemp(tmpl);
+  TEST_ASSERT(fd >= 0);
+  TEST_ASSERT_EQUAL(0, ftruncate(fd, 1024 * 1024));
+  close(fd);
+
+  /* Open read-only backend, create separate device */
+  snowscsi_backend_t *b = snowscsi_backend_file_open(tmpl, false);
+  TEST_ASSERT_NOT_NULL(b);
+  snowscsi_device_t *fdev = snowscsi_block_create(b, 512);
+  TEST_ASSERT_NOT_NULL(fdev);
+
+  /* WRITE(10) — backend write should fail, device should set sense */
+  uint8_t cdb[10];
+  uint32_t xfer;
+  uint8_t pattern[512];
+  memset(pattern, 0xAA, 512);
+  make_cdb10(cdb, SNOWSCSI_OP_WRITE_10, 0, 1);
+  snowscsi_result_t r = snowscsi_do_cmd(fdev, cdb, 10, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_DATA_OUT, r);
+  int done = snowscsi_write_data(fdev, pattern, 512);
+  TEST_ASSERT_EQUAL(-1, done);
+
+  snowscsi_sense_t s;
+  snowscsi_device_get_sense(fdev, &s);
+  TEST_ASSERT_EQUAL(SNOWSCSI_SENSE_MEDIUM_ERROR, s.key);
+  TEST_ASSERT_EQUAL_HEX8(SNOWSCSI_ASC_WRITE_FAULT, s.asc);
+
+  /* READ should still work */
+  make_cdb10(cdb, SNOWSCSI_OP_READ_10, 0, 1);
+  r = snowscsi_do_cmd(fdev, cdb, 10, &xfer);
+  TEST_ASSERT_EQUAL(SNOWSCSI_DATA_IN, r);
+  uint8_t buf[512];
+  int n = snowscsi_read_data(fdev, buf, 512);
+  TEST_ASSERT_EQUAL(512, n);
+
+  snowscsi_device_destroy(fdev);
+  unlink(tmpl);
+}
+
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -819,5 +921,8 @@ int main(void) {
   RUN_TEST(test_block_prevent_allow_start_stop_eject);
   RUN_TEST(test_block_read_capacity_pmi_zero_lba_nonzero);
   RUN_TEST(test_block_read_capacity_pmi_zero_lba_zero);
+  /* File backend tests */
+  RUN_TEST(test_block_file_write_read_roundtrip);
+  RUN_TEST(test_block_file_read_only);
   return UNITY_END();
 }
