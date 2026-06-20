@@ -10,6 +10,9 @@ struct snowscsi_device {
   snowscsi_sense_t sense;
   uint32_t sector_size;
 
+  /* Medium removal prevention (PREVENT ALLOW) */
+  bool prevent_removal;
+
   /* Chunked data transfer state */
   uint8_t *data_buf;
   uint32_t data_total;

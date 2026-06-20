@@ -83,6 +83,26 @@ const char *snowscsi_cdb_opcode_name(uint8_t opcode) {
     return "READ_12";
   case SNOWSCSI_OP_WRITE_12:
     return "WRITE_12";
+  case SNOWSCSI_OP_MODE_SENSE_6:
+    return "MODE_SENSE_6";
+  case SNOWSCSI_OP_MODE_SENSE_10:
+    return "MODE_SENSE_10";
+  case SNOWSCSI_OP_MODE_SELECT_6:
+    return "MODE_SELECT_6";
+  case SNOWSCSI_OP_MODE_SELECT_10:
+    return "MODE_SELECT_10";
+  case SNOWSCSI_OP_SYNCHRONIZE_CACHE_10:
+    return "SYNCHRONIZE_CACHE_10";
+  case SNOWSCSI_OP_SEND_DIAGNOSTIC:
+    return "SEND_DIAGNOSTIC";
+  case SNOWSCSI_OP_RECEIVE_DIAGNOSTIC:
+    return "RECEIVE_DIAGNOSTIC";
+  case SNOWSCSI_OP_REPORT_LUNS:
+    return "REPORT_LUNS";
+  case SNOWSCSI_OP_PREVENT_ALLOW:
+    return "PREVENT_ALLOW";
+  case SNOWSCSI_OP_START_STOP_UNIT:
+    return "START_STOP_UNIT";
   default:
     return "UNKNOWN";
   }
