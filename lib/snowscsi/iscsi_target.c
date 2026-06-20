@@ -314,9 +314,9 @@ static int send_scsi_response(const snowscsi_transport_ops_t *t, void *ctx,
 
 static int send_data_in(const snowscsi_transport_ops_t *t, void *ctx,
                         intptr_t conn, uint32_t itt, const uint8_t *data,
-                        uint32_t data_len, uint32_t data_sn, bool final,
-                        bool with_status, uint32_t stat_sn,
-                        uint32_t exp_cmd_sn) {
+                        uint32_t data_len, uint32_t data_sn,
+                        uint32_t buffer_offset, bool final, bool with_status,
+                        uint32_t stat_sn, uint32_t exp_cmd_sn) {
   uint8_t bhs[48];
   memset(bhs, 0, 48);
 
@@ -324,6 +324,7 @@ static int send_data_in(const snowscsi_transport_ops_t *t, void *ctx,
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
   snowscsi_iscsi_bhs_set_data_sn(bhs, data_sn);
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, data_len);
+  snowscsi_iscsi_bhs_set_buffer_offset(bhs, buffer_offset);
 
   if (final)
     bhs[1] |= SNOWSCSI_ISCSI_FLAG_DATA_FINAL;
@@ -553,14 +554,15 @@ static int handle_data_in(const snowscsi_transport_ops_t *t, void *ctx,
   uint8_t *next = buf_b;
   uint32_t cur_len, next_len;
   uint32_t data_sn = 0;
+  uint32_t buffer_offset = 0;
   int n;
 
   n = snowscsi_read_data(dev, cur, sizeof(buf_a));
   if (n <= 0) {
     /* No data at all — send final/status Data-In with zero payload */
     uint32_t exp = *cmd_sn + 1;
-    if (send_data_in(t, ctx, conn, itt, NULL, 0, data_sn, true, true, *stat_sn,
-                     exp) < 0)
+    if (send_data_in(t, ctx, conn, itt, NULL, 0, data_sn, 0, true, true,
+                     *stat_sn, exp) < 0)
       return -1;
     *cmd_sn = exp;
     (*stat_sn)++;
@@ -573,8 +575,8 @@ static int handle_data_in(const snowscsi_transport_ops_t *t, void *ctx,
     if (n <= 0) {
       /* cur is the last chunk — send with F=1, S=1 */
       uint32_t exp = *cmd_sn + 1;
-      if (send_data_in(t, ctx, conn, itt, cur, cur_len, data_sn, true, true,
-                       *stat_sn, exp) < 0)
+      if (send_data_in(t, ctx, conn, itt, cur, cur_len, data_sn,
+                       buffer_offset, true, true, *stat_sn, exp) < 0)
         return -1;
       data_sn++;
       *cmd_sn = exp;
@@ -585,10 +587,11 @@ static int handle_data_in(const snowscsi_transport_ops_t *t, void *ctx,
 
     /* cur is not final — send with F=0, S=0 */
     uint32_t exp = *cmd_sn + 1;
-    if (send_data_in(t, ctx, conn, itt, cur, cur_len, data_sn, false, false,
-                     *stat_sn, exp) < 0)
+    if (send_data_in(t, ctx, conn, itt, cur, cur_len, data_sn,
+                     buffer_offset, false, false, *stat_sn, exp) < 0)
       return -1;
     data_sn++;
+    buffer_offset += cur_len;
 
     /* Swap buffers */
     uint8_t *tmp = cur;

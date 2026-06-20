@@ -258,10 +258,14 @@ void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn) {
   put_be32(&bhs[32], sn);
 }
 
-/* ── Buffer Offset (Data-Out) ───────────────────────────────────── */
+/* ── Buffer Offset — bytes 40-43 (Data-In / Data-Out / R2T) ────── */
 
 uint32_t snowscsi_iscsi_bhs_get_buffer_offset(const uint8_t bhs[48]) {
   return get_be32(&bhs[40]);
+}
+
+void snowscsi_iscsi_bhs_set_buffer_offset(uint8_t bhs[48], uint32_t offset) {
+  put_be32(&bhs[40], offset);
 }
 
 /* ── R2T specific ───────────────────────────────────────────────── */

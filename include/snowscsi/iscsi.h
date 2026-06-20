@@ -130,9 +130,10 @@ uint32_t snowscsi_iscsi_bhs_data_in_get_stat_sn(const uint8_t bhs[48]);
 void snowscsi_iscsi_bhs_data_in_set_exp_cmd_sn(uint8_t bhs[48], uint32_t sn);
 void snowscsi_iscsi_bhs_data_in_set_max_cmd_sn(uint8_t bhs[48], uint32_t sn);
 
-/* ── Data-Out specific — Buffer Offset at bytes 40-43 ───────────── */
+/* ── Buffer Offset — bytes 40-43 (Data-In / Data-Out / R2T) ────── */
 
 uint32_t snowscsi_iscsi_bhs_get_buffer_offset(const uint8_t bhs[48]);
+void snowscsi_iscsi_bhs_set_buffer_offset(uint8_t bhs[48], uint32_t offset);
 
 /* ── R2T specific — Buffer Offset bytes 40-43, Desired Data
  * Transfer Length bytes 44-47, R2TSN bytes 36-39 ────────────────── */
