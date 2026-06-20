@@ -8,6 +8,11 @@
 
 snowscsi_result_t snowscsi_do_cmd(snowscsi_device_t *dev, const uint8_t *cdb,
                                   uint8_t cdb_len, uint32_t *transfer_len) {
+  /* Each command gets a fresh data buffer: the handler MUST allocate
+   * dev->data_buf and set dev->data_total when returning DATA_IN or
+   * DATA_OUT.  The caller (iSCSI layer) drains the buffer via
+   * snowscsi_read_data / snowscsi_write_data and then the next command
+   * frees it here. */
   free(dev->data_buf);
   dev->data_buf = NULL;
   dev->data_total = 0;

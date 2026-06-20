@@ -12,75 +12,78 @@
 
 #define INQUIRY_STD_LEN 95
 
-static void build_inquiry_std(uint8_t *buf) {
-  memset(buf, 0, INQUIRY_STD_LEN);
-  buf[0] = 0x00;            /* PDT = 0x00 (disk) */
-  buf[1] = 0x00;            /* RMB = 0 (non-removable) */
-  buf[2] = 0x05;            /* Version = SPC-3 */
-  buf[3] = 0x02;            /* Response Data Format = 2 */
-  buf[4] = INQUIRY_STD_LEN - 5; /* Additional Length = 91 */
-  buf[7] = 0x02;            /* CmdQue = 1 */
-  memcpy(buf + 8, "SnowSCSI", 8);
-  memcpy(buf + 16, "Virtual Disk    ", 16);
-  memcpy(buf + 32, "0100", 4);
-  /* Version descriptors (SPC-4 §7.6.2, Table 160) */
-  buf[58] = 0x00; buf[59] = 0xA0; /* SAM-5 */
-  buf[60] = 0x09; buf[61] = 0x60; /* iSCSI */
-  buf[62] = 0x04; buf[63] = 0x60; /* SPC-4 */
-  buf[64] = 0x04; buf[65] = 0xC0; /* SBC-3 */
+static void build_inquiry_std(uint8_t *buf, uint32_t max_len) {
+  uint8_t tmp[INQUIRY_STD_LEN];
+  memset(tmp, 0, INQUIRY_STD_LEN);
+  tmp[0] = 0x00;
+  tmp[1] = 0x00;
+  tmp[2] = 0x05;
+  tmp[3] = 0x02;
+  tmp[4] = INQUIRY_STD_LEN - 5;
+  tmp[7] = 0x02;
+  memcpy(tmp + 8, "SnowSCSI", 8);
+  memcpy(tmp + 16, "Virtual Disk    ", 16);
+  memcpy(tmp + 32, "0100", 4);
+  tmp[58] = 0x00; tmp[59] = 0xA0;
+  tmp[60] = 0x09; tmp[61] = 0x60;
+  tmp[62] = 0x04; tmp[63] = 0x60;
+  tmp[64] = 0x04; tmp[65] = 0xC0;
+  memcpy(buf, tmp, max_len < INQUIRY_STD_LEN ? max_len : INQUIRY_STD_LEN);
 }
 
 /* ── INQUIRY VPD 0x00: Supported VPD Pages ─────────────────────── */
 
 #define VPD_PAGE_LIST_LEN 7
 
-static void build_vpd_00(uint8_t *buf) {
-  memset(buf, 0, VPD_PAGE_LIST_LEN);
-  buf[0] = 0x00;            /* Peripheral Qualifier + PDT = 0 */
-  buf[1] = 0x00;            /* Page Code = 0x00 */
-  buf[2] = 0x00;            /* Reserved */
-  buf[3] = VPD_PAGE_LIST_LEN - 4; /* Page Length = 3 */
-  buf[4] = 0x00;            /* Supported page list: 0x00 */
-  buf[5] = 0x80;            /* 0x80 */
-  buf[6] = 0x83;            /* 0x83 */
+static void build_vpd_00(uint8_t *buf, uint32_t max_len) {
+  uint8_t tmp[VPD_PAGE_LIST_LEN];
+  memset(tmp, 0, VPD_PAGE_LIST_LEN);
+  tmp[0] = 0x00;
+  tmp[1] = 0x00;
+  tmp[2] = 0x00;
+  tmp[3] = VPD_PAGE_LIST_LEN - 4;
+  tmp[4] = 0x00;
+  tmp[5] = 0x80;
+  tmp[6] = 0x83;
+  memcpy(buf, tmp, max_len < VPD_PAGE_LIST_LEN ? max_len : VPD_PAGE_LIST_LEN);
 }
 
 /* ── INQUIRY VPD 0x80: Unit Serial Number ──────────────────────── */
 
 #define VPD_SERIAL_LEN (4 + 16)
 
-static void build_vpd_80(uint8_t *buf, uint64_t size) {
-  memset(buf, 0, VPD_SERIAL_LEN);
-  buf[0] = 0x00;            /* Peripheral Qualifier + PDT = 0 */
-  buf[1] = 0x80;            /* Page Code = 0x80 */
-  buf[2] = 0x00;            /* Reserved */
-  buf[3] = VPD_SERIAL_LEN - 4; /* Page Length = 16 */
-  /* Serial number derived from backend size (purely for demonstration) */
-  snprintf((char *)buf + 4, 16, "SNOW%016llX",
+static void build_vpd_80(uint8_t *buf, uint64_t size, uint32_t max_len) {
+  uint8_t tmp[VPD_SERIAL_LEN];
+  memset(tmp, 0, VPD_SERIAL_LEN);
+  tmp[0] = 0x00;
+  tmp[1] = 0x80;
+  tmp[2] = 0x00;
+  tmp[3] = VPD_SERIAL_LEN - 4;
+  snprintf((char *)tmp + 4, 16, "SNOW%016llX",
            (unsigned long long)size);
+  memcpy(buf, tmp, max_len < VPD_SERIAL_LEN ? max_len : VPD_SERIAL_LEN);
 }
 
 /* ── INQUIRY VPD 0x83: Device Identification ───────────────────── */
 
 #define VPD_ID_LEN (4 + 4 + 8)
 
-static void build_vpd_83(uint8_t *buf, uint64_t size) {
-  memset(buf, 0, VPD_ID_LEN);
-  buf[0] = 0x00;            /* Peripheral Qualifier + PDT = 0 */
-  buf[1] = 0x83;            /* Page Code = 0x83 */
-  buf[2] = 0x00;            /* Reserved */
-  buf[3] = VPD_ID_LEN - 4;  /* Page Length = 20 */
-  /* Designation descriptor #1: NAA Locally Assigned (Type 3h) */
-  buf[4] = 0x04;            /* Code Set = Binary */
-  buf[5] = 0x03;            /* Designator Type = NAA */
-  buf[6] = 0x00;            /* Reserved */
-  buf[7] = 8;               /* Designator Length for NAA-6 */
-  /* NAA-6 IEEE Registered Extended */
-  buf[8] = 0x60;            /* NAA=6, first nibble, plus 4 MSB of NAA value */
-  /* Remaining 7 bytes encode the device identifier based on size */
+static void build_vpd_83(uint8_t *buf, uint64_t size, uint32_t max_len) {
+  uint8_t tmp[VPD_ID_LEN];
+  memset(tmp, 0, VPD_ID_LEN);
+  tmp[0] = 0x00;
+  tmp[1] = 0x83;
+  tmp[2] = 0x00;
+  tmp[3] = VPD_ID_LEN - 4;
+  tmp[4] = 0x04;
+  tmp[5] = 0x03;
+  tmp[6] = 0x00;
+  tmp[7] = 8;
+  tmp[8] = 0x60;
   uint64_t id = size;
   for (int i = 0; i < 8; i++)
-    buf[9 + i] = (uint8_t)(id >> (56 - 8 * i));
+    tmp[9 + i] = (uint8_t)(id >> (56 - 8 * i));
+  memcpy(buf, tmp, max_len < VPD_ID_LEN ? max_len : VPD_ID_LEN);
 }
 
 /* ── REQUEST SENSE response (18 bytes) ─────────────────────────── */
@@ -229,13 +232,12 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
       uint32_t alloc_len = ((uint16_t)cdb[3] << 8) | cdb[4];
       switch (page_code) {
       case 0x00: {
-        /* Always allocate full internal size, truncate data_total */
         uint32_t resp_len = alloc_len < VPD_PAGE_LIST_LEN
                                 ? alloc_len
                                 : VPD_PAGE_LIST_LEN;
-        dev->data_buf = malloc(VPD_PAGE_LIST_LEN);
+        dev->data_buf = malloc(resp_len);
         if (!dev->data_buf) goto alloc_fail;
-        build_vpd_00(dev->data_buf);
+        build_vpd_00(dev->data_buf, resp_len);
         dev->data_total = resp_len;
         dev->data_offset = 0;
         *transfer_len = resp_len;
@@ -246,9 +248,9 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
       case 0x80: {
         uint32_t resp_len =
             alloc_len < VPD_SERIAL_LEN ? alloc_len : VPD_SERIAL_LEN;
-        dev->data_buf = malloc(VPD_SERIAL_LEN);
+        dev->data_buf = malloc(resp_len);
         if (!dev->data_buf) goto alloc_fail;
-        build_vpd_80(dev->data_buf, backend_size);
+        build_vpd_80(dev->data_buf, backend_size, resp_len);
         dev->data_total = resp_len;
         dev->data_offset = 0;
         *transfer_len = resp_len;
@@ -257,9 +259,9 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
       case 0x83: {
         uint32_t resp_len =
             alloc_len < VPD_ID_LEN ? alloc_len : VPD_ID_LEN;
-        dev->data_buf = malloc(VPD_ID_LEN);
+        dev->data_buf = malloc(resp_len);
         if (!dev->data_buf) goto alloc_fail;
-        build_vpd_83(dev->data_buf, backend_size);
+        build_vpd_83(dev->data_buf, backend_size, resp_len);
         dev->data_total = resp_len;
         dev->data_offset = 0;
         *transfer_len = resp_len;
@@ -283,9 +285,9 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
     uint16_t alloc = ((uint16_t)cdb[3] << 8) | cdb[4];
     uint32_t resp_len = alloc < INQUIRY_STD_LEN ? alloc : INQUIRY_STD_LEN;
     SNOW_LOGV("INQUIRY: alloc_len=%u resp_len=%u", alloc, resp_len);
-    dev->data_buf = malloc(INQUIRY_STD_LEN);
+    dev->data_buf = malloc(resp_len);
     if (!dev->data_buf) goto alloc_fail;
-    build_inquiry_std(dev->data_buf);
+    build_inquiry_std(dev->data_buf, resp_len);
     dev->data_total = resp_len;
     dev->data_offset = 0;
     *transfer_len = resp_len;
