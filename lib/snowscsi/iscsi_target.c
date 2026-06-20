@@ -63,7 +63,7 @@ static int login_find_key(const char *key) {
 
 static char *login_build_resp(const uint8_t *idata, uint32_t ilen,
                               uint32_t *out_len) {
-  char *buf = malloc(LOGIN_RESP_MAX);
+  char *buf = malloc(LOGIN_RESP_MAX + 3);
   if (!buf)
     return NULL;
 
@@ -413,17 +413,15 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
   SNOW_LOGD("  ver-max=%u ver-min=%u", bhs[2], bhs[3]);
   SNOW_LOGD("  ISID=%02x%02x%02x%02x%02x%02x", bhs[8], bhs[9], bhs[10], bhs[11],
             bhs[12], bhs[13]);
-  SNOW_LOGD("  TSIH=%u ITT=0x%08x CID=0x%08x CmdSN=%u ExpStatSN=%u",
+  SNOW_LOGD("  TSIH=%u ITT=0x%08x CID=%u CmdSN=%u ExpStatSN=%u",
+            ((uint16_t)bhs[14] << 8) | bhs[15],
             ((uint32_t)bhs[16] << 24) | ((uint32_t)bhs[17] << 16) |
                 ((uint32_t)bhs[18] << 8) | (uint32_t)bhs[19],
-            ((uint32_t)bhs[20] << 24) | ((uint32_t)bhs[21] << 16) |
-                ((uint32_t)bhs[22] << 8) | (uint32_t)bhs[23],
+            ((uint16_t)bhs[20] << 8) | bhs[21],
             ((uint32_t)bhs[24] << 24) | ((uint32_t)bhs[25] << 16) |
                 ((uint32_t)bhs[26] << 8) | (uint32_t)bhs[27],
             ((uint32_t)bhs[28] << 24) | ((uint32_t)bhs[29] << 16) |
-                ((uint32_t)bhs[30] << 8) | (uint32_t)bhs[31],
-            ((uint32_t)bhs[32] << 24) | ((uint32_t)bhs[33] << 16) |
-                ((uint32_t)bhs[34] << 8) | (uint32_t)bhs[35]);
+                ((uint32_t)bhs[30] << 8) | (uint32_t)bhs[31]);
   SNOW_LOGD("  T=%d CSG=%u NSG=%u", snowscsi_iscsi_bhs_get_t_bit(bhs),
             snowscsi_iscsi_bhs_get_csg(bhs), snowscsi_iscsi_bhs_get_nsg(bhs));
   if (op != SNOWSCSI_ISCSI_OP_LOGIN_REQ)
@@ -647,6 +645,8 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
     return -1;
 
   /* Receive Data-Out PDUs until complete */
+  uint32_t expected_bo = received;
+  uint32_t expected_data_sn = 0;
   while (1) {
     if (t_recv(t, ctx, conn, bhs, 48) < 0)
       return -1;
@@ -655,6 +655,36 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
     if (op != SNOWSCSI_ISCSI_OP_SCSI_DATA_OUT) {
       SNOW_LOGW("handle_data_out: expected SCSI_DATA_OUT, got %s(0x%02x)",
                 snowscsi_iscsi_opcode_name(op), op);
+      send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
+                  *cmd_sn + 1);
+      (*stat_sn)++;
+      return -1;
+    }
+
+    /* Validate Data-Out fields (RFC 3720 §10.7) */
+    uint32_t recv_itt = snowscsi_iscsi_bhs_get_itt(bhs);
+    uint32_t recv_ttt = snowscsi_iscsi_bhs_get_ttt(bhs);
+    uint32_t recv_bo = snowscsi_iscsi_bhs_get_buffer_offset(bhs);
+    uint32_t recv_data_sn = snowscsi_iscsi_bhs_get_data_sn(bhs);
+    if (recv_itt != itt || recv_ttt != 0) {
+      SNOW_LOGW("handle_data_out: ITT/expected=%u/got=%u TTT=%u",
+                itt, recv_itt, recv_ttt);
+      send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
+                  *cmd_sn + 1);
+      (*stat_sn)++;
+      return -1;
+    }
+    if (recv_bo != expected_bo) {
+      SNOW_LOGW("handle_data_out: BufferOffset expected=%u got=%u",
+                expected_bo, recv_bo);
+      send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
+                  *cmd_sn + 1);
+      (*stat_sn)++;
+      return -1;
+    }
+    if (recv_data_sn != expected_data_sn) {
+      SNOW_LOGW("handle_data_out: DataSN expected=%u got=%u",
+                expected_data_sn, recv_data_sn);
       send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
                   *cmd_sn + 1);
       (*stat_sn)++;
@@ -686,6 +716,8 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
                                 SNOWSCSI_ISCSI_SCSI_STATUS_CHECK_CONDITION,
                                 &sense);
     }
+    expected_bo += dsl;
+    expected_data_sn++;
     if (done == 1) {
       return send_scsi_response(t, ctx, conn, itt, stat_sn, cmd_sn,
                                 SNOWSCSI_ISCSI_SCSI_STATUS_GOOD, NULL);
@@ -752,8 +784,6 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
     return handle_data_out(t, ctx, conn, dev, itt, stat_sn, cmd_sn,
                            transfer_len, imm_data, imm_data_len);
   }
-
-  return -1;
 }
 
 /* ── iSCSI Target main serve loop ───────────────────────────────── */
