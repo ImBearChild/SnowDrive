@@ -24,9 +24,9 @@ target_link_libraries(test_iscsi_target PRIVATE libsnowscsi unity)
 add_test(NAME iscsi_target COMMAND test_iscsi_target)
 
 find_package(Threads REQUIRED)
-add_executable(test_iscsi_login_rfc test_iscsi_login_rfc.c)
-target_link_libraries(test_iscsi_login_rfc PRIVATE libsnowscsi unity Threads::Threads)
-add_test(NAME iscsi_login_rfc COMMAND test_iscsi_login_rfc)
+add_executable(test_iscsi_mock test_iscsi_mock.cpp)
+target_link_libraries(test_iscsi_mock PRIVATE libsnowscsi unity Threads::Threads)
+add_test(NAME iscsi_mock COMMAND test_iscsi_mock)
 
 find_package(PkgConfig)
 if(PkgConfig_FOUND)

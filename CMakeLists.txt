@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(snowdrive C)
+project(snowdrive C CXX)
 
 set(CMAKE_C_STANDARD 11)
 
