@@ -305,6 +305,16 @@ uint8_t snowscsi_iscsi_bhs_get_reject_reason(const uint8_t bhs[48]) {
   return bhs[2];
 }
 
+/* ── SCSI Task Management Function (byte 2 of request BHS) ─────── */
+
+uint8_t snowscsi_iscsi_bhs_get_tmf_function(const uint8_t bhs[48]) {
+  return bhs[2] & 0x7F;
+}
+
+void snowscsi_iscsi_bhs_tmf_resp_set_response(uint8_t bhs[48], uint8_t response) {
+  bhs[2] = response;
+}
+
 /* ── Opcode name ────────────────────────────────────────────────── */
 
 const char *snowscsi_iscsi_opcode_name(uint8_t opcode) {

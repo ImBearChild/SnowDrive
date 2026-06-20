@@ -725,6 +725,45 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
   }
 }
 
+/* ── Handle SCSI Task Management ────────────────────────────────── */
+
+static int handle_task_mgmt(const snowscsi_transport_ops_t *t, void *ctx,
+                            intptr_t conn, const uint8_t bhs[48],
+                            uint32_t *stat_sn, uint32_t *cmd_sn) {
+  uint32_t itt = snowscsi_iscsi_bhs_get_itt(bhs);
+  uint8_t function = snowscsi_iscsi_bhs_get_tmf_function(bhs);
+
+  uint8_t response;
+  switch (function) {
+  case SNOWSCSI_ISCSI_TMF_ABORT_TASK:
+  case SNOWSCSI_ISCSI_TMF_LOGICAL_UNIT_RESET:
+    response = SNOWSCSI_ISCSI_TMF_RESP_COMPLETE;
+    break;
+  default:
+    response = SNOWSCSI_ISCSI_TMF_RESP_NOT_SUPPORTED;
+    break;
+  }
+
+  SNOW_LOGD("task_mgmt: function=%u response=%u", function, response);
+
+  uint8_t tbhs[48];
+  memset(tbhs, 0, 48);
+  snowscsi_iscsi_bhs_set_opcode(tbhs, SNOWSCSI_ISCSI_OP_SCSI_TASK_RESP);
+  snowscsi_iscsi_bhs_set_itt(tbhs, itt);
+  tbhs[1] = 0x80;
+  snowscsi_iscsi_bhs_tmf_resp_set_response(tbhs, response);
+  snowscsi_iscsi_bhs_resp_set_stat_sn(tbhs, *stat_sn);
+  snowscsi_iscsi_bhs_resp_set_exp_cmd_sn(tbhs, *cmd_sn + 1);
+  snowscsi_iscsi_bhs_resp_set_max_cmd_sn(tbhs, *cmd_sn + 1);
+
+  if (send_pdu(t, ctx, conn, tbhs, NULL, 0) < 0)
+    return -1;
+
+  *cmd_sn += 1;
+  (*stat_sn)++;
+  return 0;
+}
+
 /* ── Handle SCSI Command ────────────────────────────────────────── */
 
 static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
@@ -878,6 +917,18 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         }
         imm_data_len = dsl;
       } else if (dsl > 0) {
+        /* Reject PDUs that should not carry a data segment */
+        if (op == SNOWSCSI_ISCSI_OP_SCSI_TASK_REQ ||
+            op == SNOWSCSI_ISCSI_OP_LOGOUT_REQ) {
+          SNOW_LOGW("unexpected DataSegmentLength=%u for %s(0x%02x)", dsl,
+                    snowscsi_iscsi_opcode_name(op), op);
+          skip_dseg(t, transport_ctx, conn, dsl);
+          send_reject(t, transport_ctx, conn,
+                      SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, stat_sn,
+                      cmd_sn + 1);
+          stat_sn++;
+          break;
+        }
         if (skip_dseg(t, transport_ctx, conn, dsl) < 0) {
           running = 0;
           break;
@@ -905,6 +956,23 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
           running = 0;
         }
         free(imm_data);
+        break;
+      }
+
+      case SNOWSCSI_ISCSI_OP_SCSI_TASK_REQ: {
+        /* Validate CmdSN */
+        uint32_t recv_cmd_sn = snowscsi_iscsi_bhs_get_cmd_sn(bhs);
+        if ((int32_t)(recv_cmd_sn - cmd_sn) < 0) {
+          send_reject(t, transport_ctx, conn, SNOWSCSI_ISCSI_REJECT_CMD_SN,
+                      stat_sn, cmd_sn + 1);
+          stat_sn++;
+          break;
+        }
+        cmd_sn = recv_cmd_sn;
+
+        if (handle_task_mgmt(t, transport_ctx, conn, bhs, &stat_sn, &cmd_sn) <
+            0)
+          running = 0;
         break;
       }
 

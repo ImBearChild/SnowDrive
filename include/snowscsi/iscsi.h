@@ -46,6 +46,20 @@
 #define SNOWSCSI_ISCSI_SCSI_STATUS_GOOD 0x00
 #define SNOWSCSI_ISCSI_SCSI_STATUS_CHECK_CONDITION 0x02
 
+/* SCSI Task Management Functions (RFC 3720 Table 15) */
+#define SNOWSCSI_ISCSI_TMF_ABORT_TASK 1
+#define SNOWSCSI_ISCSI_TMF_ABORT_TASK_SET 2
+#define SNOWSCSI_ISCSI_TMF_CLEAR_ACA 3
+#define SNOWSCSI_ISCSI_TMF_CLEAR_TASK_SET 4
+#define SNOWSCSI_ISCSI_TMF_LOGICAL_UNIT_RESET 5
+#define SNOWSCSI_ISCSI_TMF_TARGET_WARM_RESET 6
+#define SNOWSCSI_ISCSI_TMF_TARGET_COLD_RESET 7
+#define SNOWSCSI_ISCSI_TMF_TASK_REASSIGN 8
+
+/* SCSI Task Management Response codes (RFC 3720 §11.6) */
+#define SNOWSCSI_ISCSI_TMF_RESP_COMPLETE 0x00
+#define SNOWSCSI_ISCSI_TMF_RESP_NOT_SUPPORTED 0x04
+
 /* ── PDU-specific flag masks ───────────────────────────────────── */
 
 /* Login/Logout PDU flags */
@@ -151,6 +165,11 @@ void snowscsi_iscsi_bhs_set_ttt(uint8_t bhs[48], uint32_t ttt);
 
 void snowscsi_iscsi_bhs_set_reject_reason(uint8_t bhs[48], uint8_t reason);
 uint8_t snowscsi_iscsi_bhs_get_reject_reason(const uint8_t bhs[48]);
+
+/* ── SCSI Task Management specific ─────────────────────────────── */
+
+uint8_t snowscsi_iscsi_bhs_get_tmf_function(const uint8_t bhs[48]);
+void snowscsi_iscsi_bhs_tmf_resp_set_response(uint8_t bhs[48], uint8_t response);
 
 /* ── Utility ───────────────────────────────────────────────────── */
 
