@@ -50,6 +50,97 @@ static void build_read_capacity(uint8_t *buf, uint32_t max_lba,
   buf[7] = (block_size) & 0xFF;
 }
 
+/* ── Shared read/write helpers ───────────────────────────────────── */
+
+static snowscsi_result_t do_read(snowscsi_device_t *dev, uint32_t max_lba,
+                                 uint64_t lba, uint32_t count,
+                                 uint32_t *transfer_len, const char *tag) {
+  if (count == 0) {
+    *transfer_len = 0;
+    return SNOWSCSI_STATUS;
+  }
+  if (lba > max_lba || lba + count > (uint64_t)max_lba + 1) {
+    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%u count=%u", tag,
+              (unsigned long)lba, max_lba, count);
+    snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
+                       SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
+    goto check_condition;
+  }
+  uint64_t bytes64 = (uint64_t)count * dev->sector_size;
+  if (bytes64 > UINT32_MAX) {
+    snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
+                       SNOWSCSI_ASC_INVALID_FIELD, 0x00);
+    goto check_condition;
+  }
+  uint32_t bytes = (uint32_t)bytes64;
+  dev->data_buf = malloc(bytes);
+  if (!dev->data_buf)
+    goto alloc_fail;
+  uint64_t offset = lba * dev->sector_size;
+  if (dev->backend->ops->read(dev->backend->ctx, offset, dev->data_buf,
+                              bytes) != 0) {
+    SNOW_LOGE("%s: backend read failed offset=%lu bytes=%u", tag,
+              (unsigned long)offset, bytes);
+    free(dev->data_buf);
+    dev->data_buf = NULL;
+    snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
+    goto check_condition;
+  }
+  SNOW_LOGD("%s: lba=%lu blocks=%u bytes=%u", tag, (unsigned long)lba, count,
+            bytes);
+  dev->data_total = bytes;
+  dev->data_offset = 0;
+  *transfer_len = bytes;
+  return SNOWSCSI_DATA_IN;
+
+alloc_fail:
+  SNOW_LOGE("malloc failed for %s", tag);
+  snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_MEDIUM_ERROR, 0x00, 0x00);
+check_condition:
+  *transfer_len = 0;
+  return SNOWSCSI_CHECK_CONDITION;
+}
+
+static snowscsi_result_t do_write(snowscsi_device_t *dev, uint32_t max_lba,
+                                  uint64_t lba, uint32_t count,
+                                  uint32_t *transfer_len, const char *tag) {
+  if (count == 0) {
+    *transfer_len = 0;
+    return SNOWSCSI_STATUS;
+  }
+  if (lba > max_lba || lba + count > (uint64_t)max_lba + 1) {
+    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%u count=%u", tag,
+              (unsigned long)lba, max_lba, count);
+    snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
+                       SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
+    goto check_condition;
+  }
+  uint64_t bytes64 = (uint64_t)count * dev->sector_size;
+  if (bytes64 > UINT32_MAX) {
+    snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
+                       SNOWSCSI_ASC_INVALID_FIELD, 0x00);
+    goto check_condition;
+  }
+  uint32_t bytes = (uint32_t)bytes64;
+  dev->data_buf = malloc(bytes);
+  if (!dev->data_buf)
+    goto alloc_fail;
+  SNOW_LOGD("%s: lba=%lu blocks=%u bytes=%u", tag, (unsigned long)lba, count,
+            bytes);
+  dev->data_total = bytes;
+  dev->data_offset = 0;
+  dev->write_backend_offset = lba * dev->sector_size;
+  *transfer_len = bytes;
+  return SNOWSCSI_DATA_OUT;
+
+alloc_fail:
+  SNOW_LOGE("malloc failed for %s", tag);
+  snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_MEDIUM_ERROR, 0x00, 0x00);
+check_condition:
+  *transfer_len = 0;
+  return SNOWSCSI_CHECK_CONDITION;
+}
+
 /* ── SBC command handler ───────────────────────────────────────── */
 
 static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
@@ -112,79 +203,54 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
     return SNOWSCSI_DATA_IN;
   }
 
+  case SNOWSCSI_OP_READ_6: {
+    uint32_t lba = snowscsi_cdb_get_lba6(cdb);
+    uint8_t raw = snowscsi_cdb_get_transfer_len6(cdb);
+    uint32_t count = (raw == 0) ? 256 : raw;
+    return do_read(dev, max_lba, lba, count, transfer_len, "READ_6");
+  }
+
+  case SNOWSCSI_OP_WRITE_6: {
+    uint32_t lba = snowscsi_cdb_get_lba6(cdb);
+    uint8_t raw = snowscsi_cdb_get_transfer_len6(cdb);
+    uint32_t count = (raw == 0) ? 256 : raw;
+    return do_write(dev, max_lba, lba, count, transfer_len, "WRITE_6");
+  }
+
   case SNOWSCSI_OP_READ_10: {
     uint32_t lba = snowscsi_cdb_get_lba10(cdb);
     uint16_t count = snowscsi_cdb_get_transfer_len10(cdb);
-    SNOW_LOGD("READ_10: lba=%u blocks=%u bytes=%u", lba, count,
-              (uint32_t)count * dev->sector_size);
-    if (count == 0) {
-      *transfer_len = 0;
-      return SNOWSCSI_STATUS;
-    }
-    if (lba > max_lba || (uint64_t)lba + count > (uint64_t)max_lba + 1) {
-      SNOW_LOGW("READ_10: LBA out of range lba=%u max_lba=%u count=%u", lba,
-                max_lba, count);
-      snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
-                         SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
-      goto check_condition;
-    }
-    uint64_t bytes64 = (uint64_t)count * dev->sector_size;
-    if (bytes64 > UINT32_MAX) {
-      snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
-                         SNOWSCSI_ASC_INVALID_FIELD, 0x00);
-      goto check_condition;
-    }
-    uint32_t bytes = (uint32_t)bytes64;
-    dev->data_buf = malloc(bytes);
-    if (!dev->data_buf)
-      goto alloc_fail;
-    uint64_t offset = (uint64_t)lba * dev->sector_size;
-    if (dev->backend->ops->read(dev->backend->ctx, offset, dev->data_buf,
-                                bytes) != 0) {
-      SNOW_LOGE("READ_10: backend read failed offset=%lu bytes=%u",
-                (unsigned long)offset, bytes);
-      free(dev->data_buf);
-      dev->data_buf = NULL;
-      snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
-      goto check_condition;
-    }
-    dev->data_total = bytes;
-    dev->data_offset = 0;
-    *transfer_len = bytes;
-    return SNOWSCSI_DATA_IN;
+    return do_read(dev, max_lba, lba, count, transfer_len, "READ_10");
   }
 
   case SNOWSCSI_OP_WRITE_10: {
     uint32_t lba = snowscsi_cdb_get_lba10(cdb);
     uint16_t count = snowscsi_cdb_get_transfer_len10(cdb);
-    SNOW_LOGD("WRITE_10: lba=%u blocks=%u bytes=%u", lba, count,
-              (uint32_t)count * dev->sector_size);
-    if (count == 0) {
-      *transfer_len = 0;
-      return SNOWSCSI_STATUS;
-    }
-    if (lba > max_lba || (uint64_t)lba + count > (uint64_t)max_lba + 1) {
-      SNOW_LOGW("WRITE_10: LBA out of range lba=%u max_lba=%u count=%u", lba,
-                max_lba, count);
-      snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
-                         SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
-      goto check_condition;
-    }
-    uint64_t bytes64 = (uint64_t)count * dev->sector_size;
-    if (bytes64 > UINT32_MAX) {
-      snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
-                         SNOWSCSI_ASC_INVALID_FIELD, 0x00);
-      goto check_condition;
-    }
-    uint32_t bytes = (uint32_t)bytes64;
-    dev->data_buf = malloc(bytes);
-    if (!dev->data_buf)
-      goto alloc_fail;
-    dev->data_total = bytes;
-    dev->data_offset = 0;
-    dev->write_backend_offset = (uint64_t)lba * dev->sector_size;
-    *transfer_len = bytes;
-    return SNOWSCSI_DATA_OUT;
+    return do_write(dev, max_lba, lba, count, transfer_len, "WRITE_10");
+  }
+
+  case SNOWSCSI_OP_READ_12: {
+    uint32_t lba = snowscsi_cdb_get_lba12(cdb);
+    uint32_t count = snowscsi_cdb_get_transfer_len12(cdb);
+    return do_read(dev, max_lba, lba, count, transfer_len, "READ_12");
+  }
+
+  case SNOWSCSI_OP_WRITE_12: {
+    uint32_t lba = snowscsi_cdb_get_lba12(cdb);
+    uint32_t count = snowscsi_cdb_get_transfer_len12(cdb);
+    return do_write(dev, max_lba, lba, count, transfer_len, "WRITE_12");
+  }
+
+  case SNOWSCSI_OP_READ_16: {
+    uint64_t lba = snowscsi_cdb_get_lba16(cdb);
+    uint32_t count = snowscsi_cdb_get_transfer_len16(cdb);
+    return do_read(dev, max_lba, lba, count, transfer_len, "READ_16");
+  }
+
+  case SNOWSCSI_OP_WRITE_16: {
+    uint64_t lba = snowscsi_cdb_get_lba16(cdb);
+    uint32_t count = snowscsi_cdb_get_transfer_len16(cdb);
+    return do_write(dev, max_lba, lba, count, transfer_len, "WRITE_16");
   }
 
   case SNOWSCSI_OP_SERVICE_ACTION_IN: {
