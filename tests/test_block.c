@@ -522,15 +522,15 @@ void test_block_inquiry_vpd_83(void) {
   cdb[0] = SNOWSCSI_OP_INQUIRY;
   cdb[1] = 0x01; /* EVPD=1 */
   cdb[2] = 0x83;
-  cdb[4] = 24; /* alloc len */
+  cdb[4] = 16; /* alloc len */
 
   uint32_t xfer;
   snowscsi_result_t r = snowscsi_do_cmd(dev, cdb, 6, &xfer);
   TEST_ASSERT_EQUAL(SNOWSCSI_DATA_IN, r);
 
-  uint8_t buf[24];
+  uint8_t buf[16];
   int n = snowscsi_read_data(dev, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL(24, n);
+  TEST_ASSERT_EQUAL(16, n);
 
   TEST_ASSERT_EQUAL_HEX8(0x83, buf[1]); /* Page Code */
   /* Designation descriptor #1: NAA */

@@ -62,7 +62,7 @@ static void build_vpd_80(uint8_t *buf, uint64_t size) {
 
 /* ── INQUIRY VPD 0x83: Device Identification ───────────────────── */
 
-#define VPD_ID_LEN (4 + 4 + 16)
+#define VPD_ID_LEN (4 + 4 + 8)
 
 static void build_vpd_83(uint8_t *buf, uint64_t size) {
   memset(buf, 0, VPD_ID_LEN);
@@ -74,13 +74,13 @@ static void build_vpd_83(uint8_t *buf, uint64_t size) {
   buf[4] = 0x04;            /* Code Set = Binary */
   buf[5] = 0x03;            /* Designator Type = NAA */
   buf[6] = 0x00;            /* Reserved */
-  buf[7] = VPD_ID_LEN - 8;  /* Designator Length = 12 */
-  /* NAA-6 Locally Assigned (format NAA IEEE Registered) */
+  buf[7] = 8;               /* Designator Length for NAA-6 */
+  /* NAA-6 IEEE Registered Extended */
   buf[8] = 0x60;            /* NAA=6, first nibble, plus 4 MSB of NAA value */
-  /* Remaining 11 bytes encode the device identifier based on size */
+  /* Remaining 7 bytes encode the device identifier based on size */
   uint64_t id = size;
   for (int i = 0; i < 8; i++)
-    buf[12 + i] = (uint8_t)(id >> (56 - 8 * i));
+    buf[9 + i] = (uint8_t)(id >> (56 - 8 * i));
 }
 
 /* ── REQUEST SENSE response (18 bytes) ─────────────────────────── */
@@ -98,12 +98,14 @@ static void build_sense(uint8_t *buf, const snowscsi_sense_t *s) {
 
 /* ── READ CAPACITY(10) response (8 bytes) ──────────────────────── */
 
-static void build_read_capacity(uint8_t *buf, uint32_t max_lba,
+static void build_read_capacity(uint8_t *buf, uint64_t max_lba,
                                 uint32_t block_size) {
-  buf[0] = (max_lba >> 24) & 0xFF;
-  buf[1] = (max_lba >> 16) & 0xFF;
-  buf[2] = (max_lba >> 8) & 0xFF;
-  buf[3] = (max_lba) & 0xFF;
+  /* READ CAPACITY(10) returns 32-bit max LBA; cap at 0xFFFFFFFF */
+  uint32_t lba32 = (max_lba > 0xFFFFFFFFUL) ? 0xFFFFFFFFUL : (uint32_t)max_lba;
+  buf[0] = (lba32 >> 24) & 0xFF;
+  buf[1] = (lba32 >> 16) & 0xFF;
+  buf[2] = (lba32 >> 8) & 0xFF;
+  buf[3] = (lba32) & 0xFF;
   buf[4] = (block_size >> 24) & 0xFF;
   buf[5] = (block_size >> 16) & 0xFF;
   buf[6] = (block_size >> 8) & 0xFF;
@@ -112,7 +114,7 @@ static void build_read_capacity(uint8_t *buf, uint32_t max_lba,
 
 /* ── Shared read/write helpers ───────────────────────────────────── */
 
-static snowscsi_result_t do_read(snowscsi_device_t *dev, uint32_t max_lba,
+static snowscsi_result_t do_read(snowscsi_device_t *dev, uint64_t max_lba,
                                  uint64_t lba, uint32_t count,
                                  uint32_t *transfer_len, const char *tag) {
   if (count == 0) {
@@ -120,8 +122,8 @@ static snowscsi_result_t do_read(snowscsi_device_t *dev, uint32_t max_lba,
     return SNOWSCSI_STATUS;
   }
   if (lba > max_lba || lba + count > (uint64_t)max_lba + 1) {
-    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%u count=%u", tag,
-              (unsigned long)lba, max_lba, count);
+    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%lu count=%u", tag,
+               (unsigned long)lba, (unsigned long)max_lba, count);
     snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
                        SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
     goto check_condition;
@@ -161,7 +163,7 @@ check_condition:
   return SNOWSCSI_CHECK_CONDITION;
 }
 
-static snowscsi_result_t do_write(snowscsi_device_t *dev, uint32_t max_lba,
+static snowscsi_result_t do_write(snowscsi_device_t *dev, uint64_t max_lba,
                                   uint64_t lba, uint32_t count,
                                   uint32_t *transfer_len, const char *tag) {
   if (count == 0) {
@@ -169,8 +171,8 @@ static snowscsi_result_t do_write(snowscsi_device_t *dev, uint32_t max_lba,
     return SNOWSCSI_STATUS;
   }
   if (lba > max_lba || lba + count > (uint64_t)max_lba + 1) {
-    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%u count=%u", tag,
-              (unsigned long)lba, max_lba, count);
+    SNOW_LOGW("%s: LBA out of range lba=%lu max_lba=%lu count=%u", tag,
+               (unsigned long)lba, (unsigned long)max_lba, count);
     snowscsi_sense_set(&dev->sense, SNOWSCSI_SENSE_ILLEGAL_REQUEST,
                        SNOWSCSI_ASC_LBA_OUT_OF_RANGE, 0x00);
     goto check_condition;
@@ -209,8 +211,8 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
   (void)cdb_len;
   uint8_t opcode = snowscsi_cdb_get_opcode(cdb);
   uint64_t backend_size = dev->backend->ops->get_size(dev->backend->ctx);
-  uint32_t max_lba = (dev->sector_size > 0)
-                         ? (uint32_t)(backend_size / dev->sector_size) - 1
+  uint64_t max_lba = (dev->sector_size > 0)
+                         ? (backend_size / dev->sector_size) - 1
                          : 0;
 
   SNOW_LOGD("cmd=%s opcode=0x%02x", snowscsi_cdb_opcode_name(opcode), opcode);
@@ -324,8 +326,8 @@ static snowscsi_result_t block_handle_cmd(snowscsi_device_t *dev,
                          SNOWSCSI_ASC_INVALID_FIELD, 0x00);
       goto check_condition;
     }
-    SNOW_LOGV("READ_CAPACITY_10: max_lba=%u block_size=%u pmi=%u", max_lba,
-              dev->sector_size, pmi);
+    SNOW_LOGV("READ_CAPACITY_10: max_lba=%lu block_size=%u pmi=%u",
+               (unsigned long)max_lba, dev->sector_size, pmi);
     dev->data_buf = malloc(8);
     if (!dev->data_buf)
       goto alloc_fail;

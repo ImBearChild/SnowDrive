@@ -431,8 +431,9 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
 
   /* Read initiator DataSegment for parameter negotiation */
   uint8_t *idata = NULL;
-  if (dsl > 0 && dsl <= LOGIN_RESP_MAX) {
-    idata = malloc(dsl);
+  if (dsl > 0) {
+    if (dsl <= LOGIN_RESP_MAX)
+      idata = malloc(dsl);
     if (idata) {
       if (t_recv(t, ctx, conn, idata, dsl) < 0) {
         free(idata);
@@ -444,6 +445,18 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
             fputc('\n', stderr);
           else
             fputc(idata[i], stderr);
+    } else {
+      /* dsl > LOGIN_RESP_MAX or malloc failed — consume data segment
+       * bytes so subsequent PDU reads stay aligned */
+      uint32_t remain = dsl;
+      while (remain > 0) {
+        uint8_t discard[8192];
+        uint32_t chunk =
+            remain > sizeof(discard) ? (uint32_t)sizeof(discard) : remain;
+        if (t_recv(t, ctx, conn, discard, chunk) < 0)
+          return -1;
+        remain -= chunk;
+      }
     }
   }
   SNOW_LOGD("--- end params ---");
@@ -503,8 +516,6 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
     tsih[0] = 0;
     tsih[1] = 1;
   }
-  uint16_t cid = ((uint16_t)bhs[22] << 8) | bhs[23];
-
   memset(bhs, 0, 48);
   memcpy(&bhs[8], isid, 6);
   memcpy(&bhs[14], tsih, 2);
@@ -519,8 +530,6 @@ static int do_login(const snowscsi_transport_ops_t *t, void *ctx, intptr_t conn,
                        << SNOWSCSI_ISCSI_FLAG_NSG_SHIFT));
 
   snowscsi_iscsi_bhs_set_itt(bhs, itt);
-  bhs[22] = (uint8_t)(cid >> 8);
-  bhs[23] = (uint8_t)(cid & 0xFF);
   snowscsi_iscsi_bhs_set_data_seg_len(bhs, resp_len);
   /* ExpCmdSN = initial CmdSN from Login Request (first command uses same CmdSN)
    */
@@ -648,6 +657,7 @@ static int handle_data_out(const snowscsi_transport_ops_t *t, void *ctx,
                 snowscsi_iscsi_opcode_name(op), op);
       send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR, *stat_sn,
                   *cmd_sn + 1);
+      (*stat_sn)++;
       return -1;
     }
 
@@ -699,8 +709,10 @@ static int handle_scsi_cmd(const snowscsi_transport_ops_t *t, void *ctx,
 
   if (lun >= (uint8_t)num_devs) {
     SNOW_LOGW("invalid LUN %u for opcode=0x%02x itt=0x%x", lun, opcode, itt);
-    return send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR,
-                       *stat_sn, *cmd_sn + 1);
+    int ret = send_reject(t, ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR,
+                          *stat_sn, *cmd_sn + 1);
+    (*stat_sn)++;
+    return ret;
   }
 
   snowscsi_device_t *dev = devs[lun];
@@ -851,6 +863,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         if ((int32_t)(recv_cmd_sn - cmd_sn) < 0) {
           send_reject(t, transport_ctx, conn, SNOWSCSI_ISCSI_REJECT_CMD_SN,
                       stat_sn, cmd_sn + 1);
+          stat_sn++;
           break;
         }
 
@@ -871,6 +884,8 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
         if (send_nop_in(t, transport_ctx, conn, itt, ttt, stat_sn, cmd_sn + 1) <
             0)
           running = 0;
+        else
+          stat_sn++;
         break;
       }
 
@@ -919,6 +934,7 @@ int snowscsi_iscsi_serve(snowscsi_device_t **devs, int num_devs,
                   snowscsi_iscsi_opcode_name(op), op);
         send_reject(t, transport_ctx, conn, SNOWSCSI_ISCSI_REJECT_FORMAT_ERROR,
                     stat_sn, cmd_sn + 1);
+        stat_sn++;
         break;
       }
     }
