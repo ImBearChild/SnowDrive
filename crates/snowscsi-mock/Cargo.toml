@@ -1,0 +1,8 @@
+[package]
+name = "snowscsi-mock"
+version = "0.1.0"
+edition = "2021"
+description = "Mock Conn utilities for snowscsi integration testing"
+
+[dependencies]
+embedded-io = "0.7"

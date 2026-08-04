@@ -1,0 +1,13 @@
+[package]
+name = "snowscsi"
+version = "0.1.0"
+edition = "2021"
+description = "SCSI device emulation + iSCSI target protocol"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+snowcommon = { path = "../snowcommon" }
+embedded-io = "0.7"

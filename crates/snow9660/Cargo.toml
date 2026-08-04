@@ -1,0 +1,7 @@
+[package]
+name = "snow9660"
+version = "0.1.0"
+edition = "2021"
+description = "ISO9660 + Joliet filesystem library"
+
+[dependencies]

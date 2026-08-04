@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/snowcommon",
+    "crates/snowscsi",
+    "crates/snow9660",
+    "crates/snowscsi-capi",
+    "crates/snowscsi-cli",
+    "crates/snow9660-cli",
+    "crates/snowscsi-mock",
+    "tests",
+]

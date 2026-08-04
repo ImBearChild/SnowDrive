@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Generated C API header
+crates/snowscsi-capi/include/snowscsi.h
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Clangd
+.cache/
+
+# Local notes (__* files)
+__*

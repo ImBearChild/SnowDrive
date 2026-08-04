@@ -1,0 +1,13 @@
+[package]
+name = "snowdrive-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
+
+[dependencies]
+snowscsi = { path = "../crates/snowscsi" }
+snowscsi-mock = { path = "../crates/snowscsi-mock" }
+embedded-io = "0.7"
+
+[build-dependencies]
+pkg-config = "0.3"
