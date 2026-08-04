@@ -2,6 +2,13 @@
 name = "snowcommon"
 version = "0.1.0"
 edition = "2021"
-description = "Zero-alloc logging and hex formatting for SnowDrive"
+description = "Unified logging macros for SnowDrive"
+
+[features]
+default = []
+log = ["dep:log"]
+defmt = ["dep:defmt"]
 
 [dependencies]
+log = { version = "0.4", optional = true, default-features = false }
+defmt = { version = "1", optional = true }

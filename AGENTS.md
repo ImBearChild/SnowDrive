@@ -69,8 +69,9 @@ git checkout legacy
 
 ## Agent-Only Context
 
-- **Logging**: `snowcommon` provides zero-alloc `LogBuf` + `core::fmt::Write`.
-  `tracing` available as optional `std` feature for CLI output.
+- **Logging**: `snowcommon` provides unified logging macros (`trace!`/`debug!`/
+  `info!`/`warn!`/`error!`) that dispatch to `log` or `defmt` via features.
+  Log output routing is the caller's responsibility.
 - **Tests**: `cargo test --workspace`. Integration tests (mock + libiscsi
   whitebox) live in `tests/` crate.
 - **no_std verification**: `cargo build -p snowscsi -p snowcommon -p snowscsi-capi --no-default-features`
