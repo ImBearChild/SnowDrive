@@ -9,6 +9,7 @@
 //! - [`block`]: SBC block device command set (block.c)
 //! - [`iscsi_pdu`]: iSCSI PDU (BHS) field codec (RFC 3720 §10.x)
 //! - [`conn`]: connection abstraction (`embedded_io::Read + Write`)
+//! - [`transport`]: BSD TCP transport (`std` feature only)
 //! - [`iscsi_target`]: iSCSI target session state machine (RFC 3720 §5/§10)
 //!
 //! ## Features
@@ -21,6 +22,8 @@ pub mod device;
 pub mod iscsi_pdu;
 pub mod iscsi_target;
 pub mod scsi;
+#[cfg(feature = "std")]
+pub mod transport;
 
 pub use backend::{BlockBackend, BlockBackendError, RamBackend};
 pub use block::Device;
@@ -34,6 +37,8 @@ pub use scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, opcode_name, Sense, SenseKey,
 };
+#[cfg(feature = "std")]
+pub use transport::{serve, TcpConn};
 
 pub const MIN_WORK_LEN: usize = 48 + 8192;
 
