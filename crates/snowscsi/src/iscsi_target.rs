@@ -456,8 +456,11 @@ impl Session {
         if pdu.dsl > MAX_DATA_SEGMENT as usize {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
         }
-        // RFC 3720 §10.3.1: W bit is byte 1 bit 2 (legacy C used 0x20 — wrong).
-        let w_bit = bhs.as_bytes()[1] & 0x04 != 0;
+        // RFC 3720 §10.3.1: W bit is byte 1 bit 2. Per the §2.3.3 "Byte Rule",
+        // bit 0 is the MSB (2**7), so bit 2 = 0x20 — the Linux kernel
+        // (open-iscsi) sends W at 0x20. The legacy C `& 0x20` was correct; a
+        // prior Rust "fix" to 0x04 (misreading bit 2 as LSB) broke Linux writes.
+        let w_bit = bhs.as_bytes()[1] & 0x20 != 0;
         if pdu.dsl > 0 && !w_bit {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
         }

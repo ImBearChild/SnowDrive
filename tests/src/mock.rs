@@ -47,7 +47,8 @@ mod tests {
     fn write10_bhs(lba: u32, blocks: u16, itt: u32, cmd_sn: u32, dsl: u32) -> [u8; 48] {
         let mut bhs = [0u8; 48];
         bhs[0] = op::SCSI_CMD;
-        bhs[1] = 0x04 | 0x20; // W bit + Simple attribute
+        // Kernel write layout (§2.3.3): F(0x80) | W(0x20) | ATTR_SIMPLE(0x01) = 0xA1.
+        bhs[1] = 0xA1;
         bhs[5] = (dsl >> 16) as u8;
         bhs[6] = (dsl >> 8) as u8;
         bhs[7] = dsl as u8;
@@ -752,6 +753,49 @@ mod tests {
         assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
         assert_eq!(resp[3], status::GOOD);
         assert!(conn.take_pdu().is_none()); // no R2T
+    }
+
+    // ── Linux-kernel (open-iscsi) write flag layout (RFC 3720 §2.3.3) ──
+    // The kernel sends byte 1 = F(0x80) | W(0x20) | ATTR (bits 0-2): 0xA1 for
+    // a Simple write, 0xA0 for an untagged write. W is RFC 3720 bit 2 = 0x20
+    // (bit 0 is the MSB per the Byte Rule) — the target must accept these
+    // writes (regression: a prior fix checked 0x04 and Rejected them 0x04).
+
+    #[test]
+    fn linux_kernel_write_flag_layout_accepted() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // F(0x80) | W(0x20) | ATTR_SIMPLE(0x01) = 0xA1 — write10_bhs default.
+        let itt = 0xA100_0001;
+        let imm = vec![0x42u8; 512];
+        let cmd = write10_bhs(0, 1, itt, 0, 512);
+        conn.feed_padded(&cmd, &imm);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(resp[3], status::GOOD);
+
+        // F(0x80) | W(0x20), untagged (0x00) = 0xA0.
+        let itt = 0xA100_0002;
+        let mut cmd = write10_bhs(0, 1, itt, 1, 512);
+        cmd[1] = 0xA0;
+        conn.feed_padded(&cmd, &imm);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(resp[3], status::GOOD);
     }
 
     // ── serve_conn blocking loop: login + logout → Ok ──────────────
