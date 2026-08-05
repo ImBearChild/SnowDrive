@@ -321,7 +321,13 @@ impl Session {
         if t {
             self.stage = LoginStage::from_csg(nsg).unwrap_or(LoginStage::FullFeature);
             if self.stage == LoginStage::FullFeature {
-                self.cmd_sn = req.cmd_sn();
+                // RFC 3720 §10.12.8: the leading Login Request's CmdSN is the
+                // session's initial ExpCmdSN, and the first FullFeature
+                // command reuses that same CmdSN. `cmd_sn` tracks the last
+                // consumed CmdSN, so back off by one — the first command
+                // (CmdSN == login CmdSN) then passes the `cmd_sn + 1` window
+                // check (wrapping handles a login CmdSN of 0).
+                self.cmd_sn = req.cmd_sn().wrapping_sub(1);
             }
         } else {
             self.stage = LoginStage::from_csg(req_csg).unwrap_or(LoginStage::Security);

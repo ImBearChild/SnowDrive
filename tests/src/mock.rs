@@ -24,6 +24,8 @@ mod tests {
         bhs[5] = (dsl >> 16) as u8;
         bhs[6] = (dsl >> 8) as u8;
         bhs[7] = dsl as u8;
+        // CmdSN stays 0 (RFC 3720 §10.12.8): the first FullFeature command
+        // reuses the leading Login Request's CmdSN.
         bhs
     }
 
@@ -290,7 +292,7 @@ mod tests {
         assert_eq!(session.stage(), LoginStage::FullFeature);
 
         // A SCSI command now works (StatSN = 2 after two login responses).
-        let cmd = read10_bhs(0, 1, 0x9999, 1);
+        let cmd = read10_bhs(0, 1, 0x9999, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
@@ -318,7 +320,7 @@ mod tests {
         devs[0].write_data(0, &pattern).unwrap();
 
         // READ 18 blocks (9216 bytes) — crosses 2+ Data-In PDUs.
-        let cmd = read10_bhs(0, 18, 0x12345678, 1);
+        let cmd = read10_bhs(0, 18, 0x12345678, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
@@ -364,7 +366,7 @@ mod tests {
         // WRITE 3 blocks at LBA 10 with only 512 bytes of immediate data.
         let itt = 0x7777_0001;
         let imm: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
-        let cmd = write10_bhs(10, 3, itt, 1, 512);
+        let cmd = write10_bhs(10, 3, itt, 0, 512);
         conn.feed_padded(&cmd, &imm);
 
         // Pre-feed the solicited Data-Out (1024 bytes): one step consumes the
@@ -392,8 +394,8 @@ mod tests {
         assert_eq!(resp[3], status::GOOD);
         assert_eq!(&resp[16..20], &be32(itt));
         assert_eq!(&resp[24..28], &be32(1)); // StatSN
-        assert_eq!(&resp[28..32], &be32(2)); // ExpCmdSN = cmd_sn+1
-        assert_eq!(&resp[32..36], &be32(2)); // MaxCmdSN
+        assert_eq!(&resp[28..32], &be32(1)); // ExpCmdSN = cmd_sn+1
+        assert_eq!(&resp[32..36], &be32(1)); // MaxCmdSN
 
         // Verify backend content.
         let mut buf = [0u8; 1536];
@@ -418,7 +420,7 @@ mod tests {
         // 600 blocks = 307200 bytes > MaxBurstLength (262144).
         let itt = 0xAAAA_0001;
         let imm = vec![0x5Au8; 8192];
-        let cmd = write10_bhs(0, 600, itt, 1, 8192);
+        let cmd = write10_bhs(0, 600, itt, 0, 8192);
         conn.feed_padded(&cmd, &imm);
 
         // Feed the full Data-Out sequence up front: one step consumes the
@@ -501,7 +503,7 @@ mod tests {
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
-        let mut cmd = read10_bhs(0, 1, 0x1111, 1);
+        let mut cmd = read10_bhs(0, 1, 0x1111, 0);
         cmd[9] = 5; // LUN out of range (only LUN 0 exists)
         conn.feed(&cmd, &[]);
         assert_eq!(
@@ -528,7 +530,7 @@ mod tests {
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
-        // CmdSN=5 while the next expected is 1 → silent ignore, no PDU.
+        // CmdSN=5 while the next expected is 0 → silent ignore, no PDU.
         let cmd = read10_bhs(0, 1, 0x2222, 5);
         conn.feed(&cmd, &[]);
         assert_eq!(
@@ -537,8 +539,8 @@ mod tests {
         );
         assert!(conn.take_pdu().is_none());
 
-        // A correct CmdSN=1 command still executes afterwards.
-        let cmd = read10_bhs(0, 1, 0x3333, 1);
+        // A correct CmdSN=0 command still executes afterwards.
+        let cmd = read10_bhs(0, 1, 0x3333, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
@@ -546,6 +548,49 @@ mod tests {
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+    }
+
+    // ── RFC §10.12.8: first FullFeature command reuses login CmdSN ──
+
+    #[test]
+    fn first_command_reuses_login_cmd_sn() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+
+        // Login carrying a non-zero CmdSN, as a real initiator would.
+        let text = REQ_TEXT.as_bytes();
+        let mut bhs = login_bhs(text.len() as u32);
+        bhs[24..28].copy_from_slice(&be32(0x73dd_e21f));
+        conn.feed_padded(&bhs, text);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(&resp[28..32], &be32(0x73dd_e21f)); // ExpCmdSN = login CmdSN
+        assert_eq!(&resp[32..36], &be32(0x73dd_e21f)); // MaxCmdSN
+
+        // The first command reuses the same CmdSN (not +1).
+        let cmd = read10_bhs(0, 1, 0x9999, 0x73dd_e21f);
+        conn.feed(&cmd, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+
+        // The second command advances to +1.
+        let cmd = read10_bhs(0, 1, 0x999A, 0x73dd_e220);
+        conn.feed(&cmd, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
     }
 
     // ── Immediate TMF (I=1) accepted out of window (#21) ───────────
@@ -668,7 +713,7 @@ mod tests {
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
-        let mut pdu = read10_bhs(0, 1, 0x7777, 1);
+        let mut pdu = read10_bhs(0, 1, 0x7777, 0);
         pdu[4] = 1; // TotalAHSLength = 1 (4 bytes of AHS)
         conn.feed(&pdu, &[]);
         conn.feed_bytes(&[0u8; 4]); // the AHS bytes
@@ -696,7 +741,7 @@ mod tests {
 
         let itt = 0xBBBB_0001;
         let imm = vec![0x42u8; 512];
-        let cmd = write10_bhs(0, 1, itt, 1, 512);
+        let cmd = write10_bhs(0, 1, itt, 0, 512);
         conn.feed_padded(&cmd, &imm);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
