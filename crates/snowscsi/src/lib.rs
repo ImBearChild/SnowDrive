@@ -5,13 +5,16 @@
 //! ## Modules
 //! - [`scsi`]: opcodes, sense data, CDB field parsing (SPC-4 / SBC-3)
 //! - [`device`]: command outcome + device types (device.h)
+//! - [`backend`]: block storage backends (RAM + file), no_std error type
 //!
 //! ## Features
-//! - `std` (default): enables BSD transport (TcpStream) and FileBackend
+//! - `std` (default): enables BSD transport (TcpStream), FileBackend
 
+pub mod backend;
 pub mod device;
 pub mod scsi;
 
+pub use backend::{BlockBackend, BlockBackendError, RamBackend};
 pub use device::{CommandOutcome, DeviceType};
 pub use scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,

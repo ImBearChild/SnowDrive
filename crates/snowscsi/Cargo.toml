@@ -6,7 +6,7 @@ description = "SCSI device emulation + iSCSI target protocol"
 
 [features]
 default = ["std"]
-std = []
+std = ["embedded-io/std"]
 
 [dependencies]
 snowcommon = { path = "../snowcommon" }
