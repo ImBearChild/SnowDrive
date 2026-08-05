@@ -74,6 +74,7 @@ pub mod status {
 /// `0x02` (Data Digest Error) and `0x0A` (Long Operation Reject) are NOT used.
 pub mod reject {
     pub const PROTOCOL_ERROR: u8 = 0x04;
+    pub const COMMAND_NOT_SUPPORTED: u8 = 0x05;
     pub const INVALID_PDU_FIELD: u8 = 0x09;
 }
 

@@ -19,6 +19,11 @@ impl MockConn {
         self.rx.extend(data);
     }
 
+    /// Push raw inbound bytes (for AHS / odd framing in tests).
+    pub fn feed_bytes(&mut self, bytes: &[u8]) {
+        self.rx.extend(bytes);
+    }
+
     pub fn feed_padded(&mut self, bhs: &[u8; 48], data: &[u8]) {
         let dsl = data.len();
         let total = 48 + dsl;
