@@ -3,6 +3,7 @@
 #![doc = ""]
 #![doc = "Uses `Vec<u8>` deque semantics — no threads, no globals."]
 
+#[derive(Default)]
 pub struct MockConn {
     rx: std::collections::VecDeque<u8>,
     pub tx: std::vec::Vec<u8>,
@@ -10,10 +11,7 @@ pub struct MockConn {
 
 impl MockConn {
     pub fn new() -> Self {
-        Self {
-            rx: std::collections::VecDeque::new(),
-            tx: std::vec::Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn feed(&mut self, bhs: &[u8; 48], data: &[u8]) {
@@ -67,8 +65,8 @@ impl embedded_io::ErrorType for MockConn {
 impl embedded_io::Read for MockConn {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         let n = buf.len().min(self.rx.len());
-        for i in 0..n {
-            buf[i] = self.rx[i];
+        for (out, b) in buf.iter_mut().zip(self.rx.iter()).take(n) {
+            *out = *b;
         }
         self.rx.drain(..n);
         Ok(n)
