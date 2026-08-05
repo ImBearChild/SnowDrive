@@ -16,10 +16,10 @@ use crate::block::Device;
 use crate::conn::{read_exact, write_all, Conn};
 use crate::device::CommandOutcome;
 use crate::iscsi_pdu::{
-    flag, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs, BHS_SIZE,
-    MAX_DATA_SEGMENT,
+    flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
+    BHS_SIZE, MAX_DATA_SEGMENT,
 };
-use crate::scsi::Sense;
+use crate::scsi::{opcode_name, Sense};
 use crate::BlockBackend;
 
 /// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
@@ -247,6 +247,14 @@ impl Session {
         }
 
         let op = pdu.bhs.opcode();
+        snowcommon::debug!(
+            "recv {} (0x{:02X}) stage={:?} cmd_sn={} stat_sn={}",
+            iscsi_opcode_name(op),
+            op,
+            self.stage,
+            self.cmd_sn,
+            self.stat_sn
+        );
         if self.stage != LoginStage::FullFeature {
             if op != op::LOGIN_REQ {
                 return self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs);
@@ -295,6 +303,14 @@ impl Session {
         } else {
             0
         };
+        snowcommon::debug!(
+            "login: CSG={} NSG={} T={} TSIH={} itt=0x{:08X}",
+            req_csg,
+            nsg,
+            t,
+            req.tsih(),
+            req.itt()
+        );
 
         let mut resp = Bhs::new();
         resp.set_opcode(op::LOGIN_RESP);
@@ -321,6 +337,7 @@ impl Session {
         if t {
             self.stage = LoginStage::from_csg(nsg).unwrap_or(LoginStage::FullFeature);
             if self.stage == LoginStage::FullFeature {
+                snowcommon::debug!("login complete: FullFeature, cmd_sn={}", req.cmd_sn());
                 // RFC 3720 §10.12.8: the leading Login Request's CmdSN is the
                 // session's initial ExpCmdSN, and the first FullFeature
                 // command reuses that same CmdSN. `cmd_sn` tracks the last
@@ -447,6 +464,15 @@ impl Session {
 
         let cdb = bhs.cdb();
         let dev = &mut devs[lun];
+        snowcommon::debug!(
+            "scsi cmd: {} (0x{:02X}) itt=0x{:08X} lun={} cmd_sn={} dsl={}",
+            opcode_name(cdb[0]),
+            cdb[0],
+            itt,
+            lun,
+            recv_cmd_sn,
+            pdu.dsl
+        );
         let outcome = match dev.do_cmd(cdb, work, pdu.dsl) {
             Ok(o) => o,
             Err(crate::device::Error::WorkBufTooSmall) => {
@@ -455,8 +481,17 @@ impl Session {
         };
 
         match outcome {
-            CommandOutcome::Status => self.send_scsi_response(conn, work, itt, status::GOOD, None),
+            CommandOutcome::Status => {
+                snowcommon::debug!("  -> Status (GOOD)");
+                self.send_scsi_response(conn, work, itt, status::GOOD, None)
+            }
             CommandOutcome::CheckCondition(sense) => {
+                snowcommon::debug!(
+                    "  -> CheckCondition key={:?} asc=0x{:02X} ascq=0x{:02X}",
+                    sense.key,
+                    sense.asc,
+                    sense.ascq
+                );
                 self.send_scsi_response(conn, work, itt, status::CHECK_CONDITION, Some(&sense))
             }
             CommandOutcome::DataIn {
@@ -467,8 +502,14 @@ impl Session {
                 if !immediate.is_empty() {
                     // Synthesized response already resident at work[48..48+n].
                     let n = immediate.len();
+                    snowcommon::debug!("  -> DataIn (synthesized, {} bytes)", n);
                     self.send_data_in_final(conn, work, itt, n, 0, 0, status::GOOD)
                 } else {
+                    snowcommon::debug!(
+                        "  -> DataIn (backend, transfer_len={} @ offset={})",
+                        transfer_len,
+                        byte_offset
+                    );
                     self.send_read_data(conn, work, dev, itt, transfer_len, byte_offset)
                 }
             }
@@ -480,6 +521,12 @@ impl Session {
                 // Consume the immediate data first (write to backend), dropping
                 // the borrow on work (§5.1), then drive R2T/Data-Out.
                 let received = immediate.len() as u64;
+                snowcommon::debug!(
+                    "  -> DataOut transfer_len={} immediate={} @ offset={}",
+                    transfer_len,
+                    received,
+                    byte_offset
+                );
                 if received > 0 && dev.write_data(byte_offset, immediate).is_err() {
                     let sense = *dev.sense();
                     return self.send_scsi_response(
@@ -542,6 +589,13 @@ impl Session {
                 bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
                 bhs.set_flags(flag::F_BIT | flag::S_BIT);
             }
+            snowcommon::trace!(
+                "  Data-In: BO={} DataSN={} len={} final={}",
+                offset,
+                data_sn,
+                chunk,
+                is_last
+            );
             if send_pdu(conn, work, &bhs, chunk).is_err() {
                 return StepResult::Closed;
             }
@@ -586,6 +640,7 @@ impl Session {
             bhs.set_r2t_sn(r2t_sn);
             bhs.set_buffer_offset(received as u32);
             bhs.set_desired_data_len(burst as u32);
+            snowcommon::trace!("R2T: R2TSN={} BO={} DesiredLen={}", r2t_sn, received, burst);
             if send_pdu(conn, work, &bhs, 0).is_err() {
                 return StepResult::Closed;
             }
@@ -636,6 +691,12 @@ impl Session {
                         Some(&sense),
                     );
                 }
+                snowcommon::trace!(
+                    "  Data-Out: BO={} DataSN={} len={}",
+                    expected_bo,
+                    data_sn,
+                    pdu.dsl
+                );
                 expected_bo += pdu.dsl as u64;
                 burst_received += pdu.dsl as u64;
                 data_sn = data_sn.wrapping_add(1);
@@ -815,6 +876,13 @@ impl Session {
         reason: u8,
         rejected: &Bhs,
     ) -> StepResult {
+        snowcommon::warn!(
+            "rejecting {} (0x{:02X}) reason={} (0x{:02X})",
+            iscsi_opcode_name(rejected.opcode()),
+            rejected.opcode(),
+            reason,
+            reason
+        );
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::REJECT);
         bhs.set_flags(flag::F_BIT);
