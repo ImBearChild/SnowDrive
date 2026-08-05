@@ -2,14 +2,14 @@
 //! `snowscsi` CLI — starts the SnowDrive iSCSI target (`snowscsi_main.c`).
 //!
 //! Subcommands:
-//! - `serve`: run the iSCSI target (serial accept loop, `__RUST.md` §5.3)
+//! - `serve`: run the iSCSI target (serial accept loop)
 //!
 //! `--block` is repeatable; each spec becomes a LUN in order (the first
 //! `--block` is LUN 0, and so on). Specs are `ram=<size>` (K/M/G suffixes)
 //! or `<path>` (optionally `,ro` for a read-only file backend). SIGINT /
 //! SIGTERM trigger a graceful shutdown: the blocking `accept()` is woken by
 //! a probe connection, `serve()` returns, and every backend is `sync()`ed
-//! before exit (`__RUST.md` §8 验证门 6).
+//! before exit.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -23,7 +23,7 @@ use snowscsi::block::Device;
 use snowscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::MIN_WORK_LEN;
 
-/// Default work buffer size (256 KiB, `__RUST.md` §6 module 8).
+/// Default work buffer size (256 KiB).
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
@@ -121,7 +121,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     };
 
-    // Graceful shutdown (`__RUST.md` §5.3): SIGINT/SIGTERM set `stop`;
+    // Graceful shutdown: SIGINT/SIGTERM set `stop`;
     // a probe connection wakes the blocking accept() so serve() can observe
     // it and return (transport serves one connection at a time).
     let stop = Arc::new(AtomicBool::new(false));
@@ -153,7 +153,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush backends (`__RUST.md` §8 验证门 6).
+    // Graceful exit: flush backends.
     for (i, dev) in devices.iter_mut().enumerate() {
         if let Err(e) = dev.backend().sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");

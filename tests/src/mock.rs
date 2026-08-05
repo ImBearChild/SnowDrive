@@ -1,6 +1,6 @@
 //! Step-level iSCSI target integration tests (port of test_iscsi_mock.cpp
-//! semantics, `__RUST.md` §8 gate 2 / appendix C). Deterministic, single
-//! thread: `MockConn` scripted byte stream + `Session::step`.
+//! semantics). Deterministic, single thread: `MockConn` scripted byte stream
+//! + `Session::step`.
 
 #[cfg(test)]
 mod tests {

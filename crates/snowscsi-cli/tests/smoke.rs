@@ -84,7 +84,7 @@ fn serve_rejects_work_buf_too_small() {
     assert!(!out.status.success());
 }
 
-/// SIGINT → graceful shutdown → exit 0 (`__RUST.md` §8 验证门 6): the accept
+/// SIGINT → graceful shutdown → exit 0: the accept
 /// loop is woken, `serve()` returns, backends are sync()ed, process exits 0.
 #[cfg(unix)]
 #[test]

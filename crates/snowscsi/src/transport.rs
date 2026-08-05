@@ -1,13 +1,13 @@
 //! BSD TCP transport (`transport_bsd.c`) — `std` feature only.
 //!
 //! [`TcpConn`] wraps `std::net::TcpStream` as an embedded-io byte stream
-//! (thus a [`Conn`], `__RUST.md` §5.2). A read timeout is applied at
+//! (thus a [`Conn`]). A read timeout is applied at
 //! construction so a stalled peer cannot hang the server forever — this
-//! covers the login phase, the command loop, and Data-Out (`__RUST.md` §7
-//! #10/#20 DoS fix). Read/write loops are exact (`read_exact` / `write_all`
+//! covers the login phase, the command loop, and Data-Out (DoS fix).
+//! Read/write loops are exact (`read_exact` / `write_all`
 //! in [`crate::conn`], RFC 3720 §3.1 byte stream).
 //!
-//! [`serve`] is the convenience entry (`__RUST.md` §5.3): a serial accept
+//! [`serve`] is the convenience entry: a serial accept
 //! loop (MaxConnections = 1) that serves one connection at a time with a
 //! fresh [`Session`], retrying accept failures with a backoff instead of C's
 //! infinite busy retry.
@@ -21,11 +21,10 @@ use crate::backend::BlockBackend;
 use crate::block::Device;
 use crate::iscsi_target::{serve_conn, Session, TargetError};
 
-/// Default read timeout guarding login / command loop / Data-Out
-/// (`__RUST.md` §7 #10/#20).
+/// Default read timeout guarding login / command loop / Data-Out.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Backoff between accept() failures (`__RUST.md` §5.3; C busy-looped).
+/// Backoff between accept() failures (C busy-looped).
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A `TcpStream` wrapped as an embedded-io byte stream.
@@ -66,7 +65,7 @@ impl embedded_io::Write for TcpConn {
     }
 }
 
-/// Serial accept loop: serve one connection at a time (`__RUST.md` §5.3),
+/// Serial accept loop: serve one connection at a time,
 /// with accept-failure backoff retry.
 ///
 /// Each accepted connection gets a fresh [`Session`] (login restarts the

@@ -3,8 +3,8 @@
 //! [`BlockBackend`] replaces the C function-pointer table
 //! (`snowscsi_backend_ops_t`). It models **random-access block storage**
 //! (a block device); sequential / append-only media (tape, CD-R burning)
-//! will need their own storage abstraction (see `__RUST.md` Appendix D).
-//! Errors are no_std ([`BlockBackendError`]).
+//! will need their own storage abstraction. Errors are no_std
+//! ([`BlockBackendError`]).
 
 use embedded_io::ErrorKind as IoErrorKind;
 
@@ -40,7 +40,7 @@ impl core::error::Error for BlockBackendError {}
 /// (or read-only), fixed capacity. Not suited to sequential/append-only
 /// media (tape, CD-R) — those need separate storage abstractions.
 ///
-/// All methods take `&mut self` (see `__RUST.md` §5.2): the RAM backend
+/// All methods take `&mut self`: the RAM backend
 /// holds a caller-provided `&mut [u8]` and cannot serve `read` through a
 /// shared reference. Single-threaded in Phase 1.
 pub trait BlockBackend: Send {
@@ -60,7 +60,7 @@ pub trait BlockBackend: Send {
 }
 
 /// RAM backend. Disk image memory is **caller-provided** (`&mut [u8]`);
-/// the core never allocates (`__RUST.md` §4.1).
+/// the core never allocates.
 pub struct RamBackend<'a> {
     data: &'a mut [u8],
 }

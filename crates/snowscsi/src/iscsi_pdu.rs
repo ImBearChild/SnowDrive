@@ -16,8 +16,7 @@
 //! - Login Response (Status-Class 36, Status-Detail 37; bytes 20-23 Reserved): §10.13
 //! - Reject (Reason byte 2): §10.17
 //!
-//! Phase 1 negotiates HeaderDigest/DataDigest=None; no CRC32C is implemented
-//! (§6 module 5 of `__RUST.md`).
+//! Phase 1 negotiates HeaderDigest/DataDigest=None; no CRC32C is implemented.
 
 use core::ops::Index;
 
@@ -69,8 +68,8 @@ pub mod status {
 
 /// Reject reasons (RFC 3720 §10.17.1).
 ///
-/// Corrected per `__RUST.md` §7 #17: protocol/format errors use `PROTOCOL_ERROR`
-/// and field-validation failures use `INVALID_PDU_FIELD`. The legacy C values
+/// Protocol/format errors use `PROTOCOL_ERROR` and field-validation failures
+/// use `INVALID_PDU_FIELD`. The legacy C values
 /// `0x02` (Data Digest Error) and `0x0A` (Long Operation Reject) are NOT used.
 pub mod reject {
     pub const PROTOCOL_ERROR: u8 = 0x04;
@@ -297,7 +296,7 @@ impl Bhs {
 
     /// CID, bytes 20-21 (RFC 3720 §10.12.7).
     ///
-    /// Bytes 20-21 per §10.12 — NOT 22-23 (`__RUST.md` §7 #2). There is no
+    /// Bytes 20-21 per §10.12 — NOT 22-23. There is no
     /// setter: the Login Response keeps bytes 20-23 Reserved (§10.13).
     pub fn cid(&self) -> u16 {
         (u16::from(self.0[20]) << 8) | u16::from(self.0[21])
@@ -809,7 +808,7 @@ mod tests {
 
     #[test]
     fn cid_at_bytes_20_21() {
-        /* RFC 3720 §10.12: CID at bytes 20-21 — NOT 22-23 (__RUST.md §7 #2). */
+        /* RFC 3720 §10.12: CID at bytes 20-21 — NOT 22-23. */
         let mut b = bhs();
         b.0[20] = 0x12;
         b.0[21] = 0x34;

@@ -1,6 +1,6 @@
 //! SBC block device command set (block.c).
 //!
-//! Implements the direct-access block device commands per `__RUST.md` §6.1
+//! Implements the direct-access block device commands
 //! (SPC-4 / SBC-3). Synthesized responses (INQUIRY, MODE SENSE, ...) are
 //! written by the handler into `work[48..48+len]` and returned via
 //! [`CommandOutcome::DataIn::immediate`]; READ commands return an empty

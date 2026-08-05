@@ -4,7 +4,6 @@
  * offsets are therefore guaranteed correct — the Rust FFI side only ever
  * handles opaque pointers and never assumes struct layout.
  *
- * (snowdrive-tests, `__RUST.md` §8 verification gate 3.)
  */
 #include <iscsi/scsi-lowlevel.h>
 

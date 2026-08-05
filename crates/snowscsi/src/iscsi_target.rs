@@ -2,10 +2,10 @@
 //!
 //! [`Session`] drives one connection through the Login Phase (§5) and the
 //! Full Feature command loop (§10), one transaction per [`Session::step`]
-//! call (`__RUST.md` §5.3). [`serve_conn`] is the blocking `while step`
+//! call. [`serve_conn`] is the blocking `while step`
 //! wrapper.
 //!
-//! Key fixes over the legacy C implementation (`__RUST.md` §7): CID read at
+//! Key fixes over the legacy C implementation: CID read at
 //! byte 20-21 (from iscsi_pdu), Data-Out ITT/TTT/BufferOffset/DataSN
 //! validation with Reject 0x09 (#11), TMF CmdSN check by I bit (#21),
 //! out-of-window/duplicate CmdSN silently ignored (#17), Reject carries the
@@ -30,7 +30,7 @@ const TTT: u32 = 1;
 const DEFAULT_FIRST_BURST: u32 = 65536;
 const DEFAULT_MAX_BURST: u32 = 262144;
 
-/// One Login parameter key: how the target responds (`__RUST.md` §6.2).
+/// One Login parameter key: how the target responds.
 ///
 /// `value: None` echoes the initiator's value; `Some(v)` overrides it.
 /// `always: true` keys are emitted even if the initiator never sent them.
@@ -166,7 +166,7 @@ impl LoginStage {
     }
 }
 
-/// Negotiated login parameters (`__RUST.md` §5.4, RFC 3720 §12.12-.14).
+/// Negotiated login parameters (RFC 3720 §12.12-.14).
 pub struct NegotiatedParams {
     pub immediate_data: bool,
     pub initial_r2t: bool,
@@ -187,7 +187,7 @@ impl Default for NegotiatedParams {
     }
 }
 
-/// Per-connection iSCSI session state (`__RUST.md` §5.4).
+/// Per-connection iSCSI session state.
 ///
 /// `cmd_sn` is the last consumed CmdSN; non-immediate commands are accepted
 /// only when `CmdSN == cmd_sn + 1` (queue depth 1, MaxCmdSN = ExpCmdSN).
@@ -221,7 +221,7 @@ impl Session {
         self.stage
     }
 
-    /// Process one iSCSI transaction (`__RUST.md` §5.3).
+    /// Process one iSCSI transaction.
     ///
     /// Blocks on the connection for as much input as the transaction needs
     /// (Login → Login Response; SCSI Command → full Data-In/Data-Out flow and
@@ -241,7 +241,7 @@ impl Session {
             Err(()) => return StepResult::Closed,
         };
 
-        // AHS defense (`__RUST.md` §6.2): Phase 1 assumes TotalAHSLength = 0.
+        // AHS defense: Phase 1 assumes TotalAHSLength = 0.
         if pdu.bhs.total_ahs_length() != 0 {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs);
         }
@@ -725,7 +725,7 @@ impl Session {
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
 
-        // TMF CmdSN check by I bit (fix #21, `__RUST.md` §5.4).
+        // TMF CmdSN check by I bit (fix #21).
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
             return StepResult::Idle;
         }

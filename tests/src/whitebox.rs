@@ -1,4 +1,4 @@
-//! libiscsi whitebox integration tests (`__RUST.md` §8 verification gate 3).
+//! libiscsi whitebox integration tests.
 //!
 //! A real initiator (libiscsi) drives the in-process Rust iSCSI target over a
 //! real TCP loopback connection. FFI uses opaque pointers plus a tiny C
