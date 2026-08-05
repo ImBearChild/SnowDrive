@@ -280,14 +280,18 @@ impl Bhs {
         self.0[3]
     }
 
-    /// ISID, bytes 8-11 (RFC 3720 §10.12).
+    /// ISID (first 4 bytes), bytes 8-11. The full ISID field spans
+    /// bytes 8-13 (6 bytes, RFC 3720 §10.12.5).
     pub fn isid(&self) -> u32 {
         get_be32(&self.0[8..12])
     }
 
-    /// TSIH, bytes 12-13 (RFC 3720 §10.12).
+    /// TSIH, bytes 14-15 (RFC 3720 §10.12.3/.13.3).
+    ///
+    /// The Login Request layout puts ISID at bytes 8-13 and TSIH at
+    /// bytes 14-15 — NOT bytes 12-13 (C `do_login` reads `bhs[14..16]`).
     pub fn tsih(&self) -> u16 {
-        (u16::from(self.0[12]) << 8) | u16::from(self.0[13])
+        (u16::from(self.0[14]) << 8) | u16::from(self.0[15])
     }
 
     /// CID, bytes 20-21 (RFC 3720 §10.12.7).
@@ -825,11 +829,16 @@ mod tests {
         b.0[9] = 0x00;
         b.0[10] = 0x01;
         b.0[11] = 0x02;
-        b.0[12] = 0x00;
-        b.0[13] = 0x07;
+        b.0[14] = 0x00;
+        b.0[15] = 0x07;
         assert_eq!(b.version_max(), 0x10);
         assert_eq!(b.version_min(), 0x00);
         assert_eq!(b.isid(), 0x40000102);
+        assert_eq!(b.tsih(), 0x0007);
+
+        /* TSIH at bytes 14-15; bytes 12-13 are the tail of the 6-byte ISID */
+        b.0[12] = 0xAB;
+        b.0[13] = 0xCD;
         assert_eq!(b.tsih(), 0x0007);
     }
 
