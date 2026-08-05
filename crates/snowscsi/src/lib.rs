@@ -7,6 +7,7 @@
 //! - [`device`]: command outcome + device types (device.h)
 //! - [`backend`]: block storage backends (RAM + file), no_std error type
 //! - [`block`]: SBC block device command set (block.c)
+//! - [`iscsi_pdu`]: iSCSI PDU (BHS) field codec (RFC 3720 §10.x)
 //!
 //! ## Features
 //! - `std` (default): enables BSD transport (TcpStream), FileBackend
@@ -14,11 +15,13 @@
 pub mod backend;
 pub mod block;
 pub mod device;
+pub mod iscsi_pdu;
 pub mod scsi;
 
 pub use backend::{BlockBackend, BlockBackendError, RamBackend};
 pub use block::Device;
 pub use device::{CommandOutcome, DeviceType, Error};
+pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};
 pub use scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, opcode_name, Sense, SenseKey,
