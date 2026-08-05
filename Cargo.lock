@@ -584,6 +584,7 @@ name = "snow9660-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "snow9660",
 ]
 
 [[package]]
