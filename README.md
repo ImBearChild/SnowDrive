@@ -83,7 +83,8 @@ snowdrive/
 │   ├── snow9660-cli/     # binary: list
 │   └── snowscsi-mock/    # mock Conn
 ├── tests/                # integration tests (snowdrive-tests)
-└── LICENSE
+├── LICENSE-APACHE        # Apache-2.0
+└── LICENSE-MIT           # MIT
 ```
 
 ## Legacy C Code
@@ -97,4 +98,4 @@ cmake -B build && cmake --build build
 
 ## License
 
-MPL-2.0 — see [LICENSE](LICENSE).
+Dual-licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
