@@ -177,7 +177,6 @@ impl<B: BlockBackend> Device<B> {
                     immediate: &work[48..48 + n],
                 }
             }
-            op::REPORT_LUNS => self.report_luns(cdb, work),
             op::PREVENT_ALLOW => {
                 self.prevent_removal = cdb[4] & 0x03 != 0;
                 CommandOutcome::Status
@@ -424,22 +423,6 @@ impl<B: BlockBackend> Device<B> {
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&self.sector_size.to_be_bytes());
         let n = 32.min(alloc);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            byte_offset: 0,
-            immediate: &work[48..48 + n],
-        }
-    }
-
-    fn report_luns<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
-        let alloc = ((u32::from(cdb[6]) << 24)
-            | (u32::from(cdb[7]) << 16)
-            | (u32::from(cdb[8]) << 8)
-            | u32::from(cdb[9])) as usize;
-        let mut buf = [0u8; 12];
-        buf[3] = 8; /* LUN list length: one 8-byte LUN 0 */
-        let n = 12.min(alloc);
         work[48..48 + n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
@@ -1163,24 +1146,6 @@ mod tests {
         cdb[0] = op::MODE_SELECT_10;
         cdb[1] = 0x10; /* PF=1 */
         assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
-    }
-
-    #[test]
-    fn block_report_luns() {
-        let mut ram = [0u8; 1024 * 1024];
-        let mut dev = ram_dev(&mut ram);
-        let mut w = work();
-        let mut cdb = [0u8; 12];
-        cdb[0] = op::REPORT_LUNS;
-        cdb[9] = 16;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        let mut buf = [0u8; 16];
-        data_in(&mut dev, outcome, &mut buf);
-        assert_eq!(buf[0], 0x00);
-        assert_eq!(buf[1], 0x00);
-        assert_eq!(buf[2], 0x00);
-        assert_eq!(buf[3], 0x08); /* LUN list length: one LUN */
-        assert_eq!(buf[4], 0x00); /* LUN 0 */
     }
 
     #[test]

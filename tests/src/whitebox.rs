@@ -247,18 +247,49 @@ impl Drop for Task {
 /// Start the in-process target on an ephemeral loopback port. Returns the
 /// port and the server thread join handle.
 fn start_target() -> (u16, thread::JoinHandle<Result<(), TargetError>>) {
+    let (port, handle, _rams) = start_target_n_luns(1);
+    (port, handle)
+}
+
+/// Like [`start_target`], but with `n` independent RAM-backed LUNs (LUN 0..n-1).
+///
+/// The RAMs must outlive the spawned thread, so they're `Arc<Mutex<…>>`-shared
+/// with the closure. Each LUN has its own storage; libiscsi's per-LUN
+/// discovery (and the explicit `iscsi_inquiry_sync(lun, …)` below) is the
+/// regression test for the multi-LUN `REPORT LUNS` fix.
+#[allow(clippy::type_complexity)]
+fn start_target_n_luns(
+    n: usize,
+) -> (
+    u16,
+    thread::JoinHandle<Result<(), TargetError>>,
+    Vec<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+) {
+    use std::sync::{Arc, Mutex};
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().unwrap().port();
+    let rams: Vec<Arc<Mutex<Vec<u8>>>> = (0..n)
+        .map(|_| Arc::new(Mutex::new(vec![0u8; RAM_SIZE])))
+        .collect();
+    let rams_for_thread = rams.to_vec();
     let handle = thread::spawn(move || {
         let (stream, _peer) = listener.accept().expect("target accept");
         let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut session = Session::new();
-        let mut ram = vec![0u8; RAM_SIZE];
-        let mut devs = [Device::new(RamBackend::new(&mut ram), BLOCK_SIZE).expect("device")];
+        // Hold RAM guards in a Vec to extend their lifetime across `serve_conn`.
+        let mut guards: Vec<std::sync::MutexGuard<'_, Vec<u8>>> = Vec::with_capacity(n);
+        for r in &rams_for_thread {
+            guards.push(r.lock().unwrap());
+        }
+        // Coerce each guard to a `&mut [u8]` slice view, build the device.
+        let mut devs: Vec<Device<RamBackend<'_>>> = Vec::with_capacity(n);
+        for g in &mut guards {
+            devs.push(Device::new(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
+        }
         serve_conn(&mut conn, &mut work, &mut session, &mut devs)
     });
-    (port, handle)
+    (port, handle, rams)
 }
 
 /// Connect a libiscsi context to the in-process target and log in.
@@ -385,6 +416,49 @@ fn write_out_of_range_sense() {
         t.sense_key(),
         SENSE_KEY_ILLEGAL_REQUEST,
         "sense key must be ILLEGAL_REQUEST (5): {}",
+        iscsi.error()
+    );
+
+    teardown(&iscsi, server);
+}
+
+/// Multi-LUN: the target is configured with three independent LUNs.
+/// libiscsi's `iscsi_full_connect_sync` issues a TEST UNIT READY at LUN 0
+/// (and implicitly relies on REPORT LUNS to populate its internal map). The
+/// fix for the "Linux client only discovers LUN 0" bug is in
+/// `iscsi_target::handle_report_luns` — here we additionally probe LUN 1 and
+/// LUN 2 directly to confirm the per-LUN routing works on the wire.
+#[test]
+fn multi_lun_routes_by_lun() {
+    let (port, server, _rams) = start_target_n_luns(3);
+    let iscsi = connect(port);
+
+    for lun in 0..3 {
+        let t = iscsi.test_unit_ready(lun);
+        assert_eq!(
+            t.status(),
+            SCSI_STATUS_GOOD,
+            "TUR LUN {lun}: {}",
+            iscsi.error()
+        );
+        let t = iscsi.inquiry(lun, 0, 0, 96);
+        assert_eq!(
+            t.status(),
+            SCSI_STATUS_GOOD,
+            "INQUIRY LUN {lun}: {}",
+            iscsi.error()
+        );
+        let data = t.datain();
+        assert!(data.len() >= 8, "INQUIRY LUN {lun}: short data");
+        assert_eq!(data[0] & 0x1F, 0, "LUN {lun} PDT must be 0");
+    }
+
+    // LUN 3 is out of range — the target must Reject.
+    let t = iscsi.test_unit_ready(3);
+    assert_ne!(
+        t.status(),
+        SCSI_STATUS_GOOD,
+        "LUN 3 must not be reachable: {}",
         iscsi.error()
     );
 

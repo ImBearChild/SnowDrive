@@ -826,4 +826,212 @@ mod tests {
         assert_eq!(bhs[0] & 0x3F, op::LOGOUT_RESP);
         assert!(conn.take_pdu().is_none());
     }
+
+    // ── Multi-LUN REPORT LUNS (target-level) ────────────────────────
+    // Regression: a single-LUN hardcoded response made the Linux client
+    // discover only LUN 0 even when more `--block` specs were given.
+    // The fix lives in the target layer (iscsi_target::handle_report_luns),
+    // so REPORT LUNS no longer goes through any individual Device.
+
+    fn report_luns_bhs(lun: u8, itt: u32, cmd_sn: u32) -> [u8; 48] {
+        let mut bhs = [0u8; 48];
+        bhs[0] = op::SCSI_CMD;
+        bhs[16..20].copy_from_slice(&be32(itt));
+        bhs[24..28].copy_from_slice(&be32(cmd_sn));
+        bhs[28..32].copy_from_slice(&be32(cmd_sn));
+        bhs[9] = lun; // BHS LUN — does not affect the LUN list
+                      // CDB starts at BHS byte 32 (12 bytes for REPORT LUNS, group 5).
+        bhs[32] = 0xA0; // REPORT LUNS opcode
+                        // CDB bytes 6..10: allocation length (4 bytes BE). 0x0800 = 2048,
+                        // comfortably above 4 + 8*256.
+        bhs[38] = 0x08;
+        bhs[39] = 0x00;
+        bhs[40] = 0x00;
+        bhs[41] = 0x00;
+        bhs
+    }
+
+    #[test]
+    fn report_luns_single_lun() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024];
+        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs(0, 0xA1, 0), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(
+            bhs[1] & (flag::F_BIT | flag::S_BIT),
+            flag::F_BIT | flag::S_BIT
+        );
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(bhs[16..20], be32(0xA1)); // ITT echoed
+                                             // Header: 4-byte LUN list length = 8.
+        assert_eq!(&data[..4], &[0, 0, 0, 8]);
+        // 4-byte reserved (zeros) per SPC-4 / Linux kernel layout.
+        assert_eq!(&data[4..8], &[0, 0, 0, 0]);
+        // One 8-byte LUN 0 entry.
+        assert_eq!(&data[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn report_luns_three_luns() {
+        // Three independent ram-backed devices (LUN 0, 1, 2).
+        let mut r0 = vec![0u8; 16 * 1024];
+        let mut r1 = vec![0u8; 16 * 1024];
+        let mut r2 = vec![0u8; 16 * 1024];
+        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let mut devs = [d0, d1, d2];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // REPORT LUNS to LUN 0 (BHS LUN irrelevant — the response is target-wide).
+        conn.feed(&report_luns_bhs(0, 0xCAFE, 0), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(bhs[16..20], be32(0xCAFE));
+        // Header: LUN list length = 3 * 8 = 24.
+        assert_eq!(&data[..4], &[0, 0, 0, 24]);
+        // 4-byte reserved.
+        assert_eq!(&data[4..8], &[0, 0, 0, 0]);
+        // Three 8-byte single-level peripheral-device LUN entries.
+        for (i, expected) in [0u8, 1, 2].iter().enumerate() {
+            let off = 8 + i * 8;
+            assert_eq!(data[off], 0x00, "LUN {}: method/bus", i);
+            assert_eq!(data[off + 1], *expected, "LUN {}: id", i);
+            assert_eq!(&data[off + 2..off + 8], &[0u8; 6], "LUN {}: tail", i);
+        }
+    }
+
+    // ── Linux kernel REPORT LUNS scanner compatibility ─────────────
+    // Regression: the prior layout packed the first LUN entry at offset 4,
+    // but Linux's `scsi_report_lun_scan` iterates `lun_data[1..=num_luns]`
+    // (8-byte stride starting at offset 8). With the wrong layout, LUN 0
+    // straddled lun_data[0] and lun_data[1], and `scsilun_to_int` decoded
+    // the LUN 0 / LUN 1 boundary as 2^32, which then exceeded the HBA's
+    // `max_lun` and produced:
+    //   sd 0:0:0:0: lun4294967296 has a LUN larger than allowed ...
+    // (only LUN 0 was visible to the Linux initiator). This test mirrors
+    // the kernel's `scsilun_to_int` byte ordering and checks every entry.
+
+    fn kernel_scsilun_to_int(s: &[u8; 8]) -> u64 {
+        let mut lun: u64 = 0;
+        for i in (0..8).step_by(2) {
+            lun |=
+                (u64::from(s[i]) << ((i as u64 + 1) * 8)) | (u64::from(s[i + 1]) << (i as u64 * 8));
+        }
+        lun
+    }
+
+    #[test]
+    fn report_luns_kernel_scsilun_to_int_alignment() {
+        let mut r0 = vec![0u8; 16 * 1024];
+        let mut r1 = vec![0u8; 16 * 1024];
+        let mut r2 = vec![0u8; 16 * 1024];
+        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let mut devs = [d0, d1, d2];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs(0, 0xBEEF, 0), &[]);
+        session.step(&mut conn, &mut work, &mut devs);
+        let (_, data) = conn.take_pdu().unwrap();
+
+        // Replay the kernel's parse loop (drivers/scsi/scsi_scan.c):
+        //   num_luns = be32(lun_list_length) / 8;
+        //   for (lunp = &lun_data[1]; lunp <= &lun_data[num_luns]; lunp++) {
+        //     lun = scsilun_to_int(lunp);
+        let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let num_luns = length as usize / 8;
+        assert_eq!(num_luns, 3, "LUN list length should be 3*8");
+        for i in 1..=num_luns {
+            let off = i * 8;
+            let mut entry = [0u8; 8];
+            entry.copy_from_slice(&data[off..off + 8]);
+            let lun = kernel_scsilun_to_int(&entry);
+            assert_eq!(
+                lun,
+                i as u64 - 1,
+                "lun_data[{i}] must decode to LUN {}",
+                i - 1
+            );
+        }
+    }
+
+    #[test]
+    fn report_luns_three_luns_requested_at_lun_1() {
+        // Same as above but the initiator sent REPORT LUNS to LUN 1 — the
+        // target must still list all three LUNs, not just the LUN 1 entry.
+        let mut r0 = vec![0u8; 16 * 1024];
+        let mut r1 = vec![0u8; 16 * 1024];
+        let mut r2 = vec![0u8; 16 * 1024];
+        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let mut devs = [d0, d1, d2];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs(1, 0xCAFE, 0), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (_, data) = conn.take_pdu().unwrap();
+        assert_eq!(&data[..4], &[0, 0, 0, 24]);
+        // The single-level LUN id bytes — must include 0, 1, 2.
+        let ids: Vec<u8> = (0..3).map(|i| data[8 + i * 8 + 1]).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn report_luns_rejects_out_of_range_lun() {
+        // The LUN-validity check happens before the REPORT LUNS intercept,
+        // so an out-of-range LUN in the BHS still gets Rejected.
+        let mut ram = vec![0u8; 16 * 1024];
+        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        let mut cmd = report_luns_bhs(5, 0xDEAD, 0); // LUN 5 doesn't exist
+        cmd[9] = 5;
+        conn.feed(&cmd, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Closed
+        );
+        let (bhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(bhs[2], reject::INVALID_PDU_FIELD);
+    }
 }

@@ -19,6 +19,7 @@ use crate::iscsi_pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
     BHS_SIZE, MAX_DATA_SEGMENT,
 };
+use crate::scsi::op as scsi_op;
 use crate::scsi::{opcode_name, Sense};
 use crate::BlockBackend;
 
@@ -466,6 +467,9 @@ impl Session {
         }
 
         let cdb = bhs.cdb();
+        if cdb[0] == scsi_op::REPORT_LUNS {
+            return self.handle_report_luns(conn, work, itt, devs.len());
+        }
         let dev = &mut devs[lun];
         snowcommon::debug!(
             "scsi cmd: {} (0x{:02X}) itt=0x{:08X} lun={} cmd_sn={} dsl={}",
@@ -543,6 +547,64 @@ impl Session {
                 self.send_write_flow(conn, work, dev, itt, transfer_len, byte_offset, received)
             }
         }
+    }
+
+    /// Build and send the REPORT LUNS response (SPC-4 §6.21).
+    ///
+    /// The data segment is:
+    /// - 4-byte big-endian LUN list length (8 × `num_luns`),
+    /// - 4-byte reserved (zeros),
+    /// - `num_luns` 8-byte LUN entries in ascending LUN id.
+    ///
+    /// The 4 reserved bytes are required: Linux's `scsi_report_lun_scan`
+    /// (drivers/scsi/scsi_scan.c) iterates the entries starting at
+    /// `lun_data[1]` of the response buffer, i.e. byte offset 8. Skipping
+    /// the reserved padding puts LUN 0 at offset 4, and the kernel then
+    /// reads `lun_data[1]` (offset 8) as a hybrid of LUN 0's tail half +
+    /// LUN 1's head half, which `scsilun_to_int` decodes to 2^32 for the
+    /// first byte that lands in the high half. The 4 reserved bytes keep
+    /// the entries 8-byte aligned, which is what LIO and open-iscsi emit.
+    ///
+    /// Each entry is the single-level LUN structure from SAM-2: byte 0 =
+    /// 0x00 (address method 00b = peripheral device addressing, bus id 0x0),
+    /// byte 1 = LUN id, bytes 2..7 = 0x00. The response is target-wide, so
+    /// the LUN the initiator used to issue REPORT LUNS is irrelevant — the
+    /// caller's LUN-validity check above still rejects out-of-range LUNs.
+    fn handle_report_luns<C: Conn + ?Sized>(
+        &mut self,
+        conn: &mut C,
+        work: &mut [u8],
+        itt: u32,
+        num_luns: usize,
+    ) -> StepResult {
+        // 8-byte header (4-byte LUN list length + 4-byte reserved) +
+        // 8 bytes per LUN. 256 LUNs is the single-level peripheral device
+        // addressing limit (SAM-2) and fits comfortably in
+        // `MIN_WORK_LEN = 48 + 8192`.
+        let list_len = u32::try_from(num_luns)
+            .ok()
+            .and_then(|n| n.checked_mul(8))
+            .unwrap_or(u32::MAX);
+        let total = 8usize + (list_len as usize);
+        if total > work.len() - BHS_SIZE {
+            return StepResult::Error(TargetError::WorkBufTooSmall);
+        }
+        // Header: LUN list length (BE) + reserved.
+        work[BHS_SIZE..BHS_SIZE + 4].copy_from_slice(&list_len.to_be_bytes());
+        for b in &mut work[BHS_SIZE + 4..BHS_SIZE + 8] {
+            *b = 0;
+        }
+        // LUN entries start at byte 8, not 4 — see the doc comment.
+        for i in 0..num_luns {
+            let off = BHS_SIZE + 8 + i * 8;
+            work[off] = 0x00; // address method 00b, bus id 0
+            work[off + 1] = i as u8; // single-level LUN id
+            for b in &mut work[off + 2..off + 8] {
+                *b = 0;
+            }
+        }
+        snowcommon::debug!("  -> REPORT LUNS: {} LUN(s)", num_luns);
+        self.send_data_in_final(conn, work, itt, total, 0, 0, status::GOOD)
     }
 
     /// Send chunked Data-In for a backend READ (RFC 3720 §10.7).

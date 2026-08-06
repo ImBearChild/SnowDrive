@@ -16,3 +16,6 @@ crates/snowscsi-capi/include/snowscsi.h
 
 # Local notes (__* files)
 __*
+
+# Test disk image
+test.img
