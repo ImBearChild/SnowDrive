@@ -11,6 +11,8 @@
 //! - [`spc`]: SPC command parsing + shared execution (INQUIRY, MODE SENSE, ...)
 //! - [`sbc`]: SBC command parsing + execution (block device set, SBC-3 §5)
 //! - [`block`]: SBC block device command set (block.c)
+//! - [`cdblock`]: CDBlock device — read-only CD-ROM over a flat file
+//!   (`std` feature only)
 //! - [`iscsi_pdu`]: iSCSI PDU (BHS) field codec (RFC 3720 §10.x)
 //! - [`conn`]: connection abstraction (`embedded_io::Read + Write`)
 //! - [`transport`]: BSD TCP transport (`std` feature only)
@@ -21,6 +23,8 @@
 
 pub mod backend;
 pub mod block;
+#[cfg(feature = "std")]
+pub mod cdblock;
 pub mod conn;
 pub mod device;
 pub mod iscsi_pdu;
@@ -33,6 +37,8 @@ pub mod transport;
 
 pub use backend::{BlockBackend, BlockStorage, BlockStorageError, RamBackend};
 pub use block::BlockDevice;
+#[cfg(feature = "std")]
+pub use cdblock::CDBlockDevice;
 pub use conn::Conn;
 pub use device::{CommandOutcome, DeviceType, Error};
 pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};
