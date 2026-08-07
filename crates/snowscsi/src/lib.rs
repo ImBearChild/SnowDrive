@@ -31,7 +31,7 @@ pub mod spc;
 #[cfg(feature = "std")]
 pub mod transport;
 
-pub use backend::{BlockStorage, BlockStorageError, RamBackend};
+pub use backend::{BlockBackend, BlockStorage, BlockStorageError, RamBackend};
 pub use block::BlockDevice;
 pub use conn::Conn;
 pub use device::{CommandOutcome, DeviceType, Error};

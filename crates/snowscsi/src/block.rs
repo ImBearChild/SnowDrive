@@ -279,7 +279,7 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::RamBackend;
+    use crate::backend::{BlockBackend, RamBackend};
     use crate::scsi::op;
 
     /// Build a 6-byte CDB (test_block.c `make_cdb6`).
@@ -1032,6 +1032,37 @@ mod tests {
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::DataIn { .. }));
+    }
+
+    #[test]
+    fn block_device_over_block_backend_ram() {
+        let mut ram = [0u8; 1024 * 1024];
+        let mut dev = BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap();
+        let mut w = work();
+        let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
+        w[48..48 + 512].copy_from_slice(&pattern);
+
+        let cdb = make_cdb10(op::WRITE_10, 7, 1);
+        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        match outcome {
+            CommandOutcome::DataOut {
+                transfer_len,
+                byte_offset,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 512);
+                assert_eq!(byte_offset, 7 * 512);
+                assert_eq!(immediate, pattern.as_slice());
+                dev.write_data(byte_offset, immediate).unwrap();
+            }
+            _ => panic!("expected DataOut"),
+        }
+
+        let cdb = make_cdb10(op::READ_10, 7, 1);
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let mut buf = [0u8; 512];
+        data_in(&mut dev, outcome, &mut buf);
+        assert_eq!(buf, pattern.as_slice());
     }
 
     #[test]

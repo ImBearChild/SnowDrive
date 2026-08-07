@@ -1,13 +1,62 @@
-//! File block storage backend (`backend_file.c`) + re-exports of the
-//! storage seam from [`snowcommon`].
+//! Block storage backends (`backend_file.c`) + re-exports of the storage
+//! seam from [`snowcommon`].
 //!
 //! The [`BlockStorage`] trait, [`BlockStorageError`], and [`RamBackend`]
 //! live in `snowcommon::block_storage` (leaf crate, shared with embedded
-//! callers). This module keeps only the std file backend, re-exporting
-//! the seam so `snowscsi::backend::{BlockStorage, BlockStorageError,
-//! RamBackend, FileBackend}` stays a single import point.
+//! callers). This module adds the std file backend and the aggregating
+//! [`BlockBackend`] enum (`Ram` | `File`) so callers can drive a
+//! [`crate::block::BlockDevice`] through a single concrete type.
+//! `snowscsi::backend::{BlockStorage, BlockStorageError, RamBackend,
+//! FileBackend, BlockBackend}` stays a single import point.
 
 pub use snowcommon::block_storage::{BlockStorage, BlockStorageError, RamBackend};
+
+/// Aggregating block storage enum (the R4 convergence seam).
+///
+/// Wraps [`RamBackend`] (borrowed memory, no_std) and [`FileBackend`]
+/// (std). Implements [`BlockStorage`], so a `BlockBackend` can drive a
+/// [`crate::block::BlockDevice`] directly. The `'a` lifetime comes from the
+/// RAM variant's borrowed disk image (mock stack RAM, CLI owned `Vec<u8>`);
+/// no `'static` / `Box::leak` required.
+pub enum BlockBackend<'a> {
+    Ram(RamBackend<'a>),
+    #[cfg(feature = "std")]
+    File(FileBackend),
+}
+
+impl BlockStorage for BlockBackend<'_> {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        match self {
+            Self::Ram(b) => b.read(offset, buf),
+            #[cfg(feature = "std")]
+            Self::File(b) => b.read(offset, buf),
+        }
+    }
+
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        match self {
+            Self::Ram(b) => b.write(offset, buf),
+            #[cfg(feature = "std")]
+            Self::File(b) => b.write(offset, buf),
+        }
+    }
+
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        match self {
+            Self::Ram(b) => b.sync(),
+            #[cfg(feature = "std")]
+            Self::File(b) => b.sync(),
+        }
+    }
+
+    fn capacity(&self) -> u64 {
+        match self {
+            Self::Ram(b) => b.capacity(),
+            #[cfg(feature = "std")]
+            Self::File(b) => b.capacity(),
+        }
+    }
+}
 
 /// File backend (std feature, `std::fs`).
 ///
@@ -107,6 +156,66 @@ impl BlockStorage for FileBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_backend_ram_roundtrip() {
+        let mut ram = [0u8; 4096];
+        let mut b = BlockBackend::Ram(RamBackend::new(&mut ram));
+        assert_eq!(b.capacity(), 4096);
+
+        b.write(0, &[1, 2, 3, 4]).unwrap();
+        let mut out = [0u8; 4];
+        b.read(0, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 4]);
+        b.sync().unwrap();
+
+        assert_eq!(ram[0..4], [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn block_backend_ram_out_of_bounds() {
+        let mut ram = [0u8; 16];
+        let mut b = BlockBackend::Ram(RamBackend::new(&mut ram));
+        let mut out = [0u8; 4];
+        assert_eq!(b.read(15, &mut out), Err(BlockStorageError::OutOfBounds));
+        assert_eq!(b.write(14, &[0u8; 4]), Err(BlockStorageError::OutOfBounds));
+    }
+
+    #[test]
+    fn block_backend_file_dispatch() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("snowscsi_blockbackend_{}.img", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        f.flush().unwrap();
+
+        let mut b = BlockBackend::File(FileBackend::open(&path.to_string_lossy(), true).unwrap());
+        assert_eq!(b.capacity(), 1024 * 1024);
+        b.write(0, &[0xAA; 512]).unwrap();
+        b.sync().unwrap();
+        let mut out = [0u8; 512];
+        b.read(0, &mut out).unwrap();
+        assert_eq!(out, [0xAA; 512]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn block_backend_read_only_file_rejects_write() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "snowscsi_blockbackend_ro_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0u8; 512]).unwrap();
+
+        let mut b = BlockBackend::File(FileBackend::open(&path.to_string_lossy(), false).unwrap());
+        assert_eq!(b.write(0, &[1u8; 16]), Err(BlockStorageError::NotWritable));
+
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn file_roundtrip_and_sync() {
