@@ -8,9 +8,12 @@
 //! `std`-gated (`RamBackend` images are not supported).
 
 use crate::backend::{BlockStorage, BlockStorageError, FileBackend};
-use crate::device::DeviceType;
-use crate::scsi::Sense;
-use crate::spc::{block_mode_page, DeviceIdentity, SpcDevice, SpcEffect};
+use crate::device::{CommandOutcome, DeviceType, Error};
+use crate::scsi::{
+    asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
+    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, Sense, SenseKey,
+};
+use crate::spc::{block_mode_page, execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
 
 /// CD-ROM logical block size (Mode 1: 2048 data bytes per sector).
 pub const SECTOR_SIZE: u32 = 2048;
@@ -63,6 +66,171 @@ impl CDBlockDevice {
     /// Image size in bytes (from the file opened at construction).
     pub fn capacity(&self) -> u64 {
         self.backend.capacity()
+    }
+
+    /// Largest readable LBA: `(file_size / 2048) - 1`. Saturates to 0 for
+    /// images smaller than one sector (READ CAPACITY still reports a valid
+    /// last-LBA of 0).
+    pub(crate) fn max_lba(&self) -> u64 {
+        (self.capacity() / u64::from(SECTOR_SIZE)).saturating_sub(1)
+    }
+
+    pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
+        self.sense = Sense::new(key, asc, ascq);
+    }
+
+    /// CHECK CONDITION helper for non-SPC commands (SBC/MMC dispatch).
+    pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
+        self.set_sense(key, asc, 0);
+        CommandOutcome::CheckCondition(self.sense)
+    }
+
+    /// Read data from the backend (target data path), setting MEDIUM ERROR
+    /// sense on failure.
+    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        match self.backend.read(offset, buf) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+                Err(e)
+            }
+        }
+    }
+
+    /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `work`
+    /// must be at least [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length
+    /// of data already received (immediate data, never used by this
+    /// read-only device).
+    ///
+    /// Dispatch order: SPC commands go to [`execute_spc`]; the SBC read-only
+    /// set (READ 6/10/12/16, READ CAPACITY 10/16) is handled here; write
+    /// commands (WRITE 6/10/12/16, SYNCHRONIZE CACHE) return DATA PROTECT;
+    /// unknown MMC opcodes return INVALID COMMAND.
+    pub fn do_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        work: &'a mut [u8],
+        dsl: usize,
+    ) -> Result<CommandOutcome<'a>, Error> {
+        if work.len() < crate::MIN_WORK_LEN {
+            return Err(Error::WorkBufTooSmall);
+        }
+        let outcome = if let Some(cmd) = parse_spc(cdb) {
+            execute_spc(self, cmd, work, dsl)
+        } else {
+            match cdb_opcode(cdb) {
+                op::READ_6 => self.read_cmd(u64::from(cdb_lba6(cdb)), cdb_transfer_len6(cdb), work),
+                op::READ_10 => self.read_cmd(
+                    u64::from(cdb_lba10(cdb)),
+                    u32::from(cdb_transfer_len10(cdb)),
+                    work,
+                ),
+                op::READ_12 => {
+                    self.read_cmd(u64::from(cdb_lba12(cdb)), cdb_transfer_len12(cdb), work)
+                }
+                op::READ_16 => self.read_cmd(cdb_lba16(cdb), cdb_transfer_len16(cdb), work),
+                op::READ_CAPACITY_10 => {
+                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, cdb_lba10(cdb), work)
+                }
+                op::SERVICE_ACTION_IN => {
+                    let alloc = (u32::from(cdb[10]) << 24)
+                        | (u32::from(cdb[11]) << 16)
+                        | (u32::from(cdb[12]) << 8)
+                        | u32::from(cdb[13]);
+                    self.read_capacity_16_cmd(cdb[1], alloc, work)
+                }
+                op::WRITE_6
+                | op::WRITE_10
+                | op::WRITE_12
+                | op::WRITE_16
+                | op::SYNCHRONIZE_CACHE_10 => {
+                    // Plan §8.1b: every write command → DATA PROTECT.
+                    self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
+                }
+                _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND),
+            }
+        };
+        if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
+            self.sense = Sense::clear();
+        }
+        Ok(outcome)
+    }
+
+    /// Shared READ(6/10/12/16) handler (2048-byte sectors, backend read).
+    pub(crate) fn read_cmd<'a>(
+        &mut self,
+        lba: u64,
+        count: u32,
+        work: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if count == 0 {
+            return CommandOutcome::Status;
+        }
+        if !self.check_lba_range(lba, count) {
+            return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
+        }
+        let Some(bytes) = u64::from(count)
+            .checked_mul(u64::from(SECTOR_SIZE))
+            .and_then(|b| u32::try_from(b).ok())
+        else {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        };
+        CommandOutcome::DataIn {
+            transfer_len: bytes as u64,
+            byte_offset: lba * u64::from(SECTOR_SIZE),
+            immediate: &work[48..48],
+        }
+    }
+
+    /// LBA range check: `lba + count` must not exceed `max_lba + 1`.
+    fn check_lba_range(&self, lba: u64, count: u32) -> bool {
+        lba <= self.max_lba()
+            && lba
+                .checked_add(u64::from(count))
+                .is_some_and(|end| end <= self.max_lba() + 1)
+    }
+
+    pub(crate) fn read_capacity_10_cmd<'a>(
+        &mut self,
+        pmi: bool,
+        req_lba: u32,
+        work: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if !pmi && req_lba != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
+        buf[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
+        work[48..56].copy_from_slice(&buf);
+        CommandOutcome::DataIn {
+            transfer_len: 8,
+            byte_offset: 0,
+            immediate: &work[48..56],
+        }
+    }
+
+    pub(crate) fn read_capacity_16_cmd<'a>(
+        &mut self,
+        sa: u8,
+        alloc: u32,
+        work: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if sa != 0x10 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let max_lba = self.max_lba();
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
+        buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
+        let n = 32.min(alloc as usize);
+        work[48..48 + n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &work[48..48 + n],
+        }
     }
 }
 
@@ -219,6 +387,30 @@ mod tests {
     /// device and return the outcome.
     fn run<'a>(dev: &mut CDBlockDevice, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
         crate::spc::execute_spc(dev, crate::spc::parse_spc(cdb).unwrap(), work, 0)
+    }
+
+    /// Run one full SCSI command via `do_cmd` and fetch the payload, reading
+    /// backend-resident DataIn through `dev.read_data` when `immediate` is
+    /// empty.
+    fn do_data_in(dev: &mut CDBlockDevice, cdb: &[u8], work: &mut [u8], buf: &mut [u8]) -> usize {
+        let outcome = dev.do_cmd(cdb, work, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                byte_offset,
+                immediate,
+            } => {
+                assert!(transfer_len as usize <= buf.len());
+                let n = transfer_len as usize;
+                if immediate.is_empty() {
+                    dev.read_data(byte_offset, &mut buf[..n]).unwrap();
+                } else {
+                    buf[..n].copy_from_slice(&immediate[..n]);
+                }
+                n
+            }
+            _ => panic!("expected DataIn"),
+        }
     }
 
     #[test]
@@ -420,5 +612,291 @@ mod tests {
         cdb[0] = op::SEND_DIAGNOSTIC;
         cdb[1] = 0x08; /* PF=1, SELFTEST=0 */
         assert_eq!(run(&mut dev, &cdb, &mut w), CommandOutcome::Status);
+    }
+
+    fn make_cdb6(opcode: u8, lba: u32, transfer_len: u8) -> [u8; 6] {
+        let mut cdb = [0u8; 6];
+        cdb[0] = opcode;
+        cdb[1] = ((lba >> 16) & 0x1F) as u8;
+        cdb[2] = (lba >> 8) as u8;
+        cdb[3] = lba as u8;
+        cdb[4] = transfer_len;
+        cdb
+    }
+
+    fn make_cdb10(opcode: u8, lba: u32, transfer_len: u16) -> [u8; 10] {
+        let mut cdb = [0u8; 10];
+        cdb[0] = opcode;
+        cdb[2] = (lba >> 24) as u8;
+        cdb[3] = (lba >> 16) as u8;
+        cdb[4] = (lba >> 8) as u8;
+        cdb[5] = lba as u8;
+        cdb[7] = (transfer_len >> 8) as u8;
+        cdb[8] = transfer_len as u8;
+        cdb
+    }
+
+    fn make_cdb12(opcode: u8, lba: u32, transfer_len: u32) -> [u8; 12] {
+        let mut cdb = [0u8; 12];
+        cdb[0] = opcode;
+        cdb[2] = (lba >> 24) as u8;
+        cdb[3] = (lba >> 16) as u8;
+        cdb[4] = (lba >> 8) as u8;
+        cdb[5] = lba as u8;
+        cdb[6] = (transfer_len >> 24) as u8;
+        cdb[7] = (transfer_len >> 16) as u8;
+        cdb[8] = (transfer_len >> 8) as u8;
+        cdb[9] = transfer_len as u8;
+        cdb
+    }
+
+    fn make_cdb16(opcode: u8, lba: u64, transfer_len: u32) -> [u8; 16] {
+        let mut cdb = [0u8; 16];
+        cdb[0] = opcode;
+        cdb[2] = (lba >> 56) as u8;
+        cdb[3] = (lba >> 48) as u8;
+        cdb[4] = (lba >> 40) as u8;
+        cdb[5] = (lba >> 32) as u8;
+        cdb[6] = (lba >> 24) as u8;
+        cdb[7] = (lba >> 16) as u8;
+        cdb[8] = (lba >> 8) as u8;
+        cdb[9] = lba as u8;
+        cdb[10] = (transfer_len >> 24) as u8;
+        cdb[11] = (transfer_len >> 16) as u8;
+        cdb[12] = (transfer_len >> 8) as u8;
+        cdb[13] = transfer_len as u8;
+        cdb
+    }
+
+    /// Check condition sense from a do_cmd dispatch.
+    fn check_condition(outcome: CommandOutcome<'_>) -> (SenseKey, u8) {
+        match outcome {
+            CommandOutcome::CheckCondition(s) => (s.key, s.asc),
+            _ => panic!("expected CheckCondition"),
+        }
+    }
+
+    #[test]
+    fn cdblock_read_10_roundtrip() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 100);
+        let mut img = vec![0xAAu8; 2048 * 100];
+        img[2048..2048 + 4].copy_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(&f.path, &img).unwrap();
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+
+        let cdb = make_cdb10(op::READ_10, 1, 1);
+        let mut buf = [0u8; 2048];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 2048);
+        assert_eq!(buf[..4], [1, 2, 3, 4]);
+        assert_eq!(buf[4..], [0xAA; 2044]);
+        assert_eq!(dev.sense().key, SenseKey::None);
+    }
+
+    #[test]
+    fn cdblock_read_6_12_16() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 100);
+        let mut img = vec![0u8; 2048 * 100];
+        img[5 * 2048 + 1] = 0x5B;
+        img[20 * 2048] = 0x4C;
+        img[30 * 2048 + 2] = 0xE3;
+        std::fs::write(&f.path, &img).unwrap();
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+
+        let mut buf = [0u8; 2048];
+        let n = do_data_in(&mut dev, &make_cdb6(op::READ_6, 5, 1), &mut w, &mut buf);
+        assert_eq!(n, 2048);
+        assert_eq!(buf[1], 0x5B);
+
+        let mut buf = [0u8; 2048];
+        let n = do_data_in(&mut dev, &make_cdb12(op::READ_12, 20, 1), &mut w, &mut buf);
+        assert_eq!(n, 2048);
+        assert_eq!(buf[0], 0x4C);
+
+        let mut buf = [0u8; 2048];
+        let n = do_data_in(&mut dev, &make_cdb16(op::READ_16, 30, 1), &mut w, &mut buf);
+        assert_eq!(n, 2048);
+        assert_eq!(buf[2], 0xE3);
+    }
+
+    #[test]
+    fn cdblock_read_6_zero_blocks_means_256() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        // 256 blocks × 2048 = 524288 bytes overflows the 100-block image —
+        // the LBA range check must reject it before the backend is touched.
+        let cdb = make_cdb6(op::READ_6, 0, 0);
+        let (key, _) = check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap());
+        assert_eq!(key, SenseKey::IllegalRequest);
+    }
+
+    #[test]
+    fn cdblock_read_lba_out_of_range() {
+        use crate::scsi::{asc, op};
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb10(op::READ_10, 100, 1);
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE)
+        );
+        // Partial overrun is also rejected.
+        let cdb = make_cdb10(op::READ_10, 99, 2);
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    fn cdblock_read_capacity_10() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 700);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_CAPACITY_10;
+        let mut buf = [0u8; 8];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 699);
+        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), 2048);
+    }
+
+    #[test]
+    fn cdblock_read_capacity_10_pmi_zero_lba_nonzero_rejected() {
+        use crate::scsi::{asc, op};
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_CAPACITY_10;
+        cdb[5] = 0x01; /* PMI=0, LBA=1 */
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
+    }
+
+    #[test]
+    fn cdblock_read_capacity_16() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 700);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SERVICE_ACTION_IN;
+        cdb[1] = 0x10;
+        cdb[13] = 0x20;
+        let mut buf = [0u8; 32];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 32);
+        assert_eq!(
+            u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+            699
+        );
+        assert_eq!(&buf[8..12], &[0x00, 0x00, 0x08, 0x00]);
+        assert_eq!(&buf[12..], &[0u8; 20]);
+    }
+
+    #[test]
+    fn cdblock_read_capacity_16_unknown_sa_rejected() {
+        use crate::scsi::{asc, op};
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SERVICE_ACTION_IN;
+        cdb[1] = 0xFF;
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
+    }
+
+    #[test]
+    fn cdblock_write_commands_return_data_protect() {
+        use crate::scsi::{asc, op};
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+
+        let mut assert_data_protect = |cdb: &[u8]| {
+            assert_eq!(
+                check_condition(dev.do_cmd(cdb, &mut w, 0).unwrap()),
+                (SenseKey::DataProtect, asc::WRITE_PROTECTED)
+            );
+        };
+        assert_data_protect(&make_cdb6(op::WRITE_6, 0, 1));
+        assert_data_protect(&make_cdb10(op::WRITE_10, 0, 1));
+        assert_data_protect(&make_cdb12(op::WRITE_12, 0, 1));
+        assert_data_protect(&make_cdb16(op::WRITE_16, 0, 1));
+
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SYNCHRONIZE_CACHE_10;
+        assert_data_protect(&cdb);
+    }
+
+    #[test]
+    fn cdblock_unknown_opcode_returns_invalid_command() {
+        use crate::scsi::asc;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0xFF;
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
+        );
+        // READ DISC INFORMATION (0x51) is an MMC command this minimal
+        // device does not implement → INVALID COMMAND (plan §8.1b).
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x51;
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
+        );
+    }
+
+    #[test]
+    fn cdblock_work_buf_too_small() {
+        use crate::scsi::op;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut small = [0u8; 100];
+        let cdb = make_cdb10(op::READ_10, 0, 1);
+        assert_eq!(dev.do_cmd(&cdb, &mut small, 0), Err(Error::WorkBufTooSmall));
+    }
+
+    #[test]
+    fn cdblock_read_failure_sets_medium_error() {
+        use crate::scsi::asc;
+
+        let f = TempFile::new(2048 * 4);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut buf = [0u8; 2048];
+        let r = dev.read_data(2048 * 5, &mut buf);
+        assert_eq!(r, Err(BlockStorageError::OutOfBounds));
+        assert_eq!(dev.sense().key, SenseKey::MediumError);
+        assert_eq!(dev.sense().asc, asc::UNRECOVERED_READ_ERROR);
     }
 }

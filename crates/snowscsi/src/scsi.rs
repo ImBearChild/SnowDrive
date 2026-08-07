@@ -34,9 +34,11 @@ pub mod op {
 pub mod asc {
     pub const WRITE_FAULT: u8 = 0x03;
     pub const NOT_READY: u8 = 0x04;
+    pub const UNRECOVERED_READ_ERROR: u8 = 0x11;
     pub const INVALID_COMMAND: u8 = 0x20;
     pub const LBA_OUT_OF_RANGE: u8 = 0x21;
     pub const INVALID_FIELD: u8 = 0x24;
+    pub const WRITE_PROTECTED: u8 = 0x27;
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
     pub const MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
 }
