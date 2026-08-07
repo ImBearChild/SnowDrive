@@ -7,12 +7,10 @@
 
 use crate::backend::BlockStorage;
 use crate::device::{CommandOutcome, DeviceType, Error};
-use crate::scsi::{
-    asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
-    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, opcode_name, Sense, SenseKey,
-};
+use crate::sbc::{execute_sbc, parse_sbc, SbcCommand};
+use crate::scsi::{asc, Sense, SenseKey};
 use crate::spc::{
-    block_mode_page, execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY,
+    block_mode_page, execute_spc, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY,
 };
 
 /// Direct-access block device (device_internal.h `snowscsi_device`).
@@ -56,16 +54,16 @@ impl<B: BlockStorage> Device<B> {
         DeviceType::Block
     }
 
-    fn max_lba(&self) -> u64 {
+    pub(crate) fn max_lba(&self) -> u64 {
         let nblocks = self.backend.capacity() / u64::from(self.sector_size);
         nblocks.saturating_sub(1)
     }
 
-    fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
+    pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
         self.sense = Sense::new(key, asc, ascq);
     }
 
-    fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
+    pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
         self.set_sense(key, asc, 0);
         CommandOutcome::CheckCondition(self.sense)
     }
@@ -104,6 +102,10 @@ impl<B: BlockStorage> Device<B> {
     /// Process one SCSI command (`snowscsi_do_cmd`). `work` must be at
     /// least [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length of data
     /// already received into `work[48..48+dsl]` (immediate data for WRITE).
+    ///
+    /// The CDB is parsed by [`parse_sbc`]: SPC commands are dispatched to
+    /// [`execute_spc`] (via the `SbcCommand::Spc` fall-through), SBC commands
+    /// to [`execute_sbc`]; unknown opcodes yield INVALID COMMAND.
     pub fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
@@ -113,82 +115,21 @@ impl<B: BlockStorage> Device<B> {
         if work.len() < crate::MIN_WORK_LEN {
             return Err(Error::WorkBufTooSmall);
         }
-        let outcome = self.handle_cmd(cdb, work, dsl);
+        let Some(cmd) = parse_sbc(cdb) else {
+            return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+        };
+        let outcome = match cmd {
+            SbcCommand::Spc(cmd) => execute_spc(self, cmd, work, dsl),
+            cmd => execute_sbc(self, cmd, work, dsl),
+        };
         if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
             self.sense = Sense::clear();
         }
         Ok(outcome)
     }
 
-    fn handle_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8], dsl: usize) -> CommandOutcome<'a> {
-        if let Some(cmd) = parse_spc(cdb) {
-            return execute_spc(self, cmd, work, dsl);
-        }
-
-        let opcode = cdb_opcode(cdb);
-        let max_lba = self.max_lba();
-
-        match opcode {
-            op::READ_CAPACITY_10 => self.read_capacity_10(cdb, work),
-            op::SERVICE_ACTION_IN => self.read_capacity_16(cdb, work),
-            op::SYNCHRONIZE_CACHE_10 => {
-                let _ = self.backend.sync();
-                CommandOutcome::Status
-            }
-
-            op::READ_6 => self.read_cmd(
-                max_lba,
-                u64::from(cdb_lba6(cdb)),
-                cdb_transfer_len6(cdb),
-                work,
-            ),
-            op::WRITE_6 => self.write_cmd(
-                max_lba,
-                u64::from(cdb_lba6(cdb)),
-                cdb_transfer_len6(cdb),
-                work,
-                dsl,
-            ),
-            op::READ_10 => self.read_cmd(
-                max_lba,
-                u64::from(cdb_lba10(cdb)),
-                u32::from(cdb_transfer_len10(cdb)),
-                work,
-            ),
-            op::WRITE_10 => self.write_cmd(
-                max_lba,
-                u64::from(cdb_lba10(cdb)),
-                u32::from(cdb_transfer_len10(cdb)),
-                work,
-                dsl,
-            ),
-            op::READ_12 => self.read_cmd(
-                max_lba,
-                u64::from(cdb_lba12(cdb)),
-                cdb_transfer_len12(cdb),
-                work,
-            ),
-            op::WRITE_12 => self.write_cmd(
-                max_lba,
-                u64::from(cdb_lba12(cdb)),
-                cdb_transfer_len12(cdb),
-                work,
-                dsl,
-            ),
-            op::READ_16 => self.read_cmd(max_lba, cdb_lba16(cdb), cdb_transfer_len16(cdb), work),
-            op::WRITE_16 => {
-                self.write_cmd(max_lba, cdb_lba16(cdb), cdb_transfer_len16(cdb), work, dsl)
-            }
-
-            other => {
-                let _ = opcode_name(other);
-                self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND)
-            }
-        }
-    }
-
     /// Shared READ(6/10/12/16) handler.
-    fn read_cmd<'a>(
+    pub(crate) fn read_cmd<'a>(
         &mut self,
         max_lba: u64,
         lba: u64,
@@ -213,7 +154,7 @@ impl<B: BlockStorage> Device<B> {
     }
 
     /// Shared WRITE(6/10/12/16) handler.
-    fn write_cmd<'a>(
+    pub(crate) fn write_cmd<'a>(
         &mut self,
         max_lba: u64,
         lba: u64,
@@ -253,13 +194,13 @@ impl<B: BlockStorage> Device<B> {
         u32::try_from(bytes).ok()
     }
 
-    fn read_capacity_10<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
-        let pmi = cdb[1] & 0x01;
-        let req_lba = (u32::from(cdb[2]) << 24)
-            | (u32::from(cdb[3]) << 16)
-            | (u32::from(cdb[4]) << 8)
-            | u32::from(cdb[5]);
-        if pmi == 0 && req_lba != 0 {
+    pub(crate) fn read_capacity_10_cmd<'a>(
+        &mut self,
+        pmi: bool,
+        req_lba: u32,
+        work: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
@@ -274,19 +215,20 @@ impl<B: BlockStorage> Device<B> {
         }
     }
 
-    fn read_capacity_16<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
-        if cdb.len() < 16 || cdb[1] != 0x10 {
+    pub(crate) fn read_capacity_16_cmd<'a>(
+        &mut self,
+        sa: u8,
+        alloc: u32,
+        work: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let alloc = ((u32::from(cdb[10]) << 24)
-            | (u32::from(cdb[11]) << 16)
-            | (u32::from(cdb[12]) << 8)
-            | u32::from(cdb[13])) as usize;
         let max_lba = self.max_lba();
         let mut buf = [0u8; 32];
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&self.sector_size.to_be_bytes());
-        let n = 32.min(alloc);
+        let n = 32.min(alloc as usize);
         work[48..48 + n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
@@ -338,6 +280,7 @@ impl<B: BlockStorage> SpcDevice for Device<B> {
 mod tests {
     use super::*;
     use crate::backend::RamBackend;
+    use crate::scsi::op;
 
     /// Build a 6-byte CDB (test_block.c `make_cdb6`).
     fn make_cdb6(opcode: u8, lba: u32, transfer_len: u8) -> [u8; 6] {

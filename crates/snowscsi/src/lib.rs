@@ -9,6 +9,7 @@
 //!   (`BlockStorage` / `BlockStorageError` / `RamBackend` live in
 //!   `snowcommon::block_storage`)
 //! - [`spc`]: SPC command parsing + shared execution (INQUIRY, MODE SENSE, ...)
+//! - [`sbc`]: SBC command parsing + execution (block device set, SBC-3 §5)
 //! - [`block`]: SBC block device command set (block.c)
 //! - [`iscsi_pdu`]: iSCSI PDU (BHS) field codec (RFC 3720 §10.x)
 //! - [`conn`]: connection abstraction (`embedded_io::Read + Write`)
@@ -24,6 +25,7 @@ pub mod conn;
 pub mod device;
 pub mod iscsi_pdu;
 pub mod iscsi_target;
+pub mod sbc;
 pub mod scsi;
 pub mod spc;
 #[cfg(feature = "std")]
@@ -37,6 +39,7 @@ pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};
 pub use iscsi_target::{
     serve_conn, LoginStage, NegotiatedParams, Session, StepResult, TargetError,
 };
+pub use sbc::{parse_sbc, SbcCommand};
 pub use scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, opcode_name, Sense, SenseKey,
