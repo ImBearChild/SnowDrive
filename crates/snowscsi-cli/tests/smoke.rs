@@ -139,3 +139,85 @@ fn serve_exits_cleanly_on_sigint() {
     let status = child.wait().expect("wait for snowscsi");
     assert!(status.success(), "snowscsi should exit 0 after SIGINT");
 }
+
+/// The same file path on two `--block` LUNs emits a dual-mount warning on
+/// stderr while the server still starts and exits 0 after SIGINT.
+#[cfg(unix)]
+#[test]
+fn serve_warns_on_dual_mount() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir();
+    let img = dir.join(format!("snowscsi_dual_{}.img", std::process::id()));
+    std::fs::write(&img, [0u8; 512]).unwrap();
+    let path = img.to_string_lossy().to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+        .args([
+            "serve",
+            "--block",
+            &path,
+            "--block",
+            &path,
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowscsi");
+
+    // Collect dual-mount warnings until the server is ready (the warning is
+    // emitted before bind, the "listening" line after the signal handler).
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut warnings = Vec::new();
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("warning:") {
+                    warnings.push(line.clone());
+                }
+                if line.contains("listening") {
+                    let _ = ready_tx.send(warnings);
+                    return;
+                }
+                line.clear();
+            }
+            let _ = ready_tx.send(warnings);
+        });
+    }
+
+    let warnings = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(child.id().to_string())
+                .status();
+            let _ = child.wait();
+            panic!("snowscsi did not announce 'listening'");
+        });
+    assert!(
+        warnings.iter().any(|w| w.contains(&path)),
+        "expected a dual-mount warning for {path}, got {warnings:?}"
+    );
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child.wait().expect("wait for snowscsi");
+    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+
+    let _ = std::fs::remove_file(&img);
+}

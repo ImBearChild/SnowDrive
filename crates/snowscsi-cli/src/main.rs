@@ -6,10 +6,12 @@
 //!
 //! `--block` is repeatable; each spec becomes a LUN in order (the first
 //! `--block` is LUN 0, and so on). Specs are `ram=<size>` (K/M/G suffixes)
-//! or `<path>` (optionally `,ro` for a read-only file backend). SIGINT /
-//! SIGTERM trigger a graceful shutdown: the blocking `accept()` is woken by
-//! a probe connection, `serve()` returns, and every backend is `sync()`ed
-//! before exit.
+//! or `<path>` (optionally `,ro` for a read-only file backend). The same
+//! file path may appear on several LUNs; each is an independent SCSI device
+//! with its own LBA semantics, so a dual-mount warning is printed to stderr.
+//! SIGINT / SIGTERM trigger a graceful shutdown: the blocking `accept()` is
+//! woken by a probe connection, `serve()` returns, and every backend is
+//! `sync()`ed before exit.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -91,7 +93,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     };
 
-    let mut devices = Vec::new();
+    let mut specs = Vec::with_capacity(args.block.len());
     for spec in &args.block {
         let parsed = match parse_block_spec(spec) {
             Ok(p) => p,
@@ -100,7 +102,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let backend = match open_backend(&parsed) {
+        specs.push(parsed);
+    }
+
+    for w in check_dual_mount(&dual_mount_specs(&specs)) {
+        eprintln!("{w}");
+    }
+
+    let mut devices = Vec::new();
+    for (i, parsed) in specs.iter().enumerate() {
+        let backend = match open_backend(parsed) {
             Ok(b) => b,
             Err(msg) => {
                 eprintln!("snowscsi: {msg}");
@@ -109,7 +120,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         };
         let capacity = backend.capacity();
         let dev = BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-        log::debug!("LUN {}: {capacity} bytes ({spec})", devices.len());
+        log::debug!("LUN {i}: {capacity} bytes ({})", args.block[i]);
         devices.push(dev);
     }
 
@@ -182,6 +193,47 @@ fn init_logging(verbose: bool) {
 enum BlockSpec {
     Ram(u64),
     File { path: String, read_only: bool },
+}
+
+/// How a path is exposed as a SCSI device (dual-mount detection). CD kinds
+/// (`CdBlock` / `CdRom`) arrive with Phase 1.5f / Phase 2 CLI options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Block,
+}
+
+/// Collect the file-backed specs as `(kind, path)` pairs for dual-mount
+/// detection (RAM disks have no path).
+fn dual_mount_specs(specs: &[BlockSpec]) -> Vec<(DeviceKind, &str)> {
+    specs
+        .iter()
+        .filter_map(|s| match s {
+            BlockSpec::File { path, .. } => Some((DeviceKind::Block, path.as_str())),
+            BlockSpec::Ram(_) => None,
+        })
+        .collect()
+}
+
+/// Detect the same path mounted as multiple independent SCSI devices and
+/// return the stderr warning lines. A path appearing more than once in total
+/// (same or different device kinds) is warned: each occurrence is a distinct
+/// LUN with its own LBA semantics (e.g. `--block f.iso --cdblock f.iso`).
+fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, Vec<DeviceKind>> =
+        std::collections::HashMap::new();
+    for (kind, path) in specs {
+        seen.entry(path).or_default().push(*kind);
+    }
+    let mut warnings = Vec::new();
+    for (path, kinds) in seen {
+        if kinds.len() > 1 {
+            warnings.push(format!(
+                "warning: path '{path}' is mounted as {kinds:?}; these are \
+                 independent SCSI devices with different LBA semantics"
+            ));
+        }
+    }
+    warnings
 }
 
 /// A CLI block backend: RAM disk (owned memory) or file backend.
@@ -372,6 +424,48 @@ mod tests {
         assert_eq!(parse_work_size(Some("128K")).unwrap(), 128 * 1024);
         assert!(parse_work_size(Some("1000")).is_err()); // below MIN_WORK_LEN
         assert!(parse_work_size(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn dual_mount_same_path_twice_warns() {
+        let w = check_dual_mount(&[(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("a.img"));
+        assert!(w[0].starts_with("warning:"));
+    }
+
+    #[test]
+    fn dual_mount_distinct_paths_do_not_warn() {
+        let w = check_dual_mount(&[(DeviceKind::Block, "a.img"), (DeviceKind::Block, "b.img")]);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn dual_mount_single_spec_does_not_warn() {
+        let w = check_dual_mount(&[(DeviceKind::Block, "a.img")]);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn dual_mount_specs_collects_file_paths_only() {
+        let specs = [
+            BlockSpec::Ram(1024),
+            BlockSpec::File {
+                path: "a.img".to_string(),
+                read_only: false,
+            },
+            BlockSpec::File {
+                path: "a.img".to_string(),
+                read_only: true,
+            },
+        ];
+        let d = dual_mount_specs(&specs);
+        assert_eq!(
+            d,
+            vec![(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]
+        );
+        let w = check_dual_mount(&d);
+        assert_eq!(w.len(), 1);
     }
 
     #[test]
