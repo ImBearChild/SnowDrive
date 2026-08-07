@@ -604,7 +604,6 @@ dependencies = [
  "embedded-io",
  "pkg-config",
  "snowscsi",
- "snowscsi-mock",
 ]
 
 [[package]]
@@ -633,13 +632,6 @@ dependencies = [
  "env_logger",
  "log",
  "snowscsi",
-]
-
-[[package]]
-name = "snowscsi-mock"
-version = "0.1.0"
-dependencies = [
- "embedded-io",
 ]
 
 [[package]]

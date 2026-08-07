@@ -7,6 +7,5 @@ members = [
     "crates/snowscsi-capi",
     "crates/snowscsi-cli",
     "crates/snow9660-cli",
-    "crates/snowscsi-mock",
     "tests",
 ]

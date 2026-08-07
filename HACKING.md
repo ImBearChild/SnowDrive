@@ -12,7 +12,7 @@ SCSI device emulation toolkit — Rust workspace (cargo).
 | **snowscsi-capi** | C ABI bindings for snowscsi |
 | **snowscsi-cli** | CLI — `serve` command starts iSCSI target |
 | **snow9660-cli** | CLI — `list` command prints ISO directory tree (stub) |
-| **snowscsi-mock** | Mock `Conn` for deterministic step-level testing |
+| **snowdrive-tests** | Integration tests crate (MockConn folded in + libiscsi whitebox) |
 
 ```
 snowdrive/
@@ -24,9 +24,8 @@ snowdrive/
 │   ├── snow9660/         # [no_std 零 alloc] stub
 │   ├── snowscsi-capi/    # C ABI
 │   ├── snowscsi-cli/     # binary
-│   ├── snow9660-cli/     # binary
-│   └── snowscsi-mock/    # mock utils
-├── tests/                # integration tests crate
+│   └── snow9660-cli/     # binary
+├── tests/                # integration tests crate (mock + libiscsi)
 └── HACKING.md
 ```
 
@@ -36,7 +35,7 @@ Crate dependency chain:
 snow9660-cli ── snow9660
 snowscsi-cli ── snowscsi ── snowcommon
 snowscsi-capi ── snowscsi
-snowdrive-tests ── snowscsi + snowscsi-mock
+snowdrive-tests ── snowscsi
 ```
 
 ## Commit Messages

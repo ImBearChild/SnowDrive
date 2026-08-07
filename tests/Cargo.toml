@@ -7,7 +7,6 @@ description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 
 [dependencies]
 snowscsi = { path = "../crates/snowscsi" }
-snowscsi-mock = { path = "../crates/snowscsi-mock" }
 embedded-io = "0.7"
 
 [build-dependencies]

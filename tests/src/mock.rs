@@ -4,9 +4,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::mock_conn::MockConn;
     use snowscsi::iscsi_pdu::{flag, op, reject, stage, status, tmf, tmf_response};
     use snowscsi::{BlockDevice, LoginStage, RamBackend, Session, StepResult, MIN_WORK_LEN};
-    use snowscsi_mock::MockConn;
 
     /// Login parameters as sent by a Linux open-iscsi initiator
     /// (concatenated literals preserve embedded NUL separators).

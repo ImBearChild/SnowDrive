@@ -45,8 +45,7 @@ snowdrive/
 │   ├── snowscsi-capi/    # C ABI bindings (unsafe-allowed)
 │   ├── snowscsi-cli/     # binary: serve command
 │   ├── snow9660-cli/     # binary: list command (stub)
-│   └── snowscsi-mock/    # MockConn for deterministic testing
-├── tests/                # Integration tests crate (snowdrive-tests)
+├── tests/                # Integration tests crate (snowdrive-tests; MockConn folded in)
 └── ...
 ```
 

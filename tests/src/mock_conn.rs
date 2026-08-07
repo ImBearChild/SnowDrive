@@ -1,7 +1,8 @@
-#![doc = "Mock `embedded_io::Read + Write` connection for deterministic"]
-#![doc = "step-level integration testing of snowscsi iSCSI target."]
-#![doc = ""]
-#![doc = "Uses `Vec<u8>` deque semantics — no threads, no globals."]
+//! Mock `embedded_io::Read + Write` connection for deterministic
+//! step-level integration testing of the snowscsi iSCSI target.
+//!
+//! Uses `Vec<u8>` deque semantics — no threads, no globals. Folded in from
+//! the former `snowscsi-mock` crate (R6).
 
 #[derive(Default)]
 pub struct MockConn {
