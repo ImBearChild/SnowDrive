@@ -21,7 +21,7 @@ use crate::iscsi_pdu::{
 };
 use crate::scsi::op as scsi_op;
 use crate::scsi::{opcode_name, Sense};
-use crate::BlockBackend;
+use crate::BlockStorage;
 
 /// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
 const LOGIN_MAX: usize = 4096;
@@ -228,7 +228,7 @@ impl Session {
     /// (Login → Login Response; SCSI Command → full Data-In/Data-Out flow and
     /// final status; TMF / NOP / Logout → response). `work` must be at least
     /// [`crate::MIN_WORK_LEN`] bytes.
-    pub fn step<C: Conn, B: BlockBackend>(
+    pub fn step<C: Conn, B: BlockStorage>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
@@ -432,7 +432,7 @@ impl Session {
 
     // ── Full Feature: SCSI Command ────────────────────────────────
 
-    fn handle_scsi_cmd<C: Conn + ?Sized, B: BlockBackend>(
+    fn handle_scsi_cmd<C: Conn + ?Sized, B: BlockStorage>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
@@ -608,7 +608,7 @@ impl Session {
     }
 
     /// Send chunked Data-In for a backend READ (RFC 3720 §10.7).
-    fn send_read_data<C: Conn + ?Sized, B: BlockBackend>(
+    fn send_read_data<C: Conn + ?Sized, B: BlockStorage>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
@@ -676,7 +676,7 @@ impl Session {
     /// Write flow: R2T(s) → Data-Out → final status. `received` bytes have
     /// already been written to the backend (immediate data).
     #[allow(clippy::too_many_arguments)]
-    fn send_write_flow<C: Conn + ?Sized, B: BlockBackend>(
+    fn send_write_flow<C: Conn + ?Sized, B: BlockStorage>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
@@ -1006,7 +1006,7 @@ impl core::error::Error for TargetError {}
 ///
 /// Validates `work.len() >= MIN_WORK_LEN` up front. I/O errors inside `step`
 /// surface as `Closed`; only caller bugs propagate as `Err`.
-pub fn serve_conn<C: Conn, B: BlockBackend>(
+pub fn serve_conn<C: Conn, B: BlockStorage>(
     conn: &mut C,
     work: &mut [u8],
     session: &mut Session,

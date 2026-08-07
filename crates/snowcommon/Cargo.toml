@@ -3,7 +3,7 @@ name = "snowcommon"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Unified logging macros for SnowDrive"
+description = "Unified logging macros + storage seams for SnowDrive"
 
 [features]
 default = []
@@ -11,5 +11,6 @@ log = ["dep:log"]
 defmt = ["dep:defmt"]
 
 [dependencies]
+embedded-io = "0.7"
 log = { version = "0.4", optional = true, default-features = false }
 defmt = { version = "1", optional = true }

@@ -5,7 +5,9 @@
 //! ## Modules
 //! - [`scsi`]: opcodes, sense data, CDB field parsing (SPC-4 / SBC-3)
 //! - [`device`]: command outcome + device types (device.h)
-//! - [`backend`]: block storage backends (RAM + file), no_std error type
+//! - [`backend`]: file block backend + re-exports of the storage seam
+//!   (`BlockStorage` / `BlockStorageError` / `RamBackend` live in
+//!   `snowcommon::block_storage`)
 //! - [`block`]: SBC block device command set (block.c)
 //! - [`iscsi_pdu`]: iSCSI PDU (BHS) field codec (RFC 3720 §10.x)
 //! - [`conn`]: connection abstraction (`embedded_io::Read + Write`)
@@ -25,7 +27,7 @@ pub mod scsi;
 #[cfg(feature = "std")]
 pub mod transport;
 
-pub use backend::{BlockBackend, BlockBackendError, RamBackend};
+pub use backend::{BlockStorage, BlockStorageError, RamBackend};
 pub use block::Device;
 pub use conn::Conn;
 pub use device::{CommandOutcome, DeviceType, Error};

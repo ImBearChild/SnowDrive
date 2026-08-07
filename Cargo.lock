@@ -592,6 +592,7 @@ name = "snowcommon"
 version = "0.1.0"
 dependencies = [
  "defmt",
+ "embedded-io",
  "log",
 ]
 

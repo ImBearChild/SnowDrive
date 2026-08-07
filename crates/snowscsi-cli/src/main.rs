@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser};
-use snowscsi::backend::{BlockBackend, BlockBackendError, FileBackend, RamBackend};
+use snowscsi::backend::{BlockStorage, BlockStorageError, FileBackend, RamBackend};
 use snowscsi::block::Device;
 use snowscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::MIN_WORK_LEN;
@@ -191,22 +191,22 @@ enum CliBackend {
     File(FileBackend),
 }
 
-impl BlockBackend for CliBackend {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockBackendError> {
+impl BlockStorage for CliBackend {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
         match self {
             Self::Ram(disk) => RamBackend::new(disk).read(offset, buf),
             Self::File(f) => f.read(offset, buf),
         }
     }
 
-    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockBackendError> {
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
         match self {
             Self::Ram(disk) => RamBackend::new(disk).write(offset, buf),
             Self::File(f) => f.write(offset, buf),
         }
     }
 
-    fn sync(&mut self) -> Result<(), BlockBackendError> {
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
         match self {
             Self::Ram(disk) => RamBackend::new(disk).sync(),
             Self::File(f) => f.sync(),

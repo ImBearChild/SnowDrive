@@ -1,11 +1,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
-//! Unified logging macros for SnowDrive.
+//! #![no_std] zero-alloc utilities shared by the SnowDrive crates.
 //!
-//! [`trace!`], [`debug!`], [`info!`], [`warn!`], [`error!`] are unified
-//! macros that dispatch to either the [`log`] crate or [`defmt`],
-//! depending on which Cargo feature is enabled.  The two features are
-//! mutually exclusive.
+//! ## Modules
+//! - [`block_storage`]: random-access block storage seam (`BlockStorage`
+//!   trait + error + [`RamBackend`]) — implementable by embedded drivers
+//! - the logging macros below: unified [`trace!`], [`debug!`], [`info!`],
+//!   [`warn!`], [`error!`] dispatching to either the [`log`] crate or
+//!   [`defmt`], depending on which Cargo feature is enabled. The two
+//!   features are mutually exclusive.
 //!
 //! - `log` feature  — dispatch to `::log::info!()` etc.
 //! - `defmt` feature — dispatch to `::defmt::info!()` etc.
@@ -15,6 +18,8 @@
 //! backend; the final binary enables the feature it wants.  Capturing
 //! or routing log output is the caller's responsibility (e.g. an upper
 //! layer implements `log::Log` or provides a `defmt` logger).
+
+pub mod block_storage;
 
 #[cfg(all(feature = "log", feature = "defmt"))]
 compile_error!("You may not enable both `log` and `defmt` features.");

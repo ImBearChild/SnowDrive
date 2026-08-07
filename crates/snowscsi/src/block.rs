@@ -6,7 +6,7 @@
 //! [`CommandOutcome::DataIn::immediate`]; READ commands return an empty
 //! `immediate` and the target reads the backend at `byte_offset`.
 
-use crate::backend::BlockBackend;
+use crate::backend::BlockStorage;
 use crate::device::{CommandOutcome, DeviceType, Error};
 use crate::scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
@@ -25,14 +25,14 @@ const VPD_ID_LEN: usize = 16;
 const SENSE_LEN: usize = 18;
 
 /// Direct-access block device (device_internal.h `snowscsi_device`).
-pub struct Device<B: BlockBackend> {
+pub struct Device<B: BlockStorage> {
     backend: B,
     sector_size: u32,
     sense: Sense,
     prevent_removal: bool,
 }
 
-impl<B: BlockBackend> Device<B> {
+impl<B: BlockStorage> Device<B> {
     /// Create a block device over `backend` with the given sector size.
     /// Returns `None` if `sector_size == 0` (C `snowscsi_block_create`).
     pub fn new(backend: B, sector_size: u32) -> Option<Self> {
@@ -85,7 +85,7 @@ impl<B: BlockBackend> Device<B> {
         &mut self,
         offset: u64,
         buf: &[u8],
-    ) -> Result<(), crate::backend::BlockBackendError> {
+    ) -> Result<(), crate::backend::BlockStorageError> {
         match self.backend.write(offset, buf) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -100,7 +100,7 @@ impl<B: BlockBackend> Device<B> {
         &mut self,
         offset: u64,
         buf: &mut [u8],
-    ) -> Result<(), crate::backend::BlockBackendError> {
+    ) -> Result<(), crate::backend::BlockStorageError> {
         match self.backend.read(offset, buf) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -564,7 +564,7 @@ mod tests {
 
     /// Extract the DataIn payload (backend read or work-resident).
     /// Returns the number of bytes transferred.
-    fn data_in<B: BlockBackend>(
+    fn data_in<B: BlockStorage>(
         dev: &mut Device<B>,
         outcome: CommandOutcome<'_>,
         buf: &mut [u8],
@@ -1299,7 +1299,7 @@ mod tests {
                 ..
             } => {
                 let r = dev.write_data(byte_offset, immediate);
-                assert_eq!(r, Err(crate::backend::BlockBackendError::NotWritable));
+                assert_eq!(r, Err(crate::backend::BlockStorageError::NotWritable));
                 assert_eq!(dev.sense().key, SenseKey::MediumError);
                 assert_eq!(dev.sense().asc, asc::WRITE_FAULT);
             }
