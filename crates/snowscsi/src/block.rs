@@ -1,10 +1,9 @@
 //! SBC block device command set (block.c).
 //!
-//! Implements the direct-access block device commands
-//! (SPC-4 / SBC-3). Synthesized responses (INQUIRY, MODE SENSE, ...) are
-//! written by the handler into `work[48..48+len]` and returned via
-//! [`CommandOutcome::DataIn::immediate`]; READ commands return an empty
-//! `immediate` and the target reads the backend at `byte_offset`.
+//! Implements the direct-access block device commands (SPC-4 / SBC-3).
+//! SPC commands (INQUIRY, MODE SENSE, ...) are delegated to [`crate::spc`];
+//! READ commands return an empty `immediate` and the target reads the
+//! backend at `byte_offset`.
 
 use crate::backend::BlockStorage;
 use crate::device::{CommandOutcome, DeviceType, Error};
@@ -12,17 +11,9 @@ use crate::scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, opcode_name, Sense, SenseKey,
 };
-
-/// INQUIRY standard data length (additional length = 91 per SPC-3 (n-4)).
-const INQUIRY_STD_LEN: usize = 95;
-/// VPD 0x00 page list length (7 = 4 + 3 supported pages).
-const VPD_PAGE_LIST_LEN: usize = 7;
-/// VPD 0x80 unit serial length (4 header + 16 serial).
-const VPD_SERIAL_LEN: usize = 20;
-/// VPD 0x83 device identification length (4 + 4 descriptor + 8 NAA-3).
-const VPD_ID_LEN: usize = 16;
-/// REQUEST SENSE response length (fixed format).
-const SENSE_LEN: usize = 18;
+use crate::spc::{
+    block_mode_page, execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY,
+};
 
 /// Direct-access block device (device_internal.h `snowscsi_device`).
 pub struct Device<B: BlockStorage> {
@@ -130,65 +121,19 @@ impl<B: BlockStorage> Device<B> {
     }
 
     fn handle_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8], dsl: usize) -> CommandOutcome<'a> {
+        if let Some(cmd) = parse_spc(cdb) {
+            return execute_spc(self, cmd, work, dsl);
+        }
+
         let opcode = cdb_opcode(cdb);
         let max_lba = self.max_lba();
 
-        let outcome = match opcode {
-            op::TEST_UNIT_READY => CommandOutcome::Status,
-
-            op::REQUEST_SENSE => {
-                let alloc = cdb[4] as usize;
-                let mut buf = [0u8; SENSE_LEN];
-                let n = self.sense.write_fixed(&mut buf);
-                let n = n.min(alloc);
-                work[48..48 + n].copy_from_slice(&buf[..n]);
-                CommandOutcome::DataIn {
-                    transfer_len: n as u64,
-                    byte_offset: 0,
-                    immediate: &work[48..48 + n],
-                }
-            }
-
-            op::INQUIRY => self.inquiry(cdb, work),
+        match opcode {
             op::READ_CAPACITY_10 => self.read_capacity_10(cdb, work),
             op::SERVICE_ACTION_IN => self.read_capacity_16(cdb, work),
             op::SYNCHRONIZE_CACHE_10 => {
                 let _ = self.backend.sync();
                 CommandOutcome::Status
-            }
-            op::MODE_SENSE_6 => self.mode_sense(cdb, work, false),
-            op::MODE_SENSE_10 => self.mode_sense(cdb, work, true),
-            op::MODE_SELECT_6 | op::MODE_SELECT_10 => CommandOutcome::Status,
-            op::SEND_DIAGNOSTIC => {
-                if cdb[1] & 0x04 != 0 {
-                    self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
-                } else {
-                    CommandOutcome::Status
-                }
-            }
-            op::RECEIVE_DIAGNOSTIC => {
-                let alloc = ((u16::from(cdb[3]) << 8) | u16::from(cdb[4])) as usize;
-                let buf = [0u8; 4];
-                let n = 4.min(alloc);
-                work[48..48 + n].copy_from_slice(&buf[..n]);
-                CommandOutcome::DataIn {
-                    transfer_len: n as u64,
-                    byte_offset: 0,
-                    immediate: &work[48..48 + n],
-                }
-            }
-            op::PREVENT_ALLOW => {
-                self.prevent_removal = cdb[4] & 0x03 != 0;
-                CommandOutcome::Status
-            }
-            op::START_STOP_UNIT => {
-                let loej = (cdb[4] >> 1) & 0x01;
-                let load = cdb[4] & 0x01;
-                if loej == 1 && load == 0 && self.prevent_removal {
-                    self.cc(SenseKey::IllegalRequest, asc::MEDIUM_REMOVAL_PREVENTED)
-                } else {
-                    CommandOutcome::Status
-                }
             }
 
             op::READ_6 => self.read_cmd(
@@ -239,8 +184,7 @@ impl<B: BlockStorage> Device<B> {
                 let _ = opcode_name(other);
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND)
             }
-        };
-        outcome
+        }
     }
 
     /// Shared READ(6/10/12/16) handler.
@@ -309,86 +253,6 @@ impl<B: BlockStorage> Device<B> {
         u32::try_from(bytes).ok()
     }
 
-    fn inquiry<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
-        let evpd = cdb[1] & 0x01;
-        let page_code = cdb[2];
-        let alloc = ((u16::from(cdb[3]) << 8) | u16::from(cdb[4])) as usize;
-
-        if evpd == 1 {
-            let data: &[u8] = match page_code {
-                0x00 => {
-                    let mut buf = [0u8; VPD_PAGE_LIST_LEN];
-                    buf[3] = 3;
-                    buf[4] = 0x00;
-                    buf[5] = 0x80;
-                    buf[6] = 0x83;
-                    work[48..48 + VPD_PAGE_LIST_LEN].copy_from_slice(&buf);
-                    &work[48..48 + VPD_PAGE_LIST_LEN]
-                }
-                0x80 => {
-                    let mut buf = [0u8; VPD_SERIAL_LEN];
-                    buf[1] = 0x80;
-                    buf[3] = 16;
-                    let size = self.backend.capacity();
-                    buf[4..8].copy_from_slice(b"SNOW");
-                    let hex = format_hex16(size);
-                    buf[8..20].copy_from_slice(&hex[4..16]);
-                    work[48..48 + VPD_SERIAL_LEN].copy_from_slice(&buf);
-                    &work[48..48 + VPD_SERIAL_LEN]
-                }
-                0x83 => {
-                    let mut buf = [0u8; VPD_ID_LEN];
-                    buf[1] = 0x83;
-                    buf[3] = 12;
-                    buf[4] = 0x01; /* CODE SET = binary */
-                    buf[5] = 0x03; /* designator type = NAA */
-                    buf[7] = 8;
-                    let id = 0x3000_0000_0000_0000u64
-                        | (self.backend.capacity() & 0x0FFF_FFFF_FFFF_FFFF);
-                    buf[8..16].copy_from_slice(&id.to_be_bytes());
-                    work[48..48 + VPD_ID_LEN].copy_from_slice(&buf);
-                    &work[48..48 + VPD_ID_LEN]
-                }
-                _ => {
-                    return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
-                }
-            };
-            let n = data.len().min(alloc);
-            CommandOutcome::DataIn {
-                transfer_len: n as u64,
-                byte_offset: 0,
-                immediate: &work[48..48 + n],
-            }
-        } else {
-            if page_code != 0 {
-                return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
-            }
-            let mut buf = [0u8; INQUIRY_STD_LEN];
-            buf[2] = 0x06; /* SPC-4 (分歧2, was 0x05) */
-            buf[3] = 0x02; /* response data format */
-            buf[4] = (INQUIRY_STD_LEN as u8) - 4; /* additional length (n-4) */
-            buf[7] = 0x02; /* CmdQue */
-            buf[8..16].copy_from_slice(b"SnowSCSI");
-            buf[16..32].copy_from_slice(b"Virtual Disk    ");
-            buf[32..36].copy_from_slice(b"0100");
-            buf[58] = 0x00;
-            buf[59] = 0xA0; /* SAM-5 */
-            buf[60] = 0x09;
-            buf[61] = 0x60; /* iSCSI */
-            buf[62] = 0x04;
-            buf[63] = 0x60; /* SPC-4 */
-            buf[64] = 0x04;
-            buf[65] = 0xC0; /* SBC-3 */
-            let n = INQUIRY_STD_LEN.min(alloc);
-            work[48..48 + n].copy_from_slice(&buf[..n]);
-            CommandOutcome::DataIn {
-                transfer_len: n as u64,
-                byte_offset: 0,
-                immediate: &work[48..48 + n],
-            }
-        }
-    }
-
     fn read_capacity_10<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
         let pmi = cdb[1] & 0x01;
         let req_lba = (u32::from(cdb[2]) << 24)
@@ -430,65 +294,44 @@ impl<B: BlockStorage> Device<B> {
             immediate: &work[48..48 + n],
         }
     }
-
-    /// MODE SENSE(6)/(10). `long` selects the 10-byte CDB/8-byte header form.
-    fn mode_sense<'a>(&mut self, cdb: &[u8], work: &'a mut [u8], long: bool) -> CommandOutcome<'a> {
-        let page = cdb[2] & 0x3F;
-        let alloc = if long {
-            ((u16::from(cdb[7]) << 8) | u16::from(cdb[8])) as usize
-        } else {
-            cdb[4] as usize
-        };
-
-        let mut pages = [0u8; 24];
-        let mut off = 0usize;
-        if page == 0x3F || page == 0x08 {
-            let mut caching = [0u8; 20];
-            caching[0] = 0x88; /* PS=1, SPF=0, page 0x08 */
-            caching[1] = 18; /* page length */
-            caching[12] = 0x20; /* DRA=1 */
-            pages[..20].copy_from_slice(&caching);
-            off = 20;
-        }
-        if page == 0x3F || page == 0x00 {
-            pages[off..off + 4].copy_from_slice(&[0x00, 2, 0x00, 0x08]);
-            off += 4;
-        }
-        if page != 0x3F && page != 0x00 && page != 0x08 {
-            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
-        }
-
-        let header_len = if long { 8 } else { 4 };
-        let total = header_len + off;
-        let mode_len = if long { total - 2 } else { total - 1 };
-        let mut buf = [0u8; 32];
-        if long {
-            buf[0] = (mode_len >> 8) as u8;
-            buf[1] = mode_len as u8;
-        } else {
-            buf[0] = mode_len as u8;
-        }
-        buf[header_len..total].copy_from_slice(&pages[..off]);
-        let n = total.min(alloc);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            byte_offset: 0,
-            immediate: &work[48..48 + n],
-        }
-    }
 }
 
-/// Format a u64 as 16 uppercase hex digits (VPD 0x80 serial).
-fn format_hex16(v: u64) -> [u8; 16] {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = [0u8; 16];
-    let mut x = v;
-    for i in (0..16).rev() {
-        out[i] = HEX[(x & 0xF) as usize];
-        x >>= 4;
+impl<B: BlockStorage> SpcDevice for Device<B> {
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Block
     }
-    out
+
+    fn identity(&self) -> &DeviceIdentity {
+        &BLOCK_IDENTITY
+    }
+
+    fn id(&self) -> u64 {
+        self.backend.capacity()
+    }
+
+    fn mode_page(&self, page: u8) -> Option<&[u8]> {
+        block_mode_page(page)
+    }
+
+    fn sense(&self) -> &Sense {
+        &self.sense
+    }
+
+    fn sense_mut(&mut self) -> &mut Sense {
+        &mut self.sense
+    }
+
+    fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
+        if loej && !load && self.prevent_removal {
+            SpcEffect::RemovalPrevented
+        } else {
+            SpcEffect::Good
+        }
+    }
+
+    fn set_prevent(&mut self, prevent: bool) {
+        self.prevent_removal = prevent;
+    }
 }
 
 #[cfg(test)]
@@ -1155,8 +998,27 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 6];
         cdb[0] = op::SEND_DIAGNOSTIC;
-        cdb[1] = 0x10; /* PF=1, SelfTest=0 */
+        cdb[1] = 0x08; /* PF=1, SelfTest=0 (SPC-3 table 171) */
         assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+    }
+
+    #[test]
+    fn block_send_diagnostic_self_test() {
+        let mut ram = [0u8; 1024 * 1024];
+        let mut dev = ram_dev(&mut ram);
+        let mut w = work();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::SEND_DIAGNOSTIC;
+        cdb[1] = 0x0A; /* PF=1, SelfTest=1 */
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert_eq!(
+            outcome,
+            CommandOutcome::CheckCondition(Sense::new(
+                SenseKey::IllegalRequest,
+                asc::INVALID_FIELD,
+                0
+            ))
+        );
     }
 
     #[test]

@@ -9,6 +9,16 @@ pub enum DeviceType {
     Cdrom,
 }
 
+impl DeviceType {
+    /// Peripheral device type byte (INQUIRY byte 0, bits 0-4, SPC-4 §6.4.1).
+    pub fn pdt(&self) -> u8 {
+        match self {
+            Self::Block => 0x00,
+            Self::Cdrom => 0x05,
+        }
+    }
+}
+
 /// Outcome of processing one SCSI command (C `snowscsi_result_t`, device.h).
 ///
 /// Borrowed, zero-alloc: the device never holds a cross-command buffer.
