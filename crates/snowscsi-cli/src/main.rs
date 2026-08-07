@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser};
 use snowscsi::backend::{BlockStorage, BlockStorageError, FileBackend, RamBackend};
-use snowscsi::block::Device;
+use snowscsi::block::BlockDevice;
 use snowscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::MIN_WORK_LEN;
 
@@ -108,7 +108,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             }
         };
         let capacity = backend.capacity();
-        let dev = Device::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+        let dev = BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
         log::debug!("LUN {}: {capacity} bytes ({spec})", devices.len());
         devices.push(dev);
     }
@@ -185,7 +185,7 @@ enum BlockSpec {
 }
 
 /// A CLI block backend: RAM disk (owned memory) or file backend.
-/// Type-erases the two backend kinds so every LUN shares one `Device<B>`.
+/// Type-erases the two backend kinds so every LUN shares one `BlockDevice<B>`.
 enum CliBackend {
     Ram(Vec<u8>),
     File(FileBackend),

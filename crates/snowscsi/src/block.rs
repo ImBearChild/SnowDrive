@@ -14,14 +14,14 @@ use crate::spc::{
 };
 
 /// Direct-access block device (device_internal.h `snowscsi_device`).
-pub struct Device<B: BlockStorage> {
+pub struct BlockDevice<B: BlockStorage> {
     backend: B,
     sector_size: u32,
     sense: Sense,
     prevent_removal: bool,
 }
 
-impl<B: BlockStorage> Device<B> {
+impl<B: BlockStorage> BlockDevice<B> {
     /// Create a block device over `backend` with the given sector size.
     /// Returns `None` if `sector_size == 0` (C `snowscsi_block_create`).
     pub fn new(backend: B, sector_size: u32) -> Option<Self> {
@@ -238,7 +238,7 @@ impl<B: BlockStorage> Device<B> {
     }
 }
 
-impl<B: BlockStorage> SpcDevice for Device<B> {
+impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
     fn device_type(&self) -> DeviceType {
         DeviceType::Block
     }
@@ -344,14 +344,14 @@ mod tests {
         [0u8; crate::MIN_WORK_LEN]
     }
 
-    fn ram_dev<'a>(ram: &'a mut [u8]) -> Device<RamBackend<'a>> {
-        Device::new(RamBackend::new(ram), 512).unwrap()
+    fn ram_dev<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
+        BlockDevice::new(RamBackend::new(ram), 512).unwrap()
     }
 
     /// Extract the DataIn payload (backend read or work-resident).
     /// Returns the number of bytes transferred.
     fn data_in<B: BlockStorage>(
-        dev: &mut Device<B>,
+        dev: &mut BlockDevice<B>,
         outcome: CommandOutcome<'_>,
         buf: &mut [u8],
     ) -> usize {
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn block_create_rejects_zero_sector() {
         let mut ram = [0u8; 512];
-        assert!(Device::new(RamBackend::new(&mut ram), 0).is_none());
+        assert!(BlockDevice::new(RamBackend::new(&mut ram), 0).is_none());
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
         f.flush().unwrap();
 
         let backend = crate::backend::FileBackend::open(&path.to_string_lossy(), true).unwrap();
-        let mut dev = Device::new(backend, 512).unwrap();
+        let mut dev = BlockDevice::new(backend, 512).unwrap();
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
         w[48..48 + 512].copy_from_slice(&pattern);
@@ -1092,7 +1092,7 @@ mod tests {
         std::fs::write(&path, [0u8; 512]).unwrap();
 
         let backend = crate::backend::FileBackend::open(&path.to_string_lossy(), false).unwrap();
-        let mut dev = Device::new(backend, 512).unwrap();
+        let mut dev = BlockDevice::new(backend, 512).unwrap();
         let mut w = work();
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);

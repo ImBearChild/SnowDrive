@@ -19,7 +19,7 @@ use std::net::TcpListener;
 use std::thread;
 
 use snowscsi::transport::DEFAULT_READ_TIMEOUT;
-use snowscsi::{serve_conn, Device, RamBackend, Session, TargetError, TcpConn, MIN_WORK_LEN};
+use snowscsi::{serve_conn, BlockDevice, RamBackend, Session, TargetError, TcpConn, MIN_WORK_LEN};
 
 /// libiscsi constants (iscsi.h / scsi-lowlevel.h).
 const ISCSI_SESSION_NORMAL: c_int = 2;
@@ -283,9 +283,9 @@ fn start_target_n_luns(
             guards.push(r.lock().unwrap());
         }
         // Coerce each guard to a `&mut [u8]` slice view, build the device.
-        let mut devs: Vec<Device<RamBackend<'_>>> = Vec::with_capacity(n);
+        let mut devs: Vec<BlockDevice<RamBackend<'_>>> = Vec::with_capacity(n);
         for g in &mut guards {
-            devs.push(Device::new(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
+            devs.push(BlockDevice::new(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
         }
         serve_conn(&mut conn, &mut work, &mut session, &mut devs)
     });

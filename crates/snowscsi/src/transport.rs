@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::backend::BlockStorage;
-use crate::block::Device;
+use crate::block::BlockDevice;
 use crate::iscsi_target::{serve_conn, Session, TargetError};
 
 /// Default read timeout guarding login / command loop / Data-Out.
@@ -79,7 +79,7 @@ pub fn serve<B: BlockStorage>(
     listener: TcpListener,
     stop: &AtomicBool,
     work: &mut [u8],
-    devs: &mut [Device<B>],
+    devs: &mut [BlockDevice<B>],
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_WORK_LEN {
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
     use crate::conn::{read_exact, write_all};
     use crate::iscsi_pdu::{flag, op, stage};
-    use crate::{Device, RamBackend, MIN_WORK_LEN};
+    use crate::{BlockDevice, RamBackend, MIN_WORK_LEN};
     use std::io::{Read as _, Write as _};
 
     fn be32(v: u32) -> [u8; 4] {
@@ -205,7 +205,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         std::thread::scope(|scope| {

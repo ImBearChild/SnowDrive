@@ -32,7 +32,7 @@ pub mod spc;
 pub mod transport;
 
 pub use backend::{BlockStorage, BlockStorageError, RamBackend};
-pub use block::Device;
+pub use block::BlockDevice;
 pub use conn::Conn;
 pub use device::{CommandOutcome, DeviceType, Error};
 pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};

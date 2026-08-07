@@ -6,7 +6,7 @@
 //! `parse_sbc` + two-arm dispatch.
 
 use crate::backend::BlockStorage;
-use crate::block::Device;
+use crate::block::BlockDevice;
 use crate::device::CommandOutcome;
 use crate::scsi::{
     cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10, cdb_transfer_len12,
@@ -126,7 +126,7 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
 /// Execute one parsed SBC command against `dev` (SPC commands never reach
 /// here — `do_cmd` dispatches `SbcCommand::Spc` to `execute_spc`).
 pub(crate) fn execute_sbc<'a, B: BlockStorage>(
-    dev: &mut Device<B>,
+    dev: &mut BlockDevice<B>,
     cmd: SbcCommand,
     work: &'a mut [u8],
     dsl: usize,

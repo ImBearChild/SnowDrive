@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod tests {
     use snowscsi::iscsi_pdu::{flag, op, reject, stage, status, tmf, tmf_response};
-    use snowscsi::{Device, LoginStage, RamBackend, Session, StepResult, MIN_WORK_LEN};
+    use snowscsi::{BlockDevice, LoginStage, RamBackend, Session, StepResult, MIN_WORK_LEN};
     use snowscsi_mock::MockConn;
 
     /// Login parameters as sent by a Linux open-iscsi initiator
@@ -101,7 +101,7 @@ mod tests {
         conn: &mut MockConn,
         session: &mut Session,
         work: &mut [u8],
-        devs: &mut [Device<RamBackend<'_>>],
+        devs: &mut [BlockDevice<RamBackend<'_>>],
     ) -> (Vec<u8>, Vec<u8>) {
         let text = REQ_TEXT.as_bytes();
         let bhs = login_bhs(text.len() as u32);
@@ -118,7 +118,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -155,7 +155,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         for k in [
@@ -176,7 +176,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         assert_eq!(
@@ -195,7 +195,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         assert_eq!(resp_value(&data, "InitialR2T"), Some(b"Yes".as_slice()));
@@ -243,7 +243,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs);
         let dsl = (u32::from(bhs[5]) << 16) | (u32::from(bhs[6]) << 8) | u32::from(bhs[7]);
@@ -259,7 +259,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         // Stage 1: CSG=0 (Security), T=1, NSG=3 → target forces NSG=1.
@@ -312,7 +312,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -360,7 +360,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -414,7 +414,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -472,7 +472,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -500,7 +500,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -527,7 +527,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -559,7 +559,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         // Login carrying a non-zero CmdSN, as a real initiator would.
@@ -602,7 +602,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -632,7 +632,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -657,7 +657,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -683,7 +683,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -710,7 +710,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -736,7 +736,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -767,7 +767,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -808,7 +808,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         let text = REQ_TEXT.as_bytes();
@@ -857,7 +857,7 @@ mod tests {
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -888,9 +888,9 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
         let mut devs = [d0, d1, d2];
 
         let mut conn = MockConn::new();
@@ -946,9 +946,9 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
         let mut devs = [d0, d1, d2];
 
         let mut conn = MockConn::new();
@@ -988,9 +988,9 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = Device::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = Device::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = Device::new(RamBackend::new(&mut r2), 512).unwrap();
+        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
         let mut devs = [d0, d1, d2];
 
         let mut conn = MockConn::new();
@@ -1015,7 +1015,7 @@ mod tests {
         // The LUN-validity check happens before the REPORT LUNS intercept,
         // so an out-of-range LUN in the BHS still gets Rejected.
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = Device::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         let mut conn = MockConn::new();

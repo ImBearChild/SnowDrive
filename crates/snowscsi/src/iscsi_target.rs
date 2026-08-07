@@ -12,7 +12,7 @@
 //! rejected PDU header + ITT=0xffffffff (#18), and read-timeout coverage is
 //! delegated to the `Conn` implementation (#10/#20).
 
-use crate::block::Device;
+use crate::block::BlockDevice;
 use crate::conn::{read_exact, write_all, Conn};
 use crate::device::CommandOutcome;
 use crate::iscsi_pdu::{
@@ -232,7 +232,7 @@ impl Session {
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        devs: &mut [Device<B>],
+        devs: &mut [BlockDevice<B>],
     ) -> StepResult {
         if work.len() < crate::MIN_WORK_LEN {
             return StepResult::Error(TargetError::WorkBufTooSmall);
@@ -436,7 +436,7 @@ impl Session {
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        devs: &mut [Device<B>],
+        devs: &mut [BlockDevice<B>],
         pdu: &Pdu,
     ) -> StepResult {
         let bhs = &pdu.bhs;
@@ -612,7 +612,7 @@ impl Session {
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        dev: &mut Device<B>,
+        dev: &mut BlockDevice<B>,
         itt: u32,
         transfer_len: u64,
         byte_offset: u64,
@@ -680,7 +680,7 @@ impl Session {
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        dev: &mut Device<B>,
+        dev: &mut BlockDevice<B>,
         itt: u32,
         transfer_len: u64,
         byte_offset: u64,
@@ -1010,7 +1010,7 @@ pub fn serve_conn<C: Conn, B: BlockStorage>(
     conn: &mut C,
     work: &mut [u8],
     session: &mut Session,
-    devs: &mut [Device<B>],
+    devs: &mut [BlockDevice<B>],
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_WORK_LEN {
         return Err(TargetError::WorkBufTooSmall);
