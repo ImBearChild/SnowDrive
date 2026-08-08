@@ -6,12 +6,14 @@
 //!
 //! `--block` is repeatable; each spec becomes a LUN in order (the first
 //! `--block` is LUN 0, and so on). Specs are `ram=<size>` (K/M/G suffixes)
-//! or `<path>` (optionally `,ro` for a read-only file backend). The same
-//! file path may appear on several LUNs; each is an independent SCSI device
-//! with its own LBA semantics, so a dual-mount warning is printed to stderr.
-//! SIGINT / SIGTERM trigger a graceful shutdown: the blocking `accept()` is
-//! woken by a probe connection, `serve()` returns, and every backend is
-//! `sync()`ed before exit.
+//! or `<path>` (optionally `,ro` for a read-only file backend). `--cdblock`
+//! is also repeatable and exposes a read-only CD-ROM image (PDT=0x05) per
+//! file. LUN numbering: all `--block` devices first, then all `--cdblock`
+//! devices. The same file path may appear on several LUNs; each is an
+//! independent SCSI device with its own LBA semantics, so a dual-mount
+//! warning is printed to stderr. SIGINT / SIGTERM trigger a graceful
+//! shutdown: the blocking `accept()` is woken by a probe connection,
+//! `serve()` returns, and every backend is `sync()`ed before exit.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -20,8 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser};
-use snowscsi::backend::{BlockStorage, BlockStorageError, FileBackend, RamBackend};
+use snowscsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowscsi::block::BlockDevice;
+use snowscsi::cdblock::CDBlockDevice;
+use snowscsi::device::Device;
 use snowscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::MIN_WORK_LEN;
 
@@ -43,6 +47,11 @@ struct ServeArgs {
     /// Repeatable; the first --block is LUN 0, and so on.
     #[arg(long = "block", value_name = "PATH|ram=SIZE")]
     block: Vec<String>,
+
+    /// Read-only CD-ROM image (ISO9660 file). Repeatable; CD-ROM LUNs follow
+    /// the --block LUNs.
+    #[arg(long = "cdblock", value_name = "PATH")]
+    cdblock: Vec<String>,
 
     /// iSCSI listen address (required).
     #[arg(long = "iscsi", value_name = "ADDR:PORT")]
@@ -80,8 +89,8 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         },
     };
 
-    if args.block.is_empty() {
-        eprintln!("snowscsi: --block is required (at least one device)");
+    if args.block.is_empty() && args.cdblock.is_empty() {
+        eprintln!("snowscsi: --block or --cdblock is required (at least one device)");
         return ExitCode::FAILURE;
     }
 
@@ -93,7 +102,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     };
 
-    let mut specs = Vec::with_capacity(args.block.len());
+    let mut block_specs = Vec::with_capacity(args.block.len());
     for spec in &args.block {
         let parsed = match parse_block_spec(spec) {
             Ok(p) => p,
@@ -102,26 +111,86 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        specs.push(parsed);
+        block_specs.push(parsed);
     }
 
-    for w in check_dual_mount(&dual_mount_specs(&specs)) {
+    // CD-ROM images are plain paths; reject missing files up front.
+    for path in &args.cdblock {
+        if !Path::new(path).is_file() {
+            eprintln!("snowscsi: file not found: {path}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // Reject missing block files up front (FileBackend would otherwise
+    // create a fresh empty file when opened writable).
+    for spec in &block_specs {
+        if let BlockSpec::File { path, .. } = spec {
+            if !Path::new(path).is_file() {
+                eprintln!("snowscsi: file not found: {path}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    for w in check_dual_mount(&dual_mount_specs(&block_specs, &args.cdblock)) {
         eprintln!("{w}");
     }
 
-    let mut devices = Vec::new();
-    for (i, parsed) in specs.iter().enumerate() {
-        let backend = match open_backend(parsed) {
-            Ok(b) => b,
-            Err(msg) => {
-                eprintln!("snowscsi: {msg}");
+    // Allocate every RAM disk first so the Device array can borrow them
+    // without 'static / Box::leak — disjoint borrows via split_first_mut.
+    let mut ram_disks: Vec<Vec<u8>> = Vec::with_capacity(block_specs.len());
+    for spec in &block_specs {
+        if let BlockSpec::Ram(size) = spec {
+            let bytes = match usize::try_from(*size) {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("snowscsi: RAM size {size} too large for this platform");
+                    return ExitCode::FAILURE;
+                }
+            };
+            ram_disks.push(vec![0u8; bytes]);
+        }
+    }
+
+    // LUN order: all --block devices first, then all --cdblock devices.
+    let mut devices: Vec<Device<'_>> = Vec::with_capacity(block_specs.len() + args.cdblock.len());
+    let mut ram_rest: &mut [Vec<u8>] = &mut ram_disks;
+    let mut lun = 0usize;
+    for spec in &block_specs {
+        let backend = match spec {
+            BlockSpec::Ram(_) => {
+                let (slot, tail) = ram_rest.split_first_mut().unwrap();
+                ram_rest = tail;
+                BlockBackend::Ram(RamBackend::new(slot))
+            }
+            BlockSpec::File { path, read_only } => {
+                // Existence was checked by parse; FileBackend would otherwise
+                // create a fresh file when opened writable.
+                match FileBackend::open(path, !*read_only) {
+                    Ok(b) => BlockBackend::File(b),
+                    Err(e) => {
+                        eprintln!("snowscsi: failed to open file block device {path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        };
+        let mut dev = BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+        log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
+        devices.push(Device::Block(dev));
+        lun += 1;
+    }
+    for path in &args.cdblock {
+        let dev = match CDBlockDevice::new(path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("snowscsi: failed to open CD-ROM image {path}: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        let capacity = backend.capacity();
-        let dev = BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-        log::debug!("LUN {i}: {capacity} bytes ({})", args.block[i]);
-        devices.push(dev);
+        log::debug!("LUN {lun}: {path} CD-ROM image");
+        devices.push(Device::CdBlock(dev));
+        lun += 1;
     }
 
     let listener = match TcpListener::bind(addr) {
@@ -166,7 +235,11 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 
     // Graceful exit: flush backends.
     for (i, dev) in devices.iter_mut().enumerate() {
-        if let Err(e) = dev.backend().sync() {
+        let result = match dev {
+            Device::Block(d) => d.backend().sync(),
+            Device::CdBlock(d) => d.backend().sync(),
+        };
+        if let Err(e) = result {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");
         }
     }
@@ -195,23 +268,33 @@ enum BlockSpec {
     File { path: String, read_only: bool },
 }
 
-/// How a path is exposed as a SCSI device (dual-mount detection). CD kinds
-/// (`CdBlock` / `CdRom`) arrive with Phase 1.5f / Phase 2 CLI options.
+/// How a path is exposed as a SCSI device (dual-mount detection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceKind {
     Block,
+    CdBlock,
 }
 
 /// Collect the file-backed specs as `(kind, path)` pairs for dual-mount
-/// detection (RAM disks have no path).
-fn dual_mount_specs(specs: &[BlockSpec]) -> Vec<(DeviceKind, &str)> {
-    specs
+/// detection (RAM disks have no path). Both slices live in the caller; the
+/// returned paths borrow from them.
+fn dual_mount_specs<'a>(
+    block_specs: &'a [BlockSpec],
+    cdblock_specs: &'a [String],
+) -> Vec<(DeviceKind, &'a str)> {
+    let mut out: Vec<(DeviceKind, &'a str)> = block_specs
         .iter()
         .filter_map(|s| match s {
             BlockSpec::File { path, .. } => Some((DeviceKind::Block, path.as_str())),
             BlockSpec::Ram(_) => None,
         })
-        .collect()
+        .collect();
+    out.extend(
+        cdblock_specs
+            .iter()
+            .map(|p| (DeviceKind::CdBlock, p.as_str())),
+    );
+    out
 }
 
 /// Detect the same path mounted as multiple independent SCSI devices and
@@ -234,43 +317,6 @@ fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
         }
     }
     warnings
-}
-
-/// A CLI block backend: RAM disk (owned memory) or file backend.
-/// Type-erases the two backend kinds so every LUN shares one `BlockDevice<B>`.
-enum CliBackend {
-    Ram(Vec<u8>),
-    File(FileBackend),
-}
-
-impl BlockStorage for CliBackend {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        match self {
-            Self::Ram(disk) => RamBackend::new(disk).read(offset, buf),
-            Self::File(f) => f.read(offset, buf),
-        }
-    }
-
-    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
-        match self {
-            Self::Ram(disk) => RamBackend::new(disk).write(offset, buf),
-            Self::File(f) => f.write(offset, buf),
-        }
-    }
-
-    fn sync(&mut self) -> Result<(), BlockStorageError> {
-        match self {
-            Self::Ram(disk) => RamBackend::new(disk).sync(),
-            Self::File(f) => f.sync(),
-        }
-    }
-
-    fn capacity(&self) -> u64 {
-        match self {
-            Self::Ram(disk) => disk.len() as u64,
-            Self::File(f) => f.capacity(),
-        }
-    }
 }
 
 /// Parse a `--block` spec: `ram=<size>` or `<path>[,ro]`.
@@ -300,27 +346,6 @@ fn parse_block_spec(spec: &str) -> Result<BlockSpec, String> {
             path: path.to_string(),
             read_only,
         })
-    }
-}
-
-/// Open a backend for a parsed spec.
-fn open_backend(spec: &BlockSpec) -> Result<CliBackend, String> {
-    match spec {
-        BlockSpec::Ram(size) => {
-            let bytes = usize::try_from(*size)
-                .map_err(|_| format!("RAM size {size} too large for this platform"))?;
-            Ok(CliBackend::Ram(vec![0u8; bytes]))
-        }
-        BlockSpec::File { path, read_only } => {
-            // Match C: reject missing files up front (FileBackend would
-            // otherwise create a fresh empty file when opened writable).
-            if !Path::new(path).is_file() {
-                return Err(format!("file not found: {path}"));
-            }
-            let backend = FileBackend::open(path, !*read_only)
-                .map_err(|e| format!("failed to open file block device {path}: {e}"))?;
-            Ok(CliBackend::File(backend))
-        }
     }
 }
 
@@ -459,13 +484,42 @@ mod tests {
                 read_only: true,
             },
         ];
-        let d = dual_mount_specs(&specs);
+        let d = dual_mount_specs(&specs, &[]);
         assert_eq!(
             d,
             vec![(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]
         );
         let w = check_dual_mount(&d);
         assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn dual_mount_cdblock_paths_are_collected() {
+        let cd = vec!["boot.iso".to_string()];
+        let d = dual_mount_specs(&[], &cd);
+        assert_eq!(d, vec![(DeviceKind::CdBlock, "boot.iso")]);
+        assert!(check_dual_mount(&d).is_empty());
+    }
+
+    #[test]
+    fn dual_mount_block_and_cdblock_same_path_warns() {
+        let block = [BlockSpec::File {
+            path: "boot.iso".to_string(),
+            read_only: false,
+        }];
+        let cd = vec!["boot.iso".to_string()];
+        let d = dual_mount_specs(&block, &cd);
+        assert_eq!(
+            d,
+            vec![
+                (DeviceKind::Block, "boot.iso"),
+                (DeviceKind::CdBlock, "boot.iso")
+            ]
+        );
+        let w = check_dual_mount(&d);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("boot.iso"));
+        assert!(w[0].starts_with("warning:"));
     }
 
     #[test]
@@ -477,6 +531,8 @@ mod tests {
             "ram=1M",
             "--block",
             "disk.img,ro",
+            "--cdblock",
+            "boot.iso",
             "--iscsi",
             "127.0.0.1:3260",
             "--work-buf-size",
@@ -490,6 +546,7 @@ mod tests {
                     a.block,
                     vec!["ram=1M".to_string(), "disk.img,ro".to_string()]
                 );
+                assert_eq!(a.cdblock, vec!["boot.iso".to_string()]);
                 assert_eq!(a.iscsi.as_deref(), Some("127.0.0.1:3260"));
                 assert_eq!(a.work_buf_size.as_deref(), Some("256K"));
                 assert!(a.verbose);

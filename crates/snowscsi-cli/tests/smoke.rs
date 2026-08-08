@@ -221,3 +221,147 @@ fn serve_warns_on_dual_mount() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+/// `serve --cdblock <iso>` starts with a CD-ROM LUN, announces 'listening'
+/// and exits 0 after SIGINT (graceful shutdown syncs the read-only backend).
+#[cfg(unix)]
+#[test]
+fn serve_starts_with_cdblock() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir();
+    let iso = dir.join(format!("snowscsi_cdblock_{}.iso", std::process::id()));
+    // 2048 * 64 bytes = 64 sectors; sparse is fine (only capacity is read).
+    let f = std::fs::File::create(&iso).unwrap();
+    f.set_len(2048 * 64).unwrap();
+    drop(f);
+    let path = iso.to_string_lossy().to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+        .args(["serve", "--cdblock", &path, "--iscsi", "127.0.0.1:0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowscsi");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("listening") {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+                line.clear();
+            }
+        });
+    }
+
+    if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child.id().to_string())
+            .status();
+        let _ = child.wait();
+        panic!("snowscsi did not announce 'listening'");
+    }
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child.wait().expect("wait for snowscsi");
+    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+
+    let _ = std::fs::remove_file(&iso);
+}
+
+/// The same file path as both `--block` and `--cdblock` emits a dual-mount
+/// warning on stderr before the server starts.
+#[cfg(unix)]
+#[test]
+fn serve_warns_on_block_and_cdblock_dual_mount() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir();
+    let img = dir.join(format!("snowscsi_dualcd_{}.img", std::process::id()));
+    std::fs::write(&img, [0u8; 512]).unwrap();
+    let path = img.to_string_lossy().to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+        .args([
+            "serve",
+            "--block",
+            &path,
+            "--cdblock",
+            &path,
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowscsi");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut warnings = Vec::new();
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("warning:") {
+                    warnings.push(line.clone());
+                }
+                if line.contains("listening") {
+                    let _ = ready_tx.send(warnings);
+                    return;
+                }
+                line.clear();
+            }
+            let _ = ready_tx.send(warnings);
+        });
+    }
+
+    let warnings = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(child.id().to_string())
+                .status();
+            let _ = child.wait();
+            panic!("snowscsi did not announce 'listening'");
+        });
+    assert!(
+        warnings.iter().any(|w| w.contains(&path)),
+        "expected a dual-mount warning for {path}, got {warnings:?}"
+    );
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child.wait().expect("wait for snowscsi");
+    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+
+    let _ = std::fs::remove_file(&img);
+}
