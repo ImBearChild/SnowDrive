@@ -22,6 +22,8 @@
 #![deny(unsafe_code)]
 
 pub mod common;
+#[cfg(feature = "iscsi")]
+pub mod iscsi;
 #[cfg(feature = "scsi")]
 pub mod scsi;
 
