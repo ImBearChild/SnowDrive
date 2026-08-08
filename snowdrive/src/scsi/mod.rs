@@ -19,6 +19,7 @@
 //! - `iscsi_target`: iSCSI target session state machine (RFC 3720 §5/§10).
 //! - `transport`: BSD TCP transport (gated by `std`).
 
+pub mod backend;
 pub mod device;
 #[allow(clippy::module_inception)]
 pub mod scsi;

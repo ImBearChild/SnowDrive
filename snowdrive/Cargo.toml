@@ -10,7 +10,7 @@ description = "SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit (lib crate)"
 default = ["std", "scsi", "iscsi", "iso9660"]
 
 # Platform feature.
-std = []
+std = ["embedded-io/std"]
 
 # Core features (independent).
 scsi = []
