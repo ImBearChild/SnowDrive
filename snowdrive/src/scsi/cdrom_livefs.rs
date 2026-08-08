@@ -208,9 +208,10 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         lba: u32,
         sector: &mut [u8; SECTOR_SIZE as usize],
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        let metadata_end = self.layout.root_dir_lba + self.layout.root_dir_sectors;
+        let metadata_end = self.layout.first_file_lba;
         if lba < metadata_end {
-            // System area (zeros) + metadata (PVD/SVD/Path Table/root dir).
+            // System area (zeros) + descriptors + path tables + all
+            // directory extents (PVD/SVD/Path Table/root + sub-directories).
             gen_sector(&self.layout, lba, sector);
             return Ok(());
         }
@@ -614,9 +615,17 @@ mod tests {
         assert_eq!(layout.label.as_str(), "TEST");
         // 3 files + 1 dir (SUB) = 4 entries; extents only for files.
         assert_eq!(layout.extents.len(), 3);
-        // Metadata: PVD(16)+SVD(17)+Term(18)+PathTable(19)+Root(20) = 21, then files.
-        assert_eq!(layout.root_dir_lba, 20);
-        assert!(layout.total > 21);
+        // Descriptors (16-18) + PT-L (19) + PT-M (20) + root (21) + SUB (22).
+        assert_eq!(layout.root_dir_lba, 21);
+        assert_eq!(layout.dirs.len(), 2); // root + SUB
+        assert_eq!(layout.dirs[1].number, 2);
+        assert_eq!(layout.dirs[1].parent, 1);
+        // Files: 2 in root (parent 1), 1 in SUB (parent 2) — read_dir
+        // order is filesystem-dependent, so count, don't index.
+        assert_eq!(layout.extents.iter().filter(|e| e.parent == 1).count(), 2);
+        assert_eq!(layout.extents.iter().filter(|e| e.parent == 2).count(), 1);
+        assert_eq!(layout.total, 27); // 21 root + 22 SUB + files 23..27
+        assert_eq!(layout.first_file_lba, 23);
     }
 
     #[test]
@@ -687,22 +696,19 @@ mod tests {
     fn read_spanning_metadata_and_file_boundary() {
         let (_dir, fs) = sample_tree();
         let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
-        // READ 8 sectors from LBA 16 (PVD) → covers metadata (16-20) + first file (21+).
+        // READ 8 sectors from LBA 16 → descriptors, both path tables, the
+        // two directories, and the first file sectors.
         let mut buf = vec![0u8; 8 * 2048];
         dev.read_data(16 * 2048, &mut buf).unwrap();
-        // LBA 16 = PVD type 1.
-        assert_eq!(buf[0], 0x01);
+        assert_eq!(buf[0], 0x01); // PVD type 1
         assert_eq!(&buf[1..6], b"CD001");
-        // LBA 20 = root directory (non-zero). LBA 21 = first file data.
-        assert_ne!(&buf[4 * 2048..4 * 2048 + 16], &[0u8; 16]);
-        // The first file extent begins at the first_file_lba (root_dir + 1).
-        let first_lba = dev.layout().root_dir_lba + dev.layout().root_dir_sectors;
+        // Metadata area is non-zero (path tables + directory records).
+        assert_ne!(&buf[3 * 2048..3 * 2048 + 16], &[0u8; 16]);
+        // File data begins right after all directories (root + SUB).
         let first_extent = dev.layout().extents.first().unwrap();
-        assert_eq!(first_extent.lba, first_lba);
-        // The data byte at the first file LBA must be non-zero (a real file).
-        assert_ne!(buf[5 * 2048], 0);
-        // And it must match one of our fill bytes (a real file's content).
-        assert!([0x41u8, 0x42, 0x43].contains(&buf[5 * 2048]));
+        assert_eq!(first_extent.lba, dev.layout().first_file_lba);
+        let off = (first_extent.lba - 16) as usize * 2048;
+        assert!([0x41u8, 0x42, 0x43].contains(&buf[off]));
     }
 
     #[test]
@@ -809,8 +815,9 @@ mod tests {
         let fs = StdFsBackend::new(&dir.to_string_lossy());
         let mut dev = CdLiveFsDevice::new(fs, "EMPTY").unwrap();
         assert_eq!(dev.layout().extents.len(), 0);
-        // READ CAPACITY → max_lba = 20 (metadata only).
-        assert_eq!(dev.max_lba(), 20);
+        // READ CAPACITY → max_lba = 21 (metadata only: descriptors + both
+        // path tables + root directory).
+        assert_eq!(dev.max_lba(), 21);
     }
 
     #[test]
