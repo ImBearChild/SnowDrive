@@ -568,6 +568,17 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     }
     out[574..574 + pub_id.len()].copy_from_slice(pub_id);
 
+    // Volume date fields (17 bytes each, BP 814-830 / 831-847 / 848-864 /
+    // 865-881 → bytes 813-829 / 830-846 / 847-863 / 864-880): 16 ASCII
+    // digits "YYYYMMDDHHMMSScc" + a GMT-offset byte. The generator has no
+    // clock, so a fixed sentinel is recorded (strict readers reject a
+    // zero-filled field).
+    for i in 0..4 {
+        let o = 813 + i * 17;
+        out[o..o + 16].copy_from_slice(b"1980010100000000");
+        out[o + 16] = 0x00; // GMT offset: +0 (in 15-minute units)
+    }
+
     // File Structure Version
     out[881] = 0x01;
 }
