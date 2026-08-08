@@ -23,6 +23,16 @@
 //! Every sub-directory becomes its own extent with ".", "..", child
 //! directory and file records; the Path Table holds one record per
 //! directory (both-endian numeric fields per table type).
+//!
+//! # Name limits
+//!
+//! - [`MAX_JOLIET_NAME_CHARS`] — Joliet identifier width (default 32
+//!   UCS-2 chars, ECMA-119 Annex J allows 64). Longer names are
+//!   truncated in the generated metadata; raise the constant to widen.
+//! - [`MAX_PATH_LEN`] — maximum relative host path accepted by the live
+//!   scanner (default 512 bytes); deeper paths fail the layout build.
+//! - Host FS component names are bounded by `DirEntry.name`
+//!   (`String<256>`, the `FsStorage` seam).
 
 use core::cmp::Ordering;
 use heapless::{String, Vec};
@@ -52,8 +62,37 @@ pub const MAX_DIRS: usize = MAX_FILES + 1;
 /// Maximum label length (ASCII chars).
 pub const MAX_LABEL_LEN: usize = 16;
 
-/// Maximum Joliet file name length (UCS-2BE bytes, i.e. 2 × char count).
-const MAX_JOLIET_NAME_BYTES: usize = 64;
+/// Maximum length of a Joliet (UCS-2BE) file or directory identifier, in
+/// characters.
+///
+/// ECMA-119 Annex J (Joliet) allows identifiers up to **64** UCS-2
+/// characters; this library defaults to **32**. Identifiers longer than
+/// this are **truncated** in the generated ISO9660 metadata (the host-side
+/// name is untouched). Raise this constant (and rebuild) for wider names;
+/// all buffers, record sizes and `Vec` capacities below are derived from
+/// it, so no other edit is required.
+///
+/// The related host-side limits — `DirEntry.name` (`String<256>`, the FS
+/// seam) and [`MAX_PATH_LEN`] — sit above this value, so the Joliet
+/// identifier width is the binding constraint.
+pub const MAX_JOLIET_NAME_CHARS: usize = 32;
+
+/// Byte length of a Joliet identifier (2 bytes per character).
+pub const MAX_JOLIET_NAME_BYTES: usize = MAX_JOLIET_NAME_CHARS * 2;
+
+/// Maximum relative path length (bytes) accepted by the live scanner.
+///
+/// Deeper paths fail to build the layout (`TooManyFiles`) rather than
+/// silently truncating. The host `DirEntry.name` capacity (256 bytes)
+/// bounds a single component; `MAX_PATH_LEN` bounds the whole relative
+/// path.
+pub const MAX_PATH_LEN: usize = 512;
+
+/// Largest directory record: 33-byte header + identifier + pad-to-even.
+const MAX_DIR_REC_LEN: usize = 33 + MAX_JOLIET_NAME_BYTES + 1;
+
+/// Largest path-table record: 8-byte header + identifier + pad-to-even.
+const MAX_PT_REC_LEN: usize = 8 + MAX_JOLIET_NAME_BYTES + 1;
 
 // ── Input types ─────────────────────────────────────────────────────
 
@@ -64,7 +103,7 @@ const MAX_JOLIET_NAME_BYTES: usize = 64;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     /// Relative path from root (e.g. `"README.TXT"`, `"SUB/FILE.BIN"`).
-    pub path: String<512>,
+    pub path: String<MAX_PATH_LEN>,
     /// File size in bytes (0 for directories).
     pub size: u64,
     /// `true` if this entry is a directory.
@@ -441,28 +480,17 @@ pub fn total_sectors(layout: &Layout) -> u32 {
 
 // ── Joliet name encoding ────────────────────────────────────────────
 
-/// Encode an ASCII file name to Joliet UCS-2BE (0x00 + char for each ASCII byte).
+/// Encode an ASCII file name to Joliet UCS-2BE (0x00 + char for each ASCII
+/// byte). Identifiers longer than [`MAX_JOLIET_NAME_CHARS`] are truncated.
 fn to_joliet_name(name: &str) -> Vec<u8, MAX_JOLIET_NAME_BYTES> {
     let mut out = Vec::new();
-    // Joliet allows up to 64 bytes = 32 UCS-2 chars.
-    // Append ";1" version suffix as per ISO9660 (Joliet doesn't require it,
-    // but many readers expect it).
-    let with_version = alloc_less_format(name);
-    for ch in with_version.chars().take(32) {
+    for ch in name.chars().take(MAX_JOLIET_NAME_CHARS) {
         if ch.is_ascii() && !ch.is_control() {
             let _ = out.push(0x00);
             let _ = out.push(ch as u8);
         }
     }
     out
-}
-
-/// Format `"name;1"` without alloc (returns an iterator-like approach,
-/// but since we can't alloc, we just encode directly).
-fn alloc_less_format(name: &str) -> &str {
-    // For simplicity, just return the name as-is.
-    // ";1" version suffix will be added by the caller if needed.
-    name
 }
 
 // ── ISO9660 structure writers ───────────────────────────────────────
@@ -619,7 +647,7 @@ fn write_path_table(layout: &Layout, lba: u32, out: &mut [u8], is_m: bool) {
             continue;
         }
 
-        let mut rec = [0u8; 128];
+        let mut rec = [0u8; MAX_PT_REC_LEN];
         rec[0] = name_len as u8;
         rec[1] = 0x00; // extended attribute record length
         if is_m {
@@ -664,8 +692,9 @@ fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8])
             return;
         }
 
-        // Build the record into a scratch buffer (max 33 + 64 + 1 bytes).
-        let mut rec = [0u8; 128];
+        // Build the record into a scratch buffer sized from
+        // MAX_JOLIET_NAME_BYTES.
+        let mut rec = [0u8; MAX_DIR_REC_LEN];
         write_dir_record(&mut rec[..rec_len], 0, extent_lba, data_len, flags, name);
 
         let from = sector_start.max(rec_start);
@@ -816,7 +845,7 @@ mod tests {
     use super::*;
 
     fn make_entry(path: &str, size: u64, is_dir: bool) -> FileEntry {
-        let mut p = String::<512>::new();
+        let mut p = String::<MAX_PATH_LEN>::new();
         p.push_str(path).unwrap();
         FileEntry {
             path: p,
@@ -901,7 +930,7 @@ mod tests {
     fn layout_max_files_ok() {
         let mut files = Vec::<FileEntry, MAX_FILES>::new();
         for i in 0..MAX_FILES {
-            let mut path = String::<512>::new();
+            let mut path = String::<MAX_PATH_LEN>::new();
             core::fmt::Write::write_fmt(&mut path, format_args!("F{i}.BIN")).unwrap();
             files
                 .push(FileEntry {
@@ -921,7 +950,7 @@ mod tests {
     fn layout_root_dir_spans_multiple_sectors() {
         let mut files = Vec::<FileEntry, MAX_FILES>::new();
         for i in 0..MAX_FILES {
-            let mut path = String::<512>::new();
+            let mut path = String::<MAX_PATH_LEN>::new();
             core::fmt::Write::write_fmt(&mut path, format_args!("F{i:03}.BIN")).unwrap();
             files
                 .push(FileEntry {
@@ -976,6 +1005,24 @@ mod tests {
         assert_eq!(name[1], b'R');
         assert_eq!(name[2], 0x00);
         assert_eq!(name[3], b'E');
+    }
+
+    /// Names longer than MAX_JOLIET_NAME_CHARS are truncated in the ISO
+    /// metadata (documented limit); shorter names pass through whole.
+    #[test]
+    fn joliet_name_truncated_at_max_chars() {
+        // Exactly MAX_JOLIET_NAME_CHARS 'A's: preserved whole.
+        let exact: std::string::String = "A".repeat(MAX_JOLIET_NAME_CHARS);
+        let n = to_joliet_name(&exact);
+        assert_eq!(n.len(), MAX_JOLIET_NAME_BYTES);
+        // One char over: truncated to MAX_JOLIET_NAME_CHARS.
+        let over: std::string::String = "B".repeat(MAX_JOLIET_NAME_CHARS + 1);
+        let n = to_joliet_name(&over);
+        assert_eq!(n.len(), MAX_JOLIET_NAME_BYTES);
+        // Non-ASCII characters are skipped (not counted toward the limit).
+        let mixed = "AB\u{4e2d}CD";
+        let n = to_joliet_name(mixed);
+        assert_eq!(n.len(), 8); // 'A','B','C','D'
     }
 
     // ── sub-directory hierarchy ──────────────────────────────────────

@@ -17,6 +17,13 @@
 //! - [`scsi`] *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
 //! - `iso9660` *(gated by `iso9660`)*: ISO9660/Joliet algorithms.
 //! - `capi` *(gated by `capi`)*: C ABI exports (`#[allow(unsafe_code)]`).
+//!
+//! ## ISO9660 name limits
+//! The live generator (`iso9660::live`) truncates Joliet identifiers
+//! longer than [`iso9660::live::MAX_JOLIET_NAME_CHARS`] (default 32 UCS-2
+//! chars) and accepts host paths up to
+//! [`iso9660::live::MAX_PATH_LEN`] bytes. Both are public constants you
+//! can raise when wider names are required.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]

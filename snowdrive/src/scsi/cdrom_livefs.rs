@@ -13,7 +13,8 @@ use heapless::Vec;
 
 use crate::common::fs_storage::{DirEntry, FileHandle, FsError, FsStorage, OpenOptions};
 use crate::iso9660::live::{
-    compute_layout, gen_sector, resolve, FileEntry, IsoError, Layout, MAX_FILES, SECTOR_SIZE,
+    compute_layout, gen_sector, resolve, FileEntry, IsoError, Layout, MAX_FILES, MAX_PATH_LEN,
+    SECTOR_SIZE,
 };
 use crate::scsi::cdrom_common::{
     build_get_config_response, cdrom_mode_page, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY,
@@ -108,7 +109,7 @@ fn scan_dir<F: FsStorage>(
     }
     for entry in &buf[..n] {
         // Relative path of this entry.
-        let mut path = heapless::String::<512>::new();
+        let mut path = heapless::String::<MAX_PATH_LEN>::new();
         if !dir_rel.is_empty() {
             path.push_str(dir_rel)
                 .map_err(|_| CdLiveFsError::TooManyFiles)?;
