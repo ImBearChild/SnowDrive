@@ -21,6 +21,8 @@
 
 pub mod backend;
 pub mod block;
+#[cfg(feature = "std")]
+pub mod cdblock;
 pub mod device;
 pub mod sbc;
 #[allow(clippy::module_inception)]
