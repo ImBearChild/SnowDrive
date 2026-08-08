@@ -5,6 +5,8 @@
 //! ## Modules
 //! - [`block_storage`]: random-access block storage seam (`BlockStorage`
 //!   trait + error + [`RamBackend`]) — implementable by embedded drivers
+//! - [`fs_storage`]: file/directory storage seam (`FsStorage` trait +
+//!   error + [`fs_storage::FileHandle`]) — for CD-ROM bundle / live FS
 //! - the logging macros below: unified [`trace!`], [`debug!`], [`info!`],
 //!   [`warn!`], [`error!`] dispatching to either the [`log`] crate or
 //!   [`defmt`], depending on which Cargo feature is enabled. The two
@@ -20,6 +22,7 @@
 //! layer implements `log::Log` or provides a `defmt` logger).
 
 pub mod block_storage;
+pub mod fs_storage;
 
 #[cfg(all(feature = "log", feature = "defmt"))]
 compile_error!("You may not enable both `log` and `defmt` features.");
