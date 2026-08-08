@@ -531,32 +531,42 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     // Root Directory Record (34 bytes at 156)
     write_dir_record_root_pvd(out, 156, layout.root_dir_lba, layout.root_dir_sectors);
 
-    // Volume Identifier (32 bytes at 190): label padded with spaces
+    // System Identifier (BP 9-40 → bytes 8-39): space-filled.
     for i in 0..32 {
-        out[190 + i] = b' ';
+        out[8 + i] = b' ';
+    }
+
+    // Volume Identifier (BP 41-72 → bytes 40-71): label padded with spaces.
+    for i in 0..32 {
+        out[40 + i] = b' ';
     }
     let label_bytes = layout.label.as_bytes();
     let copy_len = label_bytes.len().min(32);
-    out[190..190 + copy_len].copy_from_slice(&label_bytes[..copy_len]);
+    out[40..40 + copy_len].copy_from_slice(&label_bytes[..copy_len]);
 
-    // Publisher Identifier (128 bytes at 446)
+    // Volume Set Identifier (BP 191-318 → bytes 190-317): 128 bytes.
+    for i in 0..128 {
+        out[190 + i] = b' ';
+    }
+
+    // Publisher Identifier (BP 319-446 → bytes 318-445): 128 bytes.
+    let pub_id = b"SnowDrive";
+    for i in 0..128 {
+        out[318 + i] = b' ';
+    }
+    out[318..318 + pub_id.len()].copy_from_slice(pub_id);
+
+    // Data Preparer Identifier (BP 447-574 → bytes 446-573): 128 bytes.
     for i in 0..128 {
         out[446 + i] = b' ';
     }
-    let pub_id = b"SnowDrive";
     out[446..446 + pub_id.len()].copy_from_slice(pub_id);
 
-    // Data Preparer Identifier (128 bytes at 574)
+    // Application Identifier (BP 575-702 → bytes 574-701): 128 bytes.
     for i in 0..128 {
         out[574 + i] = b' ';
     }
     out[574..574 + pub_id.len()].copy_from_slice(pub_id);
-
-    // Application Identifier (128 bytes at 838)
-    for i in 0..128 {
-        out[838 + i] = b' ';
-    }
-    out[838..838 + pub_id.len()].copy_from_slice(pub_id);
 
     // File Structure Version
     out[881] = 0x01;
@@ -567,7 +577,12 @@ fn write_svd(layout: &Layout, out: &mut [u8]) {
     out[0] = 0x02; // SVD type
     out[1..6].copy_from_slice(b"CD001");
     out[6] = 0x01; // version
-                   // Joliet escape sequences: UCS-2 Level 1
+                   // Escape sequences (BP 89-120 → bytes 88-119): UCS-2 Level 1, the
+                   // remainder space-filled (ECMA-119 §8.5.6). Strict readers compare the
+                   // whole 32-byte field.
+    for i in 0..32 {
+        out[88 + i] = b' ';
+    }
     out[88] = 0x25; // %
     out[89] = 0x2F; // /
     out[90] = 0x40; // @
@@ -602,15 +617,15 @@ fn write_svd(layout: &Layout, out: &mut [u8]) {
     // Root Directory Record
     write_dir_record_root_pvd(out, 156, layout.root_dir_lba, layout.root_dir_sectors);
 
-    // Volume Identifier (32 bytes at 190): UCS-2BE label
+    // Volume Identifier (BP 41-72 → bytes 40-71): UCS-2BE label (16 chars).
+    for i in 0..32 {
+        out[40 + i] = 0;
+    }
     let label_bytes = layout.label.as_bytes();
     let ucs2_len = label_bytes.len().min(16);
-    for i in 0..32 {
-        out[190 + i] = 0;
-    }
     for (i, &ch) in label_bytes[..ucs2_len].iter().enumerate() {
-        out[190 + i * 2] = 0x00;
-        out[190 + i * 2 + 1] = ch;
+        out[40 + i * 2] = 0x00;
+        out[40 + i * 2 + 1] = ch;
     }
 
     // File Structure Version
@@ -1192,6 +1207,9 @@ mod tests {
             u32::from_le_bytes([sector[158], sector[159], sector[160], sector[161]]),
             layout.root_dir_lba
         );
+        // Volume identifier (BP 41-72 → byte 40) = "TEST", space-padded.
+        assert_eq!(&sector[40..44], b"TEST");
+        assert_eq!(sector[44], b' ');
     }
 
     #[test]
@@ -1206,13 +1224,16 @@ mod tests {
         assert_eq!(sector[88], 0x25);
         assert_eq!(sector[89], 0x2F);
         assert_eq!(sector[90], 0x40);
-        // UCS-2BE volume ID "JOL"
-        assert_eq!(sector[190], 0x00);
-        assert_eq!(sector[191], b'J');
-        assert_eq!(sector[192], 0x00);
-        assert_eq!(sector[193], b'O');
-        assert_eq!(sector[194], 0x00);
-        assert_eq!(sector[195], b'L');
+        // Remainder of the field is space-filled, not zero (strict readers
+        // compare the whole 32-byte escape sequence field).
+        assert_eq!(sector[91], b' ');
+        // UCS-2BE volume ID "JOL" (BP 41-72 → byte 40).
+        assert_eq!(sector[40], 0x00);
+        assert_eq!(sector[41], b'J');
+        assert_eq!(sector[42], 0x00);
+        assert_eq!(sector[43], b'O');
+        assert_eq!(sector[44], 0x00);
+        assert_eq!(sector[45], b'L');
     }
 
     #[test]
