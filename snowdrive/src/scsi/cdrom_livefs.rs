@@ -87,20 +87,26 @@ pub struct CdLiveFsDevice<F: FsStorage> {
 
 /// Recursively scan `dir_rel` ("" = root), appending entries and opening
 /// file handles.  Directories appear before their children.
+///
+/// Each recursion level owns its own `read_dir` buffer: the child listing
+/// would otherwise overwrite the parent's not-yet-processed entries.
 fn scan_dir<F: FsStorage>(
     fs: &mut F,
     dir_rel: &str,
     files: &mut Vec<FileEntry, MAX_FILES>,
     handles: &mut Vec<Option<FileHandle>, MAX_FILES>,
-    buf: &mut [DirEntry; SCAN_BUF],
 ) -> Result<(), CdLiveFsError> {
-    let n = fs.read_dir(dir_rel, buf)?;
+    let mut buf: [DirEntry; SCAN_BUF] = core::array::from_fn(|_| DirEntry {
+        name: heapless::String::new(),
+        is_dir: false,
+        size: 0,
+    });
+    let n = fs.read_dir(dir_rel, &mut buf)?;
     if n == SCAN_BUF {
         // Could be truncated — reject rather than silently drop entries.
         return Err(CdLiveFsError::DirTooLarge);
     }
-    for i in 0..n {
-        let entry = &buf[i];
+    for entry in &buf[..n] {
         // Relative path of this entry.
         let mut path = heapless::String::<512>::new();
         if !dir_rel.is_empty() {
@@ -123,7 +129,7 @@ fn scan_dir<F: FsStorage>(
             handles
                 .push(None)
                 .map_err(|_| CdLiveFsError::TooManyFiles)?;
-            scan_dir(fs, path.as_str(), files, handles, buf)?;
+            scan_dir(fs, path.as_str(), files, handles)?;
         } else {
             let h = fs.open(path.as_str(), OpenOptions::read_only())?;
             handles
@@ -141,12 +147,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
     pub fn new(mut fs: F, label: &str) -> Result<Self, CdLiveFsError> {
         let mut files = Vec::<FileEntry, MAX_FILES>::new();
         let mut handles = Vec::<Option<FileHandle>, MAX_FILES>::new();
-        let mut buf = core::array::from_fn(|_| DirEntry {
-            name: heapless::String::new(),
-            is_dir: false,
-            size: 0,
-        });
-        scan_dir(&mut fs, "", &mut files, &mut handles, &mut buf)?;
+        scan_dir(&mut fs, "", &mut files, &mut handles)?;
         let layout = compute_layout(&files, label).map_err(|e: IsoError| match e {
             IsoError::TooManyFiles => CdLiveFsError::TooManyFiles,
         })?;
@@ -833,5 +834,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let fs = StdFsBackend::new(&dir.to_string_lossy());
         assert!(CdLiveFsDevice::new(fs, "MISS").is_err());
+    }
+
+    /// Controlled-order `FsStorage` mock: the root lists a directory FIRST,
+    /// followed by a file. A child listing with more entries than the
+    /// remaining parent entries must not clobber the parent's pending
+    /// entries (regression: the shared scan buffer was overwritten by the
+    /// recursion, turning the parent's next entry into a bogus path).
+    #[test]
+    fn scan_does_not_clobber_parent_entries() {
+        use crate::common::fs_storage::OpenOptions;
+        use crate::scsi::fs_backend::FsError;
+
+        struct MockFs;
+
+        impl FsStorage for MockFs {
+            fn open(&mut self, path: &str, _opts: OpenOptions) -> Result<FileHandle, FsError> {
+                // Only the real tree's paths exist.
+                match path {
+                    "sub/x" | "sub/y" | "tail" => Ok(FileHandle::new(0)),
+                    _ => Err(FsError::NotFound),
+                }
+            }
+            fn read(&mut self, _h: &FileHandle, _o: u64, b: &mut [u8]) -> Result<usize, FsError> {
+                b.fill(0);
+                Ok(b.len())
+            }
+            fn write(&mut self, _h: &FileHandle, _o: u64, _b: &[u8]) -> Result<(), FsError> {
+                Ok(())
+            }
+            fn close(&mut self, _h: FileHandle) {}
+            fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError> {
+                let mk = |name: &str, is_dir: bool, size: u64| {
+                    let mut s = heapless::String::<256>::new();
+                    s.push_str(name).unwrap();
+                    DirEntry {
+                        name: s,
+                        is_dir,
+                        size,
+                    }
+                };
+                // Root: a directory first, then a file (order is the point).
+                let list: &[DirEntry] = match path {
+                    "" => &[mk("sub", true, 0), mk("tail", false, 3)],
+                    "sub" => &[mk("x", false, 1), mk("y", false, 2)],
+                    _ => &[],
+                };
+                for (i, e) in list.iter().take(out.len()).enumerate() {
+                    out[i] = e.clone();
+                }
+                Ok(list.len())
+            }
+            fn root(&self) -> &str {
+                "/"
+            }
+            fn sync(&mut self) -> Result<(), FsError> {
+                Ok(())
+            }
+            fn remove(&mut self, _path: &str) -> Result<(), FsError> {
+                Ok(())
+            }
+        }
+
+        let mut dev = CdLiveFsDevice::new(MockFs, "TEST").unwrap();
+        // 3 files: sub/x, sub/y, tail. (Pre-fix this failed: the root's
+        // pending "tail" entry was clobbered by the sub listing and the
+        // parent tried to open a bogus relative path.)
+        assert_eq!(dev.layout().extents.len(), 3);
+        // The last extent (size 3) is "tail" — its data is readable.
+        let tail = dev.layout().extents.iter().find(|e| e.size == 3).unwrap();
+        let mut buf = [0u8; 4];
+        dev.read_data(u64::from(tail.lba) * 2048, &mut buf).unwrap();
+        assert_eq!(buf, [0u8; 4]);
     }
 }
