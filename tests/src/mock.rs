@@ -5,9 +5,12 @@
 #[cfg(test)]
 mod tests {
     use crate::mock_conn::MockConn;
-    use snowscsi::device::ScsiDevice;
-    use snowscsi::iscsi_pdu::{flag, op, reject, stage, status, tmf, tmf_response};
-    use snowscsi::{BlockDevice, LoginStage, RamBackend, Session, StepResult, MIN_WORK_LEN};
+    use snowdrive::common::block_storage::RamBackend;
+    use snowdrive::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response};
+    use snowdrive::iscsi::target::{LoginStage, Session, StepResult};
+    use snowdrive::scsi::block::BlockDevice;
+    use snowdrive::scsi::device::ScsiDevice;
+    use snowdrive::MIN_WORK_LEN;
 
     /// Login parameters as sent by a Linux open-iscsi initiator
     /// (concatenated literals preserve embedded NUL separators).
@@ -805,7 +808,7 @@ mod tests {
 
     #[test]
     fn serve_conn_login_then_logout() {
-        use snowscsi::serve_conn;
+        use snowdrive::iscsi::target::serve_conn;
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
@@ -1055,8 +1058,9 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_and_cdblock_dispatch() {
-        use snowscsi::backend::BlockBackend;
-        use snowscsi::{CDBlockDevice, Device};
+        use snowdrive::scsi::backend::BlockBackend;
+        use snowdrive::scsi::cdblock::CDBlockDevice;
+        use snowdrive::scsi::device::Device;
 
         let dir = std::env::temp_dir();
         let iso = dir.join(format!("snowscsi_mock_cdblock_{}.iso", std::process::id()));

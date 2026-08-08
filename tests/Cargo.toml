@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 
 [dependencies]
-snowscsi = { path = "../crates/snowscsi" }
+snowdrive = { path = "../snowdrive", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom"] }
 embedded-io = "0.7"
 
 [build-dependencies]

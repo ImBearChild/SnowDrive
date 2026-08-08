@@ -18,8 +18,12 @@ use std::ffi::{c_int, CStr, CString};
 use std::net::TcpListener;
 use std::thread;
 
-use snowscsi::transport::DEFAULT_READ_TIMEOUT;
-use snowscsi::{serve_conn, BlockDevice, RamBackend, Session, TargetError, TcpConn, MIN_WORK_LEN};
+use snowdrive::common::block_storage::RamBackend;
+use snowdrive::iscsi::target::{serve_conn, LoginStage, Session, StepResult, TargetError};
+use snowdrive::iscsi::transport::TcpConn;
+use snowdrive::iscsi::transport::DEFAULT_READ_TIMEOUT;
+use snowdrive::scsi::block::BlockDevice;
+use snowdrive::MIN_WORK_LEN;
 
 /// libiscsi constants (iscsi.h / scsi-lowlevel.h).
 const ISCSI_SESSION_NORMAL: c_int = 2;

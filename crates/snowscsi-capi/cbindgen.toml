@@ -1,9 +1,0 @@
-[export]
-include = ["snowscsi_capi"]
-
-[parse]
-parse_deps = true
-include = ["snowscsi-capi"]
-
-[enum]
-rename_variants = "None"

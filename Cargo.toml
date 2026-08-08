@@ -2,10 +2,7 @@
 resolver = "2"
 members = [
     "snowdrive",
-    "crates/snowcommon",
-    "crates/snowscsi",
-    "crates/snowscsi-capi",
-    "crates/snowscsi-cli",
-    "crates/snow9660-cli",
+    "bins/snowscsi",
+    "bins/snow9660",
     "tests",
 ]

@@ -22,12 +22,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser};
-use snowscsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
-use snowscsi::block::BlockDevice;
-use snowscsi::cdblock::CDBlockDevice;
-use snowscsi::device::Device;
-use snowscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
-use snowscsi::MIN_WORK_LEN;
+use snowdrive::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
+use snowdrive::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
+use snowdrive::scsi::block::BlockDevice;
+use snowdrive::scsi::cdblock::CDBlockDevice;
+use snowdrive::scsi::device::Device;
+use snowdrive::MIN_WORK_LEN;
 
 /// Default work buffer size (256 KiB).
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
