@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "snowdrive",
     "crates/snowcommon",
     "crates/snowscsi",
     "crates/snow9660",

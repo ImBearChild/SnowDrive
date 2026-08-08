@@ -1,0 +1,32 @@
+[package]
+name = "snowdrive"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit (lib crate)"
+
+[features]
+# Default: desktop PC environment — all commonly used features.
+default = ["std", "scsi", "iscsi", "iso9660"]
+
+# Platform feature.
+std = []
+
+# Core features (independent).
+scsi = []
+iso9660 = []
+
+# Composite features (depend on others).
+iscsi = ["scsi"]
+cdrom = ["scsi", "iso9660"]
+
+# Optional features.
+capi = ["std"]
+log = ["dep:log"]
+defmt = ["dep:defmt"]
+
+[dependencies]
+embedded-io = "0.7"
+heapless = "0.8"
+log = { version = "0.4", optional = true, default-features = false }
+defmt = { version = "1", optional = true }

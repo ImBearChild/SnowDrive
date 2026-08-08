@@ -603,6 +603,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "snow9660"
 version = "0.1.0"
+dependencies = [
+ "heapless",
+]
 
 [[package]]
 name = "snow9660-cli"
@@ -614,6 +617,16 @@ dependencies = [
 
 [[package]]
 name = "snowcommon"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "embedded-io",
+ "heapless",
+ "log",
+]
+
+[[package]]
+name = "snowdrive"
 version = "0.1.0"
 dependencies = [
  "defmt",
