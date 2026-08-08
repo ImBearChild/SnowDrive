@@ -14,4 +14,5 @@ defmt = ["snowcommon/defmt"]
 [dependencies]
 snowcommon = { path = "../snowcommon" }
 embedded-io = "0.7"
+heapless = "0.8"
 log = { version = "0.4", optional = true, default-features = false }

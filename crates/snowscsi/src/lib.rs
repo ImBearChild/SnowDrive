@@ -8,6 +8,9 @@
 //! - [`backend`]: file block backend + re-exports of the storage seam
 //!   (`BlockStorage` / `BlockStorageError` / `RamBackend` live in
 //!   `snowcommon::block_storage`)
+//! - [`fs_backend`]: filesystem backend + re-exports of the FS seam
+//!   (`FsStorage` / `FsError` / `DirEntry` / `FileHandle` live in
+//!   `snowcommon::fs_storage`) — `std` feature only
 //! - [`spc`]: SPC command parsing + shared execution (INQUIRY, MODE SENSE, ...)
 //! - [`sbc`]: SBC command parsing + execution (block device set, SBC-3 §5)
 //! - [`block`]: SBC block device command set (block.c)
@@ -19,7 +22,8 @@
 //! - [`iscsi_target`]: iSCSI target session state machine (RFC 3720 §5/§10)
 //!
 //! ## Features
-//! - `std` (default): enables BSD transport (TcpStream), FileBackend
+//! - `std` (default): enables BSD transport (TcpStream), FileBackend,
+//!   StdFsBackend
 
 pub mod backend;
 pub mod block;
@@ -27,6 +31,8 @@ pub mod block;
 pub mod cdblock;
 pub mod conn;
 pub mod device;
+#[cfg(feature = "std")]
+pub mod fs_backend;
 pub mod iscsi_pdu;
 pub mod iscsi_target;
 pub mod sbc;
@@ -41,6 +47,8 @@ pub use block::BlockDevice;
 pub use cdblock::CDBlockDevice;
 pub use conn::Conn;
 pub use device::{CommandOutcome, Device, DeviceType, Error, ScsiDevice};
+#[cfg(feature = "std")]
+pub use fs_backend::{FsBackend, StdFsBackend};
 pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};
 pub use iscsi_target::{
     serve_conn, LoginStage, NegotiatedParams, Session, StepResult, TargetError,
@@ -57,6 +65,7 @@ pub use transport::{serve, TcpConn};
 pub const MIN_WORK_LEN: usize = 48 + 8192;
 
 pub use snowcommon;
+pub use snowcommon::fs_storage::{DirEntry, FileHandle, FsError, FsStorage, OpenOptions};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
