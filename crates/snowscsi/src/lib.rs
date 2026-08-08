@@ -29,6 +29,7 @@ pub mod backend;
 pub mod block;
 #[cfg(feature = "std")]
 pub mod cdblock;
+pub mod cdrom;
 pub mod cdrom_common;
 pub mod conn;
 pub mod device;
