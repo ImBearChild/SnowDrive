@@ -17,8 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::backend::BlockStorage;
-use crate::block::BlockDevice;
+use crate::device::ScsiDevice;
 use crate::iscsi_target::{serve_conn, Session, TargetError};
 
 /// Default read timeout guarding login / command loop / Data-Out.
@@ -75,11 +74,11 @@ impl embedded_io::Write for TcpConn {
 /// Note: `std::net::TcpListener::bind` uses the OS default listen backlog
 /// (SOMAXCONN), not the C `listen(fd, 1)`; the serial loop still queues a
 /// second connection in the backlog until the current one ends.
-pub fn serve<B: BlockStorage>(
+pub fn serve<D: ScsiDevice>(
     listener: TcpListener,
     stop: &AtomicBool,
     work: &mut [u8],
-    devs: &mut [BlockDevice<B>],
+    devs: &mut [D],
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_WORK_LEN {

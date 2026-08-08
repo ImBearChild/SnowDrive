@@ -5,8 +5,8 @@
 //! READ commands return an empty `immediate` and the target reads the
 //! backend at `byte_offset`.
 
-use crate::backend::BlockStorage;
-use crate::device::{CommandOutcome, DeviceType, Error};
+use crate::backend::{BlockStorage, BlockStorageError};
+use crate::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 use crate::sbc::{execute_sbc, parse_sbc, SbcCommand};
 use crate::scsi::{asc, Sense, SenseKey};
 use crate::spc::{
@@ -273,6 +273,33 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
 
     fn set_prevent(&mut self, prevent: bool) {
         self.prevent_removal = prevent;
+    }
+}
+
+impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
+    fn do_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        work: &'a mut [u8],
+        dsl: usize,
+    ) -> Result<CommandOutcome<'a>, Error> {
+        self.do_cmd(cdb, work, dsl)
+    }
+
+    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        self.read_data(byte_offset, buf)
+    }
+
+    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        self.write_data(byte_offset, buf)
+    }
+
+    fn sense(&self) -> &Sense {
+        self.sense()
+    }
+
+    fn device_type(&self) -> DeviceType {
+        self.device_type()
     }
 }
 

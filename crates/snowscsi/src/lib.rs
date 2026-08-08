@@ -40,7 +40,7 @@ pub use block::BlockDevice;
 #[cfg(feature = "std")]
 pub use cdblock::CDBlockDevice;
 pub use conn::Conn;
-pub use device::{CommandOutcome, DeviceType, Error};
+pub use device::{CommandOutcome, Device, DeviceType, Error, ScsiDevice};
 pub use iscsi_pdu::{cdb_len_from_opcode, iscsi_opcode_name, pdu_pad_len, Bhs};
 pub use iscsi_target::{
     serve_conn, LoginStage, NegotiatedParams, Session, StepResult, TargetError,

@@ -12,16 +12,14 @@
 //! rejected PDU header + ITT=0xffffffff (#18), and read-timeout coverage is
 //! delegated to the `Conn` implementation (#10/#20).
 
-use crate::block::BlockDevice;
 use crate::conn::{read_exact, write_all, Conn};
-use crate::device::CommandOutcome;
+use crate::device::{CommandOutcome, ScsiDevice};
 use crate::iscsi_pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
     BHS_SIZE, MAX_DATA_SEGMENT,
 };
 use crate::scsi::op as scsi_op;
 use crate::scsi::{opcode_name, Sense};
-use crate::BlockStorage;
 
 /// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
 const LOGIN_MAX: usize = 4096;
@@ -228,11 +226,11 @@ impl Session {
     /// (Login → Login Response; SCSI Command → full Data-In/Data-Out flow and
     /// final status; TMF / NOP / Logout → response). `work` must be at least
     /// [`crate::MIN_WORK_LEN`] bytes.
-    pub fn step<C: Conn, B: BlockStorage>(
+    pub fn step<C: Conn, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        devs: &mut [BlockDevice<B>],
+        devs: &mut [D],
     ) -> StepResult {
         if work.len() < crate::MIN_WORK_LEN {
             return StepResult::Error(TargetError::WorkBufTooSmall);
@@ -432,11 +430,11 @@ impl Session {
 
     // ── Full Feature: SCSI Command ────────────────────────────────
 
-    fn handle_scsi_cmd<C: Conn + ?Sized, B: BlockStorage>(
+    fn handle_scsi_cmd<C: Conn + ?Sized, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        devs: &mut [BlockDevice<B>],
+        devs: &mut [D],
         pdu: &Pdu,
     ) -> StepResult {
         let bhs = &pdu.bhs;
@@ -608,11 +606,11 @@ impl Session {
     }
 
     /// Send chunked Data-In for a backend READ (RFC 3720 §10.7).
-    fn send_read_data<C: Conn + ?Sized, B: BlockStorage>(
+    fn send_read_data<C: Conn + ?Sized, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        dev: &mut BlockDevice<B>,
+        dev: &mut D,
         itt: u32,
         transfer_len: u64,
         byte_offset: u64,
@@ -676,11 +674,11 @@ impl Session {
     /// Write flow: R2T(s) → Data-Out → final status. `received` bytes have
     /// already been written to the backend (immediate data).
     #[allow(clippy::too_many_arguments)]
-    fn send_write_flow<C: Conn + ?Sized, B: BlockStorage>(
+    fn send_write_flow<C: Conn + ?Sized, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
-        dev: &mut BlockDevice<B>,
+        dev: &mut D,
         itt: u32,
         transfer_len: u64,
         byte_offset: u64,
@@ -1006,11 +1004,11 @@ impl core::error::Error for TargetError {}
 ///
 /// Validates `work.len() >= MIN_WORK_LEN` up front. I/O errors inside `step`
 /// surface as `Closed`; only caller bugs propagate as `Err`.
-pub fn serve_conn<C: Conn, B: BlockStorage>(
+pub fn serve_conn<C: Conn, D: ScsiDevice>(
     conn: &mut C,
     work: &mut [u8],
     session: &mut Session,
-    devs: &mut [BlockDevice<B>],
+    devs: &mut [D],
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_WORK_LEN {
         return Err(TargetError::WorkBufTooSmall);

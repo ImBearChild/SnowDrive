@@ -8,7 +8,7 @@
 //! `std`-gated (`RamBackend` images are not supported).
 
 use crate::backend::{BlockStorage, BlockStorageError, FileBackend};
-use crate::device::{CommandOutcome, DeviceType, Error};
+use crate::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 use crate::scsi::{
     asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, Sense, SenseKey,
@@ -454,6 +454,35 @@ impl SpcDevice for CDBlockDevice {
 
     fn set_prevent(&mut self, prevent: bool) {
         self.prevent_removal = prevent;
+    }
+}
+
+impl ScsiDevice for CDBlockDevice {
+    fn do_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        work: &'a mut [u8],
+        dsl: usize,
+    ) -> Result<CommandOutcome<'a>, Error> {
+        self.do_cmd(cdb, work, dsl)
+    }
+
+    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        self.read_data(byte_offset, buf)
+    }
+
+    fn write_data(&mut self, _byte_offset: u64, _buf: &[u8]) -> Result<(), BlockStorageError> {
+        // do_cmd never yields DataOut for this read-only device (every write
+        // command returns DATA PROTECT); a direct write is still refused.
+        Err(BlockStorageError::NotWritable)
+    }
+
+    fn sense(&self) -> &Sense {
+        self.sense()
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cdrom
     }
 }
 
