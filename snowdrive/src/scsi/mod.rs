@@ -25,6 +25,8 @@ pub mod block;
 pub mod cdblock;
 pub mod cdrom;
 pub mod cdrom_common;
+#[cfg(feature = "livefs")]
+pub mod cdrom_livefs;
 pub mod device;
 #[cfg(feature = "std")]
 pub mod fs_backend;
