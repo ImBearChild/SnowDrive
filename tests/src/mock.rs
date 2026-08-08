@@ -1138,4 +1138,117 @@ mod tests {
 
         let _ = std::fs::remove_file(&iso);
     }
+
+    // ── Mixed heterogeneous LUNs: Device enum (Block + CdFlat + CdLiveFs) ──
+
+    #[test]
+    fn mixed_lun_block_cdflat_and_livefs_dispatch() {
+        use snowdrive::scsi::backend::{BlockBackend, FileBackend};
+        use snowdrive::scsi::cdrom::CdromDevice;
+        use snowdrive::scsi::cdrom_livefs::CdLiveFsDevice;
+        use snowdrive::scsi::device::Device;
+        use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
+
+        // LUN 1 source: a flat ISO file (0xCD sectors).
+        let dir = std::env::temp_dir();
+        let iso = dir.join(format!("snowscsi_mock_cdflat_{}.iso", std::process::id()));
+        std::fs::write(&iso, vec![0xCDu8; 2048 * 32]).unwrap();
+
+        // LUN 2 source: a live directory tree with one file (DATA.BIN).
+        let tree = dir.join(format!("snowscsi_mock_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("DATA.BIN"), vec![0x42u8; 4096]).unwrap();
+
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let d0 = Device::Block(
+            BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
+        );
+        let flat = CdromDevice::new(BlockBackend::File(
+            FileBackend::open(iso.to_str().unwrap(), false).unwrap(),
+        ));
+        let d1 = Device::CdFlat(flat);
+        // Extract the live file's LBA before moving the device into the enum.
+        let live = CdLiveFsDevice::new(
+            FsBackend::Std(StdFsBackend::new(&tree.to_string_lossy())),
+            "TEST",
+        )
+        .unwrap();
+        let live_lba = live.layout().extents[0].lba;
+        let d2 = Device::CdLiveFs(live);
+        let mut devs = [d0, d1, d2];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // INQUIRY: LUN 0 → PDT 0x00, LUN 1/2 → PDT 0x05.
+        for (lun, pdt) in [(0u8, 0x00u8), (1, 0x05), (2, 0x05)] {
+            conn.feed(&inquiry_bhs(lun, 96, 0x0100 + lun as u32, lun as u32), &[]);
+            assert_eq!(
+                session.step(&mut conn, &mut work, &mut devs),
+                StepResult::Processed
+            );
+            let (bhs, data) = conn.take_pdu().unwrap();
+            assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+            assert_eq!(bhs[3], status::GOOD);
+            assert_eq!(data[0], pdt, "LUN {lun} must report PDT {pdt:#x}");
+        }
+
+        // READ(10) LUN 1, LBA 0, 1 sector → the flat ISO bytes stream back.
+        let mut read = read10_bhs(0, 1, 0x0201, 3);
+        read[9] = 1;
+        conn.feed(&read, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(data.len(), 2048);
+        assert_eq!(&data[..4], &[0xCD; 4]);
+
+        // READ(10) LUN 2 at the live file's LBA → DATA.BIN content (0x42).
+        let mut read = read10_bhs(live_lba, 1, 0x0202, 4);
+        read[9] = 2;
+        conn.feed(&read, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(data.len(), 2048);
+        assert_eq!(&data[..4], &[0x42; 4]);
+
+        // WRITE(10) to either read-only CD-ROM LUN → CHECK CONDITION.
+        let mut write = write10_bhs(0, 1, 0x0301, 5, 0);
+        write[9] = 2;
+        conn.feed(&write, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::CHECK_CONDITION);
+
+        // REPORT LUNS lists all three LUNs.
+        conn.feed(&report_luns_bhs(0, 0x0401, 6), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (_, data) = conn.take_pdu().unwrap();
+        assert_eq!(&data[..4], &[0, 0, 0, 24]); /* 3 × 8-byte LUN entries */
+        assert_eq!(data[8 + 1], 0);
+        assert_eq!(data[16 + 1], 1);
+        assert_eq!(data[24 + 1], 2);
+
+        let _ = std::fs::remove_file(&iso);
+        let _ = std::fs::remove_dir_all(&tree);
+    }
 }
