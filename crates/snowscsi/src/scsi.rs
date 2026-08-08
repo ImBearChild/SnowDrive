@@ -31,6 +31,7 @@ pub mod op {
 
     // MMC-6 (CD/DVD) opcodes.
     pub const READ_TOC: u8 = 0x43;
+    pub const GET_CONFIGURATION: u8 = 0x46;
 }
 
 /// Additional sense codes (SPC-4 §4.5.6).
@@ -204,6 +205,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::PREVENT_ALLOW => "PREVENT_ALLOW",
         op::START_STOP_UNIT => "START_STOP_UNIT",
         op::READ_TOC => "READ_TOC",
+        op::GET_CONFIGURATION => "GET_CONFIGURATION",
         _ => "UNKNOWN",
     }
 }

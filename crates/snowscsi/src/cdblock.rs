@@ -140,6 +140,7 @@ impl CDBlockDevice {
                     self.read_capacity_16_cmd(cdb[1], alloc, work)
                 }
                 op::READ_TOC => self.read_toc_cmd(cdb, work),
+                op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, work),
                 op::WRITE_6
                 | op::WRITE_10
                 | op::WRITE_12
@@ -324,6 +325,99 @@ impl CDBlockDevice {
         let f = v % 75;
         [0x00, m as u8, s as u8, f as u8]
     }
+
+    /// GET CONFIGURATION (0x46) — minimal implementation (MMC-6 §6.5).
+    ///
+    /// Returns the Current Profile (0x0008 CD-ROM for images ≤ 700 MiB,
+    /// 0x0010 DVD-ROM otherwise, plan §8.1b) and four feature descriptors:
+    /// Core (0x0001), Removable Medium (0x0003), Random Readable (0x0010,
+    /// logical block size 2048) and CD Read (0x001E). RT=00b/01b return all
+    /// features; RT=10b filters to the Starting Feature Number and higher;
+    /// RT=11b is rejected. The response is clamped to the allocation length
+    /// without shrinking the Data Length field.
+    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+        let rt = cdb[1] & 0x03;
+        let start = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+
+        if rt == 0x03 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+
+        let mut buf = [0u8; 44];
+        let profile = self.current_profile();
+        buf[6] = (profile >> 8) as u8;
+        buf[7] = profile as u8;
+
+        // RT=10b: only the Starting Feature Number and higher are returned.
+        let include = |code: u16| rt != 0x02 || code >= start;
+        let mut off = 8usize;
+
+        // Core (0x0001): version 0010b, persistent, current; additional
+        // length 8 — physical interface standard (SCSI family) + INQ2/DBE.
+        if include(0x0001) {
+            buf[off] = 0x00;
+            buf[off + 1] = 0x01;
+            buf[off + 2] = 0x03;
+            buf[off + 3] = 0x08;
+            buf[off + 4..off + 8].copy_from_slice(&[0, 0, 0, 1]); /* SCSI family */
+            buf[off + 8] = 0x06; /* INQ2 | DBE */
+            off += 12;
+        }
+
+        // Removable Medium (0x0003): current; no dependent data.
+        if include(0x0003) {
+            buf[off] = 0x00;
+            buf[off + 1] = 0x03;
+            buf[off + 2] = 0x01; /* current */
+            off += 4;
+        }
+
+        // Random Readable (0x0010): current; additional length 8 — logical
+        // block size 2048, blocking 1, no error-recovery page (PP=0).
+        if include(0x0010) {
+            buf[off] = 0x00;
+            buf[off + 1] = 0x10;
+            buf[off + 2] = 0x01; /* current */
+            buf[off + 3] = 0x08;
+            buf[off + 4..off + 8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
+            buf[off + 8] = 0x00;
+            buf[off + 9] = 0x01; /* blocking = 1 */
+            off += 12;
+        }
+
+        // CD Read (0x001E): version 0010b, current; additional length 4 —
+        // DAP/C2/CD-Text all clear.
+        if include(0x001E) {
+            buf[off] = 0x00;
+            buf[off + 1] = 0x1E;
+            buf[off + 2] = 0x03;
+            buf[off + 3] = 0x04;
+            off += 8;
+        }
+
+        // Data Length = descriptor bytes following the 8-byte header.
+        let data_len = (off - 8) as u32;
+        buf[0..4].copy_from_slice(&data_len.to_be_bytes());
+
+        let n = off.min(alloc as usize);
+        work[48..48 + n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &work[48..48 + n],
+        }
+    }
+
+    /// Current profile for GET CONFIGURATION: CD-ROM up to 700 MiB, DVD-ROM
+    /// beyond (plan §8.1b / §8.2 profile table).
+    fn current_profile(&self) -> u16 {
+        if self.capacity() <= 700 * 1024 * 1024 {
+            0x0008
+        } else {
+            0x0010
+        }
+    }
 }
 
 impl SpcDevice for CDBlockDevice {
@@ -381,6 +475,22 @@ mod tests {
             let dir = std::env::temp_dir();
             let path = dir.join(format!("snowscsi_cdblock_{}_{}.iso", std::process::id(), n));
             std::fs::write(&path, vec![0u8; len as usize]).unwrap();
+            Self { path }
+        }
+
+        /// Sparse temp file of `len` bytes (no backing disk blocks) — used
+        /// for capacity-derived behavior without allocating the image.
+        fn sparse(len: u64) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!(
+                "snowscsi_cdblock_sparse_{}_{}.iso",
+                std::process::id(),
+                n
+            ));
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(len).unwrap();
             Self { path }
         }
 
@@ -1151,5 +1261,145 @@ mod tests {
             check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
             (SenseKey::IllegalRequest, asc::INVALID_FIELD)
         );
+    }
+
+    fn make_cdb_get_configuration(rt: u8, start: u16, alloc: u16) -> [u8; 10] {
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::GET_CONFIGURATION;
+        cdb[1] = rt & 0x03;
+        cdb[2] = (start >> 8) as u8;
+        cdb[3] = start as u8;
+        cdb[7] = (alloc >> 8) as u8;
+        cdb[8] = alloc as u8;
+        cdb
+    }
+
+    #[test]
+    fn cdblock_get_configuration_cd_profile_full_features() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_get_configuration(0x00, 0x0000, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 44);
+
+        // Header: data length 36, reserved, current profile CD-ROM.
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x24]);
+        assert_eq!(buf[4], 0);
+        assert_eq!(buf[5], 0);
+        assert_eq!(buf[6], 0x00);
+        assert_eq!(buf[7], 0x08); /* CD-ROM */
+
+        // Core (0x0001): version 2 + persistent + current, addlen 8,
+        // SCSI-family physical interface, INQ2|DBE.
+        assert_eq!(&buf[8..10], &[0x00, 0x01]);
+        assert_eq!(buf[10], 0x03);
+        assert_eq!(buf[11], 0x08);
+        assert_eq!(&buf[12..16], &[0, 0, 0, 1]);
+        assert_eq!(buf[16], 0x06);
+
+        // Removable Medium (0x0003): current, no dependent data.
+        assert_eq!(&buf[20..22], &[0x00, 0x03]);
+        assert_eq!(buf[22], 0x01);
+        assert_eq!(buf[23], 0x00);
+
+        // Random Readable (0x0010): current, addlen 8, block size 2048.
+        assert_eq!(&buf[24..26], &[0x00, 0x10]);
+        assert_eq!(buf[26], 0x01);
+        assert_eq!(buf[27], 0x08);
+        assert_eq!(&buf[28..32], &[0x00, 0x00, 0x08, 0x00]); /* 2048 */
+        assert_eq!(&buf[32..34], &[0x00, 0x01]); /* blocking 1 */
+
+        // CD Read (0x001E): version 2 + current, addlen 4, flags clear.
+        assert_eq!(&buf[36..38], &[0x00, 0x1E]);
+        assert_eq!(buf[38], 0x03);
+        assert_eq!(buf[39], 0x04);
+        assert_eq!(&buf[40..44], &[0u8; 4]);
+    }
+
+    #[test]
+    fn cdblock_get_configuration_dvd_profile_over_700_mib() {
+        // Sparse 701 MiB image — capacity-derived profile, no disk blocks.
+        let f = TempFile::sparse(701 * 1024 * 1024);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_get_configuration(0x00, 0x0000, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 44);
+        assert_eq!(buf[6], 0x00);
+        assert_eq!(buf[7], 0x10); /* DVD-ROM */
+    }
+
+    #[test]
+    fn cdblock_get_configuration_starting_feature_filters() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+
+        // RT=10b, start 0x0010 → Random Readable + CD Read (12 + 8 = 20).
+        let cdb = make_cdb_get_configuration(0x02, 0x0010, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 28);
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x14]); /* data len 20 */
+        assert_eq!(&buf[8..10], &[0x00, 0x10]);
+        assert_eq!(&buf[20..22], &[0x00, 0x1E]);
+
+        // RT=10b, start 0x001E → CD Read only (8 bytes).
+        let cdb = make_cdb_get_configuration(0x02, 0x001E, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 16);
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x08]);
+        assert_eq!(&buf[8..10], &[0x00, 0x1E]);
+
+        // RT=10b, start 0x0020 (unsupported) → header only, data length 0.
+        let cdb = make_cdb_get_configuration(0x02, 0x0020, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(&buf[0..4], &[0u8; 4]);
+        assert_eq!(buf[7], 0x08);
+    }
+
+    #[test]
+    fn cdblock_get_configuration_rt_current_only_same_result() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_get_configuration(0x01, 0x0000, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 44);
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x24]);
+    }
+
+    #[test]
+    fn cdblock_get_configuration_rt_reserved_rejected() {
+        use crate::scsi::asc;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_get_configuration(0x03, 0x0000, 64);
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
+    }
+
+    #[test]
+    fn cdblock_get_configuration_alloc_clamp_keeps_data_length() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_get_configuration(0x00, 0x0000, 8);
+        let mut buf = [0u8; 8];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 8); /* header only */
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x24]); /* full data length */
+        assert_eq!(buf[7], 0x08);
     }
 }
