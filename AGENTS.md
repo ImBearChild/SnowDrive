@@ -37,15 +37,20 @@ tracked by git.
 
 ```
 snowdrive/
-├── Cargo.toml            # virtual workspace
-├── crates/
-│   ├── snowcommon/       # [no_std 零 alloc] logging + hex formatting
-│   ├── snowscsi/         # [no_std 零 alloc; std feature] SCSI core + iSCSI target
-│   ├── snow9660/         # [no_std 零 alloc] ISO9660 stub
-│   ├── snowscsi-capi/    # C ABI bindings (unsafe-allowed)
-│   ├── snowscsi-cli/     # binary: serve command
-│   ├── snow9660-cli/     # binary: list command (stub)
-├── tests/                # Integration tests crate (snowdrive-tests; MockConn folded in)
+├── Cargo.toml            # workspace: snowdrive lib + 2 bins + tests
+├── snowdrive/            # unified lib crate (feature-gated modules)
+│   ├── src/
+│   │   ├── lib.rs        # #![no_std] (unless std feature); deny(unsafe_code)
+│   │   ├── common/       # always on: BlockStorage/FsStorage seams + logging macros
+│   │   ├── scsi/         # feature "scsi": SCSI core, block/cdblock/cdrom, spc/sbc
+│   │   ├── iscsi/        # feature "iscsi": PDU codec, Conn, target, transport
+│   │   └── iso9660/      # feature "iso9660": ISO9660/Joliet live-generation
+│   ├── build.rs          # cbindgen (feature "capi")
+│   └── cbindgen.toml
+├── bins/
+│   ├── snowscsi/         # binary: serve command (std)
+│   └── snow9660/         # binary: list command (stub)
+├── tests/                # integration tests crate (snowdrive-tests; MockConn folded in)
 └── ...
 ```
 
@@ -53,11 +58,12 @@ snowdrive/
 
 | Component | Status |
 |-----------|--------|
-| `snowscsi` | Pending: SBC + RAM backend + iSCSI PDU/target loop to be ported from C |
-| `snow9660` | Stub (version string only) |
-| `snowscsi-cli` | Stub (help text only) |
-| `snow9660-cli` | Stub (help text only) |
-| `snowscsi-capi` | Stub (cbindgen configured, no exported functions yet) |
+| `snowdrive::scsi` | Done — SBC + RAM/File backends + SPC/SBC layers + block/cdblock/cdrom devices + iSCSI PDU/target loop |
+| `snowdrive::iscsi` | Done — PDU codec, Conn trait, Session state machine, BSD transport |
+| `snowdrive::iso9660` | Done — live ISO9660/Joliet generation algorithms (`live.rs`) |
+| `snowdrive::capi` | Postponed — C ABI (`feature = "capi"` declared, no exports yet) |
+| `bins/snowscsi` | Done — `serve` subcommand (--block / --cdblock / --iscsi) |
+| `bins/snow9660` | Stub — `list` subcommand (help text only) |
 
 ## Legacy C Code
 
@@ -68,15 +74,18 @@ git checkout legacy
 
 ## Agent-Only Context
 
-- **Logging**: `snowcommon` provides unified logging macros (`trace!`/`debug!`/
-  `info!`/`warn!`/`error!`) that dispatch to `log` or `defmt` via features.
-  Log output routing is the caller's responsibility.
+- **Logging**: `snowdrive::common` provides unified logging macros (`trace!`/
+  `debug!`/`info!`/`warn!`/`error!`) that dispatch to `log` or `defmt` via
+  features. Log output routing is the caller's responsibility.
 - **Tests**: `cargo test --workspace`. Integration tests (mock + libiscsi
   whitebox) live in `tests/` crate.
-- **no_std verification**: `cargo build -p snowscsi -p snowcommon -p snowscsi-capi --no-default-features`
+- **no_std verification**: `cargo build -p snowdrive --no-default-features`
 - **Transport layer**: `Conn` trait = blanket impl of `embedded_io::Read + Write`.
-  BSD transport (`TcpStream`) behind `std` feature in `snowscsi`.
-- **C ABI**: `snowscsi-capi` wraps borrow-based core with `OpaqueHandle` +
-  C-style mirror API. `cbindgen` generates `snowscsi.h` via build.rs.
-- **Red lines**: `#![forbid(unsafe_code)]` on all crates except `snowscsi-capi`
-  and `snowdrive-tests`. RFC 3720 only, no RFC 7143. `__*` files never committed.
+  BSD transport (`TcpStream`) behind `std` feature in `snowdrive::iscsi`.
+- **C ABI**: postponed. When resumed, `snowdrive::capi` (`feature = "capi"`)
+  wraps the borrow-based core with `OpaqueHandle` + C-style mirror API;
+  `cbindgen` generates `snowscsi.h` via build.rs.
+- **Red lines**: `#![deny(unsafe_code)]` on the snowdrive lib (forbid would
+  block the future `capi` module, which opts back in via `#[allow(unsafe_code)]`).
+  `snowdrive-tests` allows unsafe (libiscsi FFI). RFC 3720 only, no RFC 7143.
+  `__*` files never committed.

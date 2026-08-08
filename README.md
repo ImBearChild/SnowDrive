@@ -12,13 +12,13 @@ and exposes them to a host machine via iSCSI.
 
 | Component | Crate | Description |
 |-----------|-------|-------------|
-| **snowcommon** | `snowcommon` | Zero-alloc logging and hex formatting (`no_std`) |
-| **SCSI core + iSCSI** | `snowscsi` | SCSI device emulation, block device (SBC), iSCSI target (`no_std` + `std` feature) |
-| **ISO9660** | `snow9660` | ISO9660 + Joliet filesystem library (`no_std`) |
-| **C API** | `snowscsi-capi` | C ABI bindings (unsafe-allowed, cbindgen) |
-| **CLI — serve** | `snowscsi-cli` | `snowscsi serve` starts iSCSI target |
-| **CLI — list** | `snow9660-cli` | `snow9660 list` prints ISO directory tree |
-| **Mock** | `snowscsi-mock` | Deterministic mock `Conn` for testing |
+| **Unified lib** | `snowdrive` | SCSI emulation, block/CD-ROM devices, iSCSI target, ISO9660 algorithms (`no_std` + `std` feature; module-gated) |
+| — storage seams | `snowdrive::common` | Zero-alloc `BlockStorage` / `FsStorage` + unified logging macros |
+| — SCSI + iSCSI | `snowdrive::scsi` / `::iscsi` | Block/CD-ROM devices (SBC/SPC/MMC), iSCSI PDU + target |
+| — ISO9660 | `snowdrive::iso9660` | ISO9660 + Joliet live-generation algorithms |
+| **CLI — serve** | `bins/snowscsi` | `snowscsi serve` starts iSCSI target |
+| **CLI — list** | `bins/snow9660` | `snow9660 list` prints ISO directory tree (stub) |
+| **Tests** | `snowdrive-tests` | Mock + libiscsi whitebox integration tests |
 
 ## Build
 
@@ -61,10 +61,9 @@ iscsiadm -m node -T iqn.2025-01.local.snowscsi:target -p 127.0.0.1:3260 --login
 
 ## Project Status
 
-- [x] Phase 1 skeleton: Rust workspace, crate stubs, build system
-- [ ] Phase 1: SCSI core + block device (SBC) + iSCSI target (port from C)
-- [ ] Phase 1: C ABI (`snowscsi-capi`)
-- [ ] Phase 2: Read-only optical drive (CD-ROM) + Live ISO mode
+- [x] Unified `snowdrive` lib crate: SCSI core + block/CD-ROM devices (SBC/SPC/MMC) + iSCSI target + ISO9660 algorithms
+- [x] `snowscsi serve` CLI: `--block` (ram/path,ro) + `--cdblock` + multi-LUN + graceful shutdown
+- [ ] C ABI (`snowdrive::capi`, feature-gated) — postponed
 - [ ] Phase 3: Writable optical drive (CD-R) + disc bundle export
 - [ ] Phase 4: Rewritable optical drive (CD-RW)
 - [ ] Phase 5: Advanced features (audio tracks, multi-session, READ CD)
@@ -73,18 +72,34 @@ iscsiadm -m node -T iqn.2025-01.local.snowscsi:target -p 127.0.0.1:3260 --login
 
 ```
 snowdrive/
-├── Cargo.toml            # virtual workspace
-├── crates/
-│   ├── snowcommon/       # [no_std] logging + hex
-│   ├── snowscsi/         # [no_std + std] SCSI + iSCSI
-│   ├── snow9660/         # [no_std] ISO9660 stub
-│   ├── snowscsi-capi/    # C ABI (unsafe-allowed)
-│   ├── snowscsi-cli/     # binary: serve
-│   ├── snow9660-cli/     # binary: list
-│   └── snowscsi-mock/    # mock Conn
-├── tests/                # integration tests (snowdrive-tests)
+├── Cargo.toml            # workspace: lib + 2 bins + tests
+├── snowdrive/            # unified lib crate (feature-gated modules)
+│   ├── src/
+│   │   ├── lib.rs        # common, scsi, iscsi, iso9660
+│   │   ├── common/       # storage seams + logging macros (always on)
+│   │   ├── scsi/         # SCSI core, block/cdblock/cdrom, spc/sbc, backends
+│   │   └── iscsi/        # PDU codec, Conn, target, transport
+├── bins/
+│   ├── snowscsi/         # iSCSI target CLI (binary)
+│   └── snow9660/         # ISO9660 CLI (binary, stub)
+├── tests/                # integration tests (mock + libiscsi whitebox)
 ├── LICENSE-APACHE        # Apache-2.0
 └── LICENSE-MIT           # MIT
+```
+
+## Library Usage
+
+The `snowdrive` lib is feature-gated — pick only what you need:
+
+```toml
+# SCSI core only (embedded block device)
+snowdrive = { version = "0.1", default-features = false, features = ["scsi"] }
+
+# SCSI + iSCSI over TCP (network block device)
+snowdrive = { version = "0.1", default-features = false, features = ["std", "scsi", "iscsi"] }
+
+# Full desktop build (default)
+snowdrive = { version = "0.1" }
 ```
 
 ## Legacy C Code

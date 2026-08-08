@@ -2,41 +2,48 @@
 
 ## Project Structure
 
-SCSI device emulation toolkit — Rust workspace (cargo).
+SCSI device emulation toolkit — unified Rust lib crate + two binaries.
 
-| Component | Description |
-|-----------|-------------|
-| **snowcommon** | Zero-alloc logging and hex formatting (`no_std`) |
-| **snowscsi** | SCSI device emulation + iSCSI target protocol (`no_std` + optional `std` feature) |
-| **snow9660** | ISO9660 + Joliet filesystem library (Phase 1 stub, `no_std`) |
-| **snowscsi-capi** | C ABI bindings for snowscsi |
-| **snowscsi-cli** | CLI — `serve` command starts iSCSI target |
-| **snow9660-cli** | CLI — `list` command prints ISO directory tree (stub) |
-| **snowdrive-tests** | Integration tests crate (MockConn folded in + libiscsi whitebox) |
+| Component | Location | Description |
+|-----------|----------|-------------|
+| **snowdrive** | `snowdrive/` | Unified lib crate (`no_std` + `std` feature) |
+| — `common` | `snowdrive/src/common/` | Zero-alloc storage seams (`BlockStorage` / `FsStorage`) + unified logging macros |
+| — `scsi` | `snowdrive/src/scsi/` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), file/fs backends |
+| — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
+| — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
+| **snowscsi** | `bins/snowscsi/` | Binary — `snowscsi serve` starts iSCSI target |
+| **snow9660** | `bins/snow9660/` | Binary — `snow9660 list` prints ISO directory tree (stub) |
+| **snowdrive-tests** | `tests/` | Integration tests crate (MockConn folded in + libiscsi whitebox) |
 
 ```
 snowdrive/
-├── Cargo.toml            # virtual workspace
+├── Cargo.toml            # workspace: lib + 2 bins + tests
 ├── Cargo.lock
-├── crates/
-│   ├── snowcommon/       # [no_std 零 alloc]
-│   ├── snowscsi/         # [no_std 零 alloc; std feature]
-│   ├── snow9660/         # [no_std 零 alloc] stub
-│   ├── snowscsi-capi/    # C ABI
-│   ├── snowscsi-cli/     # binary
-│   └── snow9660-cli/     # binary
-├── tests/                # integration tests crate (mock + libiscsi)
+├── snowdrive/            # unified lib crate (feature-gated modules)
+│   ├── src/
+│   │   ├── lib.rs        # common, scsi, iscsi, iso9660 (feature-gated)
+│   │   ├── common/       # BlockStorage / FsStorage seams + logging macros
+│   │   ├── scsi/         # SCSI core, block/cdblock/cdrom, spc/sbc, backends
+│   │   └── iscsi/        # PDU codec, Conn, target, transport
+├── bins/
+│   ├── snowscsi/         # iSCSI target CLI (binary)
+│   └── snow9660/         # ISO9660 CLI (binary, stub)
+├── tests/                # integration tests crate (mock + libiscsi whitebox)
 └── HACKING.md
 ```
 
-Crate dependency chain:
+Dependency chain:
 
 ```
-snow9660-cli ── snow9660
-snowscsi-cli ── snowscsi ── snowcommon
-snowscsi-capi ── snowscsi
-snowdrive-tests ── snowscsi
+bins/snowscsi ──┐
+bins/snow9660 ──┤── snowdrive
+snowdrive-tests ┘
 ```
+
+Feature map (`snowdrive/Cargo.toml`): `std`, `scsi`, `iscsi` (→ `scsi`),
+`iso9660`, `cdrom` (→ `scsi`+`iso9660`), `capi`, `log` / `defmt`. The lib's
+default is `["std", "scsi", "iscsi", "iso9660"]`; the `snowscsi` bin enables
+`cdrom` on top (the `--cdblock` option needs it).
 
 ## Commit Messages
 
@@ -100,6 +107,8 @@ cargo test --workspace
 2. `cargo test --workspace`
 3. `cargo fmt --check`
 4. `cargo clippy --workspace -- -D warnings`
+5. `cargo build -p snowdrive --no-default-features` — the lib must stay
+   `no_std`-clean (feature-gated std surface only)
 
 ## Code Formatting
 
