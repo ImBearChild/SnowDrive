@@ -20,7 +20,9 @@
 //! - `transport`: BSD TCP transport (gated by `std`).
 
 pub mod backend;
+pub mod block;
 pub mod device;
+pub mod sbc;
 #[allow(clippy::module_inception)]
 pub mod scsi;
 pub mod spc;

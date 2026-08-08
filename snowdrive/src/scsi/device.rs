@@ -1,10 +1,11 @@
-//! Device abstraction: result outcomes and device types (device.h).
+//! Device abstraction: result outcomes, device types, and the SCSI
+//! device seam (device.h).
 //!
-//! The SCSI device seam ([`ScsiDevice`]) and the [`Device`] enum live in
-//! `device.rs` until the rest of the leaf `snowscsi` crate is folded in.
-//! Once `block` and `cdblock` are in place, this file will grow the
-//! `ScsiDevice` trait and the `Device<'a>` enum.
+//! The [`Device<'_>`] enum (the borrowed, type-erased container that
+//! targets drive) lands here in a later commit once `cdblock` is in
+//! place.  Only the trait ([`ScsiDevice`]) + the simple types move now.
 
+use crate::scsi::backend::BlockStorageError;
 use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
@@ -70,3 +71,32 @@ impl core::fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
+
+/// The SCSI device seam: the minimal command set the iSCSI target needs from
+/// any device. The target is generic over `D: ScsiDevice`, so it can serve a
+/// homogeneous `&mut [BlockDevice<B>]` or a heterogeneous `&mut [Device<'_>]`
+/// equally.
+pub trait ScsiDevice {
+    /// Process one SCSI command. `work` must be at least
+    /// [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length of data already
+    /// received into `work[48..48+dsl]`.
+    fn do_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        work: &'a mut [u8],
+        dsl: usize,
+    ) -> Result<CommandOutcome<'a>, Error>;
+
+    /// Read `buf.len()` bytes from the backing store at `byte_offset`
+    /// (the READ data path — `CommandOutcome::DataIn` with empty
+    /// `immediate`).
+    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError>;
+
+    /// Write `buf` to the backing store at `byte_offset`
+    /// (the WRITE data path — `CommandOutcome::DataOut`).
+    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError>;
+
+    fn sense(&self) -> &Sense;
+
+    fn device_type(&self) -> DeviceType;
+}

@@ -1,8 +1,8 @@
-//! Device abstraction: re-exports the simple types from the unified
-//! `snowdrive` lib and keeps the legacy `ScsiDevice` trait + `Device` enum
-//! until the rest of the `snowscsi` crate is folded in.
+//! Re-exports the simple types from the unified `snowdrive` lib and keeps
+//! the legacy `Device<'_>` enum (which depends on `cdblock`, still in the
+//! legacy crate) until the rest of `snowscsi` is folded in.
 
-pub use snowdrive::scsi::device::{CommandOutcome, DeviceType, Error};
+pub use snowdrive::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 
 use crate::backend::{BlockBackend, BlockStorageError};
 use crate::block::BlockDevice;
@@ -10,36 +10,7 @@ use crate::block::BlockDevice;
 use crate::cdblock::CDBlockDevice;
 use crate::scsi::Sense;
 
-/// The SCSI device seam: the minimal command set the iSCSI target needs from
-/// any device (the 2f convergence, plan §9.2). The target is generic over
-/// `D: ScsiDevice`, so it can serve a homogeneous `&mut [BlockDevice<B>]`
-/// or a heterogeneous `&mut [Device<'_>]` equally.
-pub trait ScsiDevice {
-    /// Process one SCSI command. `work` must be at least
-    /// [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length of data already
-    /// received into `work[48..48+dsl]`.
-    fn do_cmd<'a>(
-        &mut self,
-        cdb: &[u8],
-        work: &'a mut [u8],
-        dsl: usize,
-    ) -> Result<CommandOutcome<'a>, Error>;
-
-    /// Read `buf.len()` bytes from the backing store at `byte_offset`
-    /// (the READ data path — `CommandOutcome::DataIn` with empty
-    /// `immediate`).
-    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError>;
-
-    /// Write `buf` to the backing store at `byte_offset`
-    /// (the WRITE data path — `CommandOutcome::DataOut`).
-    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError>;
-
-    fn sense(&self) -> &Sense;
-
-    fn device_type(&self) -> DeviceType;
-}
-
-/// Borrowed, type-erased device container (plan §3.4 / §9.2).
+/// Borrowed, type-erased device container.
 ///
 /// The `'a` lifetime unifies the RAM disk-image borrow across variants
 /// (`Block` wraps `BlockBackend<'a>`), so mock stack RAM and CLI owned
