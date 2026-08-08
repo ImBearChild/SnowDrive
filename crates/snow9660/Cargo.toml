@@ -6,3 +6,4 @@ license = "MIT OR Apache-2.0"
 description = "ISO9660 + Joliet filesystem library"
 
 [dependencies]
+heapless = "0.8"
