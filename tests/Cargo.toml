@@ -8,6 +8,9 @@ description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 [dependencies]
 snowdrive = { path = "../snowdrive", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs"] }
 embedded-io = "0.7"
+# Independent ISO9660 reader used to cross-validate the live generator's
+# output (test-only; not a dependency of the library).
+hadris-iso = { version = "1", default-features = false, features = ["std", "read", "joliet"] }
 
 [build-dependencies]
 pkg-config = "0.3"
