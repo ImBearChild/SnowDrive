@@ -13,7 +13,7 @@ use clap::{Args, Parser};
 #[command(
     name = "snow9660",
     about = "SnowDrive ISO9660 filesystem tools",
-    version = snow9660::VERSION,
+    version = snowdrive::iso9660::VERSION,
     subcommand_required = true
 )]
 enum Cli {

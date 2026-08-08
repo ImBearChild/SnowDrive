@@ -1,7 +1,3 @@
-#![no_std]
-#![forbid(unsafe_code)]
-//! ISO9660 + Joliet filesystem library (Phase 1 stub).
-
 pub mod live;
 
 /// Library version (SemVer), like `snow9660_version()` in the C stub.

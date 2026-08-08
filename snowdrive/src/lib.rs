@@ -24,6 +24,8 @@
 pub mod common;
 #[cfg(feature = "iscsi")]
 pub mod iscsi;
+#[cfg(feature = "iso9660")]
+pub mod iso9660;
 #[cfg(feature = "scsi")]
 pub mod scsi;
 

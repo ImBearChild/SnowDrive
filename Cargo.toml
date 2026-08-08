@@ -4,7 +4,6 @@ members = [
     "snowdrive",
     "crates/snowcommon",
     "crates/snowscsi",
-    "crates/snow9660",
     "crates/snowscsi-capi",
     "crates/snowscsi-cli",
     "crates/snow9660-cli",
