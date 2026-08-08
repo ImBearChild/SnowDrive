@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod tests {
     use crate::mock_conn::MockConn;
+    use snowscsi::device::ScsiDevice;
     use snowscsi::iscsi_pdu::{flag, op, reject, stage, status, tmf, tmf_response};
     use snowscsi::{BlockDevice, LoginStage, RamBackend, Session, StepResult, MIN_WORK_LEN};
 
@@ -97,11 +98,13 @@ mod tests {
     }
 
     /// One-PDU login on the given harness; returns the Login Response PDU.
-    fn login(
+    /// Generic over `D: ScsiDevice` so a homogeneous block array or a mixed
+    /// `Device` array both work.
+    fn login<D: ScsiDevice>(
         conn: &mut MockConn,
         session: &mut Session,
         work: &mut [u8],
-        devs: &mut [BlockDevice<RamBackend<'_>>],
+        devs: &mut [D],
     ) -> (Vec<u8>, Vec<u8>) {
         let text = REQ_TEXT.as_bytes();
         let bhs = login_bhs(text.len() as u32);
@@ -1033,5 +1036,102 @@ mod tests {
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::REJECT);
         assert_eq!(bhs[2], reject::INVALID_PDU_FIELD);
+    }
+
+    // ── Mixed heterogeneous LUNs: Device enum (Block + CdBlock) ───────
+
+    fn inquiry_bhs(lun: u8, alloc: u8, itt: u32, cmd_sn: u32) -> [u8; 48] {
+        let mut bhs = [0u8; 48];
+        bhs[0] = op::SCSI_CMD;
+        bhs[1] = 0x40;
+        bhs[9] = lun; // single-level LUN id (BHS byte 9)
+        bhs[16..20].copy_from_slice(&be32(itt));
+        bhs[24..28].copy_from_slice(&be32(cmd_sn));
+        bhs[28..32].copy_from_slice(&be32(cmd_sn));
+        bhs[32] = 0x12; // INQUIRY
+        bhs[36] = alloc; // allocation length (CDB byte 4)
+        bhs
+    }
+
+    #[test]
+    fn mixed_lun_block_and_cdblock_dispatch() {
+        use snowscsi::backend::BlockBackend;
+        use snowscsi::{CDBlockDevice, Device};
+
+        let dir = std::env::temp_dir();
+        let iso = dir.join(format!("snowscsi_mock_cdblock_{}.iso", std::process::id()));
+        std::fs::write(&iso, vec![0xCDu8; 2048 * 32]).unwrap();
+
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let d0 = Device::Block(
+            BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
+        );
+        let d1 = Device::CdBlock(CDBlockDevice::new(iso.to_str().unwrap()).unwrap());
+        let mut devs = [d0, d1];
+
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // INQUIRY LUN 0 → PDT 0x00 (disk).
+        conn.feed(&inquiry_bhs(0, 96, 0x0101, 0), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(data[0], 0x00, "LUN 0 must report PDT 0x00");
+
+        // INQUIRY LUN 1 → PDT 0x05 (CD-ROM).
+        conn.feed(&inquiry_bhs(1, 96, 0x0102, 1), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(data[0], 0x05, "LUN 1 must report PDT 0x05");
+
+        // READ(10) LUN 1, LBA 0, 1 sector → the ISO image bytes stream back.
+        let mut read = read10_bhs(0, 1, 0x0201, 2);
+        read[9] = 1;
+        conn.feed(&read, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(data.len(), 2048);
+        assert_eq!(&data[..4], &[0xCD; 4]);
+
+        // WRITE(10) to the read-only CD-ROM LUN → CHECK CONDITION.
+        let mut write = write10_bhs(0, 1, 0x0301, 3, 0);
+        write[9] = 1;
+        conn.feed(&write, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::CHECK_CONDITION);
+
+        // REPORT LUNS lists both LUNs (target-wide, from LUN 0).
+        conn.feed(&report_luns_bhs(0, 0x0401, 4), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (_, data) = conn.take_pdu().unwrap();
+        assert_eq!(&data[..4], &[0, 0, 0, 16]); /* 2 × 8-byte LUN entries */
+        assert_eq!(data[8 + 1], 0); /* LUN 0 id */
+        assert_eq!(data[16 + 1], 1); /* LUN 1 id */
+
+        let _ = std::fs::remove_file(&iso);
     }
 }
