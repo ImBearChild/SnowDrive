@@ -11,9 +11,14 @@
 //! | CD-ROM device (flat / live / bundle) | `cdrom` (implies `scsi`+`iso9660`) |
 //! | C ABI exports | `capi` (implies `std`) |
 //!
-//! No module is declared yet — each P0.* step moves one crate in.  This
-//! skeleton exists only to claim the `snowdrive` package name and lock
-//! down the feature map.
+//! ## Modules
+//! - [`common`]: zero-alloc storage seams + unified logging macros
+//!   (always available, no feature gate).
+//! - `scsi` *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
+//! - `iso9660` *(gated by `iso9660`)*: ISO9660/Joliet algorithms.
+//! - `capi` *(gated by `capi`)*: C ABI exports (`#[allow(unsafe_code)]`).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
+
+pub mod common;

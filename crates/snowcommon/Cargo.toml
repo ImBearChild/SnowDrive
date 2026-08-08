@@ -3,15 +3,12 @@ name = "snowcommon"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Unified logging macros + storage seams for SnowDrive"
+description = "Thin re-export shim for the merged snowdrive lib crate (plan §15.7)"
+publish = false
 
 [features]
-default = []
-log = ["dep:log"]
-defmt = ["dep:defmt"]
+log = ["snowdrive/log"]
+defmt = ["snowdrive/defmt"]
 
 [dependencies]
-embedded-io = "0.7"
-heapless = "0.8"
-log = { version = "0.4", optional = true, default-features = false }
-defmt = { version = "1", optional = true }
+snowdrive = { path = "../../snowdrive", default-features = false }
