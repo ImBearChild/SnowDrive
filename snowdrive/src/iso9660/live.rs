@@ -120,13 +120,11 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
     // Root dir starts at LBA 20.
     let path_table_lba = SYSTEM_AREA_SECTORS + 3; // 19
     let root_dir_lba = path_table_lba + 1; // 20
-    let root_dir_sectors = 1u32;
-    let first_file_lba = root_dir_lba + root_dir_sectors; // 21
 
-    // Build file extents with Joliet names.
+    // Build file extents with Joliet names first (the root directory must
+    // be sized from the total record bytes before file LBAs are assigned).
     let mut extents = Vec::<FileExtent, MAX_FILES>::new();
-    let mut next_lba = first_file_lba;
-
+    let mut root_bytes: u64 = 34 + 34; // "." and ".." records
     for (idx, entry) in files.iter().enumerate() {
         if entry.is_dir {
             continue;
@@ -139,15 +137,35 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
         let file_name = entry.path.rsplit('/').next().unwrap_or(entry.path.as_str());
         let joliet_name = to_joliet_name(file_name);
 
-        let extent = FileExtent {
-            file_index: idx,
-            lba: next_lba,
-            sectors,
-            size,
-            name: joliet_name,
-        };
-        extents.push(extent).map_err(|_| IsoError::TooManyFiles)?;
-        next_lba += sectors;
+        // Directory record length: 33 + name + pad-to-even.
+        let rec_len = 33u64
+            + joliet_name.len() as u64
+            + if joliet_name.len().is_multiple_of(2) {
+                0
+            } else {
+                1
+            };
+        root_bytes += rec_len;
+
+        extents
+            .push(FileExtent {
+                file_index: idx,
+                lba: 0, // assigned below
+                sectors,
+                size,
+                name: joliet_name,
+            })
+            .map_err(|_| IsoError::TooManyFiles)?;
+    }
+
+    // Root directory spans as many sectors as its records need.
+    let root_dir_sectors = root_bytes.div_ceil(u64::from(SECTOR_SIZE)) as u32;
+    let first_file_lba = root_dir_lba + root_dir_sectors;
+
+    let mut next_lba = first_file_lba;
+    for extent in extents.iter_mut() {
+        extent.lba = next_lba;
+        next_lba += extent.sectors;
     }
 
     let total = next_lba;
@@ -190,7 +208,7 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
             true
         }
         l if l >= layout.root_dir_lba && l < layout.root_dir_lba + layout.root_dir_sectors => {
-            write_root_directory(layout, out);
+            write_root_directory(layout, lba, out);
             true
         }
         _ => false,
@@ -387,23 +405,61 @@ fn write_path_table(layout: &Layout, out: &mut [u8]) {
     out[9] = 0x00; // padding
 }
 
-/// Write the root directory at `layout.root_dir_lba`.
+/// Write the root directory sector at `lba` (which must lie within
+/// `layout.root_dir_lba .. + root_dir_sectors`).
 ///
-/// Contains ".", "..", and one entry per file (Joliet UCS-2BE names).
-fn write_root_directory(layout: &Layout, out: &mut [u8]) {
+/// Contains ".", "..", and one entry per file (Joliet UCS-2BE names). Only
+/// the records overlapping this sector are written; the rest of `out` is
+/// zeroed.
+fn write_root_directory(layout: &Layout, lba: u32, out: &mut [u8]) {
+    out.fill(0);
+    let sector_start = (lba - layout.root_dir_lba) as usize * SECTOR_SIZE as usize;
+
+    // Emit one record, tracking its byte offset within the directory
+    // extent and copying only the part that overlaps `out`'s sector.
     let mut offset = 0usize;
+    let mut emit = |offset: &mut usize, extent_lba: u32, data_len: u32, flags: u8, name: &[u8]| {
+        let rec_len = 33 + name.len() + if !name.len().is_multiple_of(2) { 1 } else { 0 };
+        let rec_start = *offset;
+        *offset += rec_len;
+
+        let sect_end = sector_start + out.len();
+        if rec_start + rec_len <= sector_start || rec_start >= sect_end {
+            return;
+        }
+
+        // Build the record into a scratch buffer (max 33 + 64 + 1 bytes).
+        let mut rec = [0u8; 128];
+        write_dir_record(&mut rec[..rec_len], 0, extent_lba, data_len, flags, name);
+
+        let from = sector_start.max(rec_start);
+        let to = (rec_start + rec_len).min(sect_end);
+        out[from - sector_start..to - sector_start]
+            .copy_from_slice(&rec[from - rec_start..to - rec_start]);
+    };
 
     // "." entry (self = root)
-    offset += write_dir_record(out, offset, layout.root_dir_lba, 0, 0x02, &[0x00]);
+    emit(
+        &mut offset,
+        layout.root_dir_lba,
+        layout.root_dir_sectors * SECTOR_SIZE,
+        0x02,
+        &[0x00],
+    );
 
     // ".." entry (parent = root for root directory)
-    offset += write_dir_record(out, offset, layout.root_dir_lba, 0, 0x02, &[0x01]);
+    emit(
+        &mut offset,
+        layout.root_dir_lba,
+        layout.root_dir_sectors * SECTOR_SIZE,
+        0x02,
+        &[0x01],
+    );
 
     // File entries
     for extent in &layout.extents {
         let data_len = extent.sectors * SECTOR_SIZE;
-        let name = &extent.name;
-        offset += write_dir_record(out, offset, extent.lba, data_len, 0x00, name);
+        emit(&mut offset, extent.lba, data_len, 0x00, &extent.name);
     }
 }
 
@@ -580,6 +636,56 @@ mod tests {
         }
         let layout = compute_layout(&files, "MAX").unwrap();
         assert_eq!(layout.extents.len(), MAX_FILES);
+    }
+
+    /// Regression: the root directory record table must be allowed to span
+    /// multiple sectors (a large flat tree overflows one 2048-byte sector).
+    #[test]
+    fn layout_root_dir_spans_multiple_sectors() {
+        let mut files = Vec::<FileEntry, MAX_FILES>::new();
+        for i in 0..MAX_FILES {
+            let mut path = String::<512>::new();
+            core::fmt::Write::write_fmt(&mut path, format_args!("F{i:03}.BIN")).unwrap();
+            files
+                .push(FileEntry {
+                    path,
+                    size: 100,
+                    is_dir: false,
+                })
+                .unwrap();
+        }
+        let layout = compute_layout(&files, "BIG").unwrap();
+        // 128 records × 33 + UCS-2BE name + pad ≫ 2048.
+        assert!(
+            layout.root_dir_sectors > 1,
+            "root dir should span {} sectors",
+            layout.root_dir_sectors
+        );
+        // File data starts right after the root directory extent.
+        assert_eq!(
+            layout.extents[0].lba,
+            layout.root_dir_lba + layout.root_dir_sectors
+        );
+
+        // Every root directory sector must generate without panicking and
+        // the first sector must begin with the "." record.
+        for i in 0..layout.root_dir_sectors {
+            let mut sector = [0u8; 2048];
+            assert!(gen_sector(&layout, layout.root_dir_lba + i, &mut sector));
+        }
+        let mut sector = [0u8; 2048];
+        gen_sector(&layout, layout.root_dir_lba, &mut sector);
+        assert_eq!(sector[0], 35); // "." record length (33 + 1 name + 1 pad)
+        assert_eq!(sector[32], 1); // "." name length
+                                   // Sector 0 holds "." and ".." records.
+        assert_eq!(sector[35], 35); // ".." record length
+                                    // The last root dir sector still carries (parts of) file records.
+        let last = layout.root_dir_lba + layout.root_dir_sectors - 1;
+        let mut sector = [0u8; 2048];
+        gen_sector(&layout, last, &mut sector);
+        // A record crosses the sector boundary, so the sector is not empty
+        // (it may start mid-record with zero bytes).
+        assert!(sector.iter().any(|&b| b != 0));
     }
 
     #[test]
