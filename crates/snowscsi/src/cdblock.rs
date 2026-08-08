@@ -139,6 +139,7 @@ impl CDBlockDevice {
                         | u32::from(cdb[13]);
                     self.read_capacity_16_cmd(cdb[1], alloc, work)
                 }
+                op::READ_TOC => self.read_toc_cmd(cdb, work),
                 op::WRITE_6
                 | op::WRITE_10
                 | op::WRITE_12
@@ -231,6 +232,97 @@ impl CDBlockDevice {
             byte_offset: 0,
             immediate: &work[48..48 + n],
         }
+    }
+
+    /// READ TOC/PMA/ATIP (0x43) — minimal implementation (MMC-6 §6.25).
+    ///
+    /// Supports only Format 0000b (formatted TOC: single data track +
+    /// lead-out, plan §8.1b) and Format 0001b (session info: single
+    /// session). Track/Session Number 0 or 1 returns the full TOC; AAh
+    /// returns just the lead-out descriptor; MSF selects MSF-form addresses
+    /// (LBA 0 → 00:02:00); the response is clamped to the allocation length
+    /// without shrinking the TOC Data Length field.
+    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+        let msf = cdb[1] & 0x02 != 0;
+        let format = cdb[2] & 0x0F;
+        let track = cdb[6];
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+
+        // TOC Data Length = bytes following the 2-byte length field, always
+        // the full value (not clamped by the allocation length, MMC-6 §6.25.3).
+        // Response layout: 2-byte length + first/last + 8-byte descriptors,
+        // so the totals are 20 (two descriptors) or 12 (one descriptor).
+        let (buf, n): ([u8; 22], usize) = match format {
+            0x0 => {
+                let lead_out = self.lead_out_lba();
+                let track1_addr = self.toc_address(0, msf);
+                let lead_addr = self.toc_address(lead_out, msf);
+                let mut b = [0u8; 22];
+                b[1] = 0x12; /* data length: 2 (first/last) + 2 × 8 */
+                b[2] = 0x01; /* first track */
+                b[3] = 0x01; /* last track */
+                match track {
+                    0 | 1 => {
+                        // Track 1 descriptor.
+                        b[5] = 0x14; /* ADR=1 (position), CONTROL=4 (data) */
+                        b[6] = 0x01;
+                        b[8..12].copy_from_slice(&track1_addr);
+                        // Lead-out descriptor.
+                        b[13] = 0x14;
+                        b[14] = 0xAA;
+                        b[16..20].copy_from_slice(&lead_addr);
+                        (b, 20)
+                    }
+                    0xAA => {
+                        // Lead-out only: 2-byte length + first/last + 1 × 8,
+                        // descriptor starts at byte 4.
+                        b[1] = 0x0A;
+                        b[5] = 0x14;
+                        b[6] = 0xAA;
+                        b[8..12].copy_from_slice(&lead_addr);
+                        (b, 12)
+                    }
+                    _ => return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
+                }
+            }
+            0x1 => {
+                // Session info: 2-byte length + sessions + 1 × 8 descriptor.
+                let mut b = [0u8; 22];
+                b[1] = 0x0A; /* data length: 2 (sessions) + 8 */
+                b[2] = 0x01; /* first complete session */
+                b[3] = 0x01; /* last complete session */
+                b[5] = 0x14; /* ADR/CTL */
+                b[6] = 0x01; /* first track in last session */
+                b[8..12].copy_from_slice(&self.toc_address(0, msf));
+                (b, 12)
+            }
+            _ => return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
+        };
+        let n = n.min(alloc as usize);
+        work[48..48 + n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &work[48..48 + n],
+        }
+    }
+
+    /// Lead-out start LBA: the number of sectors in the image.
+    fn lead_out_lba(&self) -> u32 {
+        (self.capacity() / u64::from(SECTOR_SIZE)).min(u32::MAX as u64) as u32
+    }
+
+    /// Encode a track/session start address in LBA or MSF form. MSF uses the
+    /// 2-second (150-frame) lead-in offset: LBA 0 → 00:02:00 (MMC-6 §4.2.3.3).
+    fn toc_address(&self, lba: u32, msf: bool) -> [u8; 4] {
+        if !msf {
+            return lba.to_be_bytes();
+        }
+        let v = lba + 150;
+        let m = v / (75 * 60);
+        let s = (v % (75 * 60)) / 75;
+        let f = v % 75;
+        [0x00, m as u8, s as u8, f as u8]
     }
 }
 
@@ -898,5 +990,166 @@ mod tests {
         assert_eq!(r, Err(BlockStorageError::OutOfBounds));
         assert_eq!(dev.sense().key, SenseKey::MediumError);
         assert_eq!(dev.sense().asc, asc::UNRECOVERED_READ_ERROR);
+    }
+
+    fn make_cdb_read_toc(msf: bool, format: u8, track: u8, alloc: u16) -> [u8; 10] {
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_TOC;
+        cdb[1] = if msf { 0x02 } else { 0x00 };
+        cdb[2] = format;
+        cdb[6] = track;
+        cdb[7] = (alloc >> 8) as u8;
+        cdb[8] = alloc as u8;
+        cdb
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_0_lba() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0x00, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 20);
+        // Header.
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[1], 0x12); /* data length 18 */
+        assert_eq!(buf[2], 0x01); /* first track */
+        assert_eq!(buf[3], 0x01); /* last track */
+        // Track 1 descriptor.
+        assert_eq!(buf[4], 0x00);
+        assert_eq!(buf[5], 0x14); /* ADR=1, CONTROL=4 (data) */
+        assert_eq!(buf[6], 0x01);
+        assert_eq!(buf[7], 0x00);
+        assert_eq!(&buf[8..12], &[0, 0, 0, 0]); /* start LBA 0 */
+        // Lead-out descriptor.
+        assert_eq!(buf[12], 0x00);
+        assert_eq!(buf[13], 0x14);
+        assert_eq!(buf[14], 0xAA);
+        assert_eq!(buf[15], 0x00);
+        assert_eq!(&buf[16..20], &[0, 0, 0, 100]); /* lead-out = 100 */
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_0_msf() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(true, 0x00, 0x00, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 20);
+        // Track 1: LBA 0 → 00:02:00.
+        assert_eq!(&buf[8..12], &[0x00, 0x00, 0x02, 0x00]);
+        // Lead-out: LBA 100 → 100+150 = 250 → 00:03:25.
+        assert_eq!(&buf[16..20], &[0x00, 0x00, 0x03, 0x19]);
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_0_track_aa_returns_leadout() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0xAA, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 12); /* length + first/last + lead-out descriptor only */
+        assert_eq!(buf[1], 0x0A);
+        assert_eq!(buf[2], 0x01);
+        assert_eq!(buf[3], 0x01);
+        assert_eq!(buf[5], 0x14);
+        assert_eq!(buf[6], 0xAA);
+        assert_eq!(&buf[8..12], &[0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_0_track_1_returns_full() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0x01, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 20);
+        assert_eq!(buf[6], 0x01);
+        assert_eq!(buf[14], 0xAA);
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_0_invalid_track_rejected() {
+        use crate::scsi::asc;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0x02, 64);
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
+    }
+
+    #[test]
+    fn cdblock_read_toc_format_1_lba_and_msf() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+
+        let cdb = make_cdb_read_toc(false, 0x01, 0x00, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 12);
+        assert_eq!(buf[1], 0x0A); /* data length 10 */
+        assert_eq!(buf[2], 0x01); /* first session */
+        assert_eq!(buf[3], 0x01); /* last session */
+        assert_eq!(buf[5], 0x14);
+        assert_eq!(buf[6], 0x01); /* first track in last session */
+        assert_eq!(&buf[8..12], &[0, 0, 0, 0]); /* start LBA 0 */
+
+        let cdb = make_cdb_read_toc(true, 0x01, 0x00, 64);
+        let mut buf = [0u8; 64];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 12);
+        assert_eq!(&buf[8..12], &[0x00, 0x00, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn cdblock_read_toc_alloc_clamp_keeps_data_length() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0x00, 12);
+        let mut buf = [0u8; 12];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 12); /* clamped to allocation length */
+        assert_eq!(buf[1], 0x12); /* data length still the full value */
+    }
+
+    #[test]
+    fn cdblock_read_toc_alloc_zero_transfers_nothing() {
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        let cdb = make_cdb_read_toc(false, 0x00, 0x00, 0);
+        let mut buf = [0u8; 4];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cdblock_read_toc_unsupported_format_rejected() {
+        use crate::scsi::asc;
+
+        let f = TempFile::new(2048 * 100);
+        let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        let mut w = work();
+        // Format 0010b (raw TOC) is a valid MMC format this minimal device
+        // does not implement → INVALID FIELD IN CDB.
+        let cdb = make_cdb_read_toc(true, 0x02, 0x01, 64);
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
     }
 }

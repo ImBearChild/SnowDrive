@@ -28,6 +28,9 @@ pub mod op {
     pub const REPORT_LUNS: u8 = 0xA0;
     pub const READ_12: u8 = 0xA8;
     pub const WRITE_12: u8 = 0xAA;
+
+    // MMC-6 (CD/DVD) opcodes.
+    pub const READ_TOC: u8 = 0x43;
 }
 
 /// Additional sense codes (SPC-4 §4.5.6).
@@ -200,6 +203,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::REPORT_LUNS => "REPORT_LUNS",
         op::PREVENT_ALLOW => "PREVENT_ALLOW",
         op::START_STOP_UNIT => "START_STOP_UNIT",
+        op::READ_TOC => "READ_TOC",
         _ => "UNKNOWN",
     }
 }
