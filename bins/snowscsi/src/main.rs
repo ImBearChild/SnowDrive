@@ -4,16 +4,24 @@
 //! Subcommands:
 //! - `serve`: run the iSCSI target (serial accept loop)
 //!
-//! `--block` is repeatable; each spec becomes a LUN in order (the first
-//! `--block` is LUN 0, and so on). Specs are `ram=<size>` (K/M/G suffixes)
-//! or `<path>` (optionally `,ro` for a read-only file backend). `--cdblock`
-//! is also repeatable and exposes a read-only CD-ROM image (PDT=0x05) per
-//! file. LUN numbering: all `--block` devices first, then all `--cdblock`
-//! devices. The same file path may appear on several LUNs; each is an
-//! independent SCSI device with its own LBA semantics, so a dual-mount
-//! warning is printed to stderr. SIGINT / SIGTERM trigger a graceful
-//! shutdown: the blocking `accept()` is woken by a probe connection,
-//! `serve()` returns, and every backend is `sync()`ed before exit.
+//! Device flags come in two planes (QEMU-style `[key=]value[,option...]`
+//! specs). `--disk` is the block plane; `--cdrom` is the CD plane.
+//!
+//! - `--disk` (block plane): `ram=<size>` (K/M/G suffixes), `cd=<path>`
+//!   (read-only ISO as a lazy CD-ROM, PDT=0x05), or `[img=]<path>[,ro]`
+//!   (file, default key `img=`).
+//! - `--cdrom` (CD plane): `img=<iso>` (flat full MMC), `live=<dir>` (live
+//!   ISO9660 over a directory); bare `.iso` maps to `img=`. Other bare
+//!   values are rejected (no auto-typing by suffix). `bundle=` (Phase 3)
+//!   and `ram=` (Phase 4) are reserved.
+//!
+//! LUN numbering: all `--disk` devices first, then all `--cdrom` devices
+//! (the two planes cannot interleave). The same file path may appear on
+//! several LUNs; each is an independent SCSI device with its own LBA
+//! semantics, so a dual-mount warning is printed to stderr. SIGINT / SIGTERM
+//! trigger a graceful shutdown: the blocking `accept()` is woken by a probe
+//! connection, `serve()` returns, and every backend is `sync()`ed before
+//! exit.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -46,21 +54,17 @@ enum Cli {
 
 #[derive(Args, Debug)]
 struct ServeArgs {
-    /// Block device: file path, `path,ro`, or `ram=<size>` (K/M/G suffixes).
-    /// Repeatable; the first --block is LUN 0, and so on.
-    #[arg(long = "block", value_name = "PATH|ram=SIZE")]
-    block: Vec<String>,
+    /// Block plane device: `[img=]<path>[,ro]` (file, `img=` default),
+    /// `ram=<size>` (K/M/G suffixes), or `cd=<path>` (read-only ISO as a
+    /// lazy CD-ROM). Repeatable; `--disk` LUNs come first in order.
+    #[arg(long = "disk", value_name = "SPEC")]
+    disk: Vec<String>,
 
-    /// Read-only CD-ROM image (ISO9660 file). Repeatable; CD-ROM LUNs follow
-    /// the --block LUNs.
-    #[arg(long = "cdblock", value_name = "PATH")]
-    cdblock: Vec<String>,
-
-    /// CD-ROM device: an ISO9660 file (`*.iso`, full MMC) or a live
-    /// directory (`<dir>,live` → live ISO9660). Repeatable; these LUNs
-    /// follow the --cdblock LUNs. Bundle (`<dir>` / `.d`) and RAM modes are
-    /// not yet supported.
-    #[arg(long = "cdrom", value_name = "PATH|DIR,live")]
+    /// CD-ROM device: `img=<path>.iso` (flat, full MMC) or `live=<dir>`
+    /// (live ISO9660); a bare `.iso` also maps to `img=`. `bundle=` (Phase
+    /// 3) and `ram=` (Phase 4) are reserved. Repeatable; these LUNs follow
+    /// the `--disk` LUNs.
+    #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
     /// iSCSI listen address (required).
@@ -99,8 +103,8 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         },
     };
 
-    if args.block.is_empty() && args.cdblock.is_empty() && args.cdrom.is_empty() {
-        eprintln!("snowscsi: --block, --cdblock, or --cdrom is required (at least one device)");
+    if args.disk.is_empty() && args.cdrom.is_empty() {
+        eprintln!("snowscsi: --disk or --cdrom is required (at least one device)");
         return ExitCode::FAILURE;
     }
 
@@ -112,16 +116,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     };
 
-    let mut block_specs = Vec::with_capacity(args.block.len());
-    for spec in &args.block {
-        let parsed = match parse_block_spec(spec) {
+    let mut disk_specs = Vec::with_capacity(args.disk.len());
+    for spec in &args.disk {
+        let parsed = match parse_disk_spec(spec) {
             Ok(p) => p,
             Err(msg) => {
-                eprintln!("snowscsi: invalid --block spec '{spec}': {msg}");
+                eprintln!("snowscsi: invalid --disk spec '{spec}': {msg}");
                 return ExitCode::FAILURE;
             }
         };
-        block_specs.push(parsed);
+        disk_specs.push(parsed);
     }
 
     let mut cdrom_specs = Vec::with_capacity(args.cdrom.len());
@@ -136,14 +140,20 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         cdrom_specs.push(parsed);
     }
 
-    // CD-ROM images are plain paths; reject missing files up front.
-    for path in &args.cdblock {
-        if !Path::new(path).is_file() {
-            eprintln!("snowscsi: file not found: {path}");
-            return ExitCode::FAILURE;
+    // Reject missing sources up front (FileBackend would otherwise create a
+    // fresh empty file when opened writable; CdromDevice/CdLiveFs would
+    // otherwise fail later).
+    for spec in &disk_specs {
+        match spec {
+            DiskSpec::Img { path, .. } | DiskSpec::Cdrom { path } => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowscsi: file not found: {path}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            DiskSpec::Ram(_) => {}
         }
     }
-    // Reject missing CD-ROM sources up front.
     for spec in &cdrom_specs {
         match spec {
             CdromSpec::Flat { path } => {
@@ -160,26 +170,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             }
         }
     }
-    // Reject missing block files up front (FileBackend would otherwise
-    // create a fresh empty file when opened writable).
-    for spec in &block_specs {
-        if let BlockSpec::File { path, .. } = spec {
-            if !Path::new(path).is_file() {
-                eprintln!("snowscsi: file not found: {path}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
 
-    for w in check_dual_mount(&dual_mount_specs(&block_specs, &args.cdblock, &cdrom_specs)) {
+    for w in check_dual_mount(&dual_mount_specs(&disk_specs, &cdrom_specs)) {
         eprintln!("{w}");
     }
 
     // Allocate every RAM disk first so the Device array can borrow them
     // without 'static / Box::leak — disjoint borrows via split_first_mut.
-    let mut ram_disks: Vec<Vec<u8>> = Vec::with_capacity(block_specs.len());
-    for spec in &block_specs {
-        if let BlockSpec::Ram(size) = spec {
+    let mut ram_disks: Vec<Vec<u8>> = Vec::with_capacity(disk_specs.len());
+    for spec in &disk_specs {
+        if let DiskSpec::Ram(size) = spec {
             let bytes = match usize::try_from(*size) {
                 Ok(n) => n,
                 Err(_) => {
@@ -191,47 +191,55 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     }
 
-    // LUN order: all --block devices first, then all --cdblock devices,
-    // then all --cdrom devices (clap collects each flag separately, so the
-    // interleaved appearance order cannot be restored).
-    let mut devices: Vec<Device<'_>> =
-        Vec::with_capacity(block_specs.len() + args.cdblock.len() + cdrom_specs.len());
+    // LUN order: all --disk devices first, then all --cdrom devices (clap
+    // collects each flag separately, so the interleaved appearance order
+    // cannot be restored; the two planes do not interleave).
+    let mut devices: Vec<Device<'_>> = Vec::with_capacity(disk_specs.len() + cdrom_specs.len());
     let mut ram_rest: &mut [Vec<u8>] = &mut ram_disks;
     let mut lun = 0usize;
-    for spec in &block_specs {
-        let backend = match spec {
-            BlockSpec::Ram(_) => {
+    for spec in &disk_specs {
+        match spec {
+            DiskSpec::Ram(_) => {
                 let (slot, tail) = ram_rest.split_first_mut().unwrap();
                 ram_rest = tail;
-                BlockBackend::Ram(RamBackend::new(slot))
+                let backend = BlockBackend::Ram(RamBackend::new(slot));
+                let mut dev =
+                    BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+                log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
+                devices.push(Device::Block(dev));
             }
-            BlockSpec::File { path, read_only } => {
+            DiskSpec::Img { path, read_only } => {
                 // Existence was checked by parse; FileBackend would otherwise
                 // create a fresh file when opened writable.
                 match FileBackend::open(path, !*read_only) {
-                    Ok(b) => BlockBackend::File(b),
+                    Ok(b) => {
+                        let mut dev = BlockDevice::new(BlockBackend::File(b), SECTOR_SIZE)
+                            .expect("SECTOR_SIZE is nonzero");
+                        log::debug!(
+                            "LUN {lun}: {path} block device ({}{} bytes)",
+                            if *read_only { "read-only, " } else { "" },
+                            dev.backend().capacity()
+                        );
+                        devices.push(Device::Block(dev));
+                    }
                     Err(e) => {
                         eprintln!("snowscsi: failed to open file block device {path}: {e}");
                         return ExitCode::FAILURE;
                     }
                 }
             }
-        };
-        let mut dev = BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-        log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
-        devices.push(Device::Block(dev));
-        lun += 1;
-    }
-    for path in &args.cdblock {
-        let dev = match CDBlockDevice::new(path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("snowscsi: failed to open CD-ROM image {path}: {e}");
-                return ExitCode::FAILURE;
+            DiskSpec::Cdrom { path } => {
+                let dev = match CDBlockDevice::new(path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("snowscsi: failed to open CD-ROM image {path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                log::debug!("LUN {lun}: {path} CD-ROM image");
+                devices.push(Device::CdBlock(dev));
             }
-        };
-        log::debug!("LUN {lun}: {path} CD-ROM image");
-        devices.push(Device::CdBlock(dev));
+        }
         lun += 1;
     }
     for spec in &cdrom_specs {
@@ -345,19 +353,24 @@ fn init_logging(verbose: bool) {
     builder.init();
 }
 
-/// A parsed `--block` spec.
+/// A parsed `--disk` spec (block plane).
 #[derive(Debug)]
-enum BlockSpec {
+enum DiskSpec {
+    /// `ram=<size>` → RAM-backed block device.
     Ram(u64),
-    File { path: String, read_only: bool },
+    /// `[img=]<path>[,ro]` → file-backed block device (`img=` is default).
+    Img { path: String, read_only: bool },
+    /// `cd=<path>` → lazy CD-ROM (PDT=0x05, 2048B sectors, read-only).
+    Cdrom { path: String },
 }
 
-/// A parsed `--cdrom` spec.
+/// A parsed `--cdrom` spec (CD plane).
 #[derive(Debug)]
 enum CdromSpec {
-    /// Flat ISO9660 file (`*.iso`) → `CdromDevice<FileBackend>`.
+    /// `img=<iso>` → flat ISO9660, full MMC (`CdromDevice<FileBackend>`).
     Flat { path: String },
-    /// Live directory (`<dir>,live`) → `CdLiveFsDevice<FsBackend>`.
+    /// `live=<dir>` → live ISO9660 over a directory
+    /// (`CdLiveFsDevice<FsBackend>`).
     Live { dir: String },
 }
 
@@ -374,22 +387,17 @@ enum DeviceKind {
 /// detection (RAM disks have no path). All slices live in the caller; the
 /// returned paths borrow from them.
 fn dual_mount_specs<'a>(
-    block_specs: &'a [BlockSpec],
-    cdblock_specs: &'a [String],
+    disk_specs: &'a [DiskSpec],
     cdrom_specs: &'a [CdromSpec],
 ) -> Vec<(DeviceKind, &'a str)> {
-    let mut out: Vec<(DeviceKind, &'a str)> = block_specs
+    let mut out: Vec<(DeviceKind, &'a str)> = disk_specs
         .iter()
         .filter_map(|s| match s {
-            BlockSpec::File { path, .. } => Some((DeviceKind::Block, path.as_str())),
-            BlockSpec::Ram(_) => None,
+            DiskSpec::Img { path, .. } => Some((DeviceKind::Block, path.as_str())),
+            DiskSpec::Cdrom { path } => Some((DeviceKind::CdBlock, path.as_str())),
+            DiskSpec::Ram(_) => None,
         })
         .collect();
-    out.extend(
-        cdblock_specs
-            .iter()
-            .map(|p| (DeviceKind::CdBlock, p.as_str())),
-    );
     out.extend(cdrom_specs.iter().map(|s| match s {
         CdromSpec::Flat { path } => (DeviceKind::CdFlat, path.as_str()),
         CdromSpec::Live { dir } => (DeviceKind::CdLiveFs, dir.as_str()),
@@ -400,7 +408,7 @@ fn dual_mount_specs<'a>(
 /// Detect the same path mounted as multiple independent SCSI devices and
 /// return the stderr warning lines. A path appearing more than once in total
 /// (same or different device kinds) is warned: each occurrence is a distinct
-/// LUN with its own LBA semantics (e.g. `--block f.iso --cdblock f.iso`).
+/// LUN with its own LBA semantics (e.g. `--disk cd=f.iso --cdrom img=f.iso`).
 fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
     let mut seen: std::collections::HashMap<&str, Vec<DeviceKind>> =
         std::collections::HashMap::new();
@@ -419,64 +427,89 @@ fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
     warnings
 }
 
-/// Parse a `--block` spec: `ram=<size>` or `<path>[,ro]`.
-fn parse_block_spec(spec: &str) -> Result<BlockSpec, String> {
-    if let Some(size) = spec.strip_prefix("ram=") {
-        match parse_size(size) {
-            Some(n) => Ok(BlockSpec::Ram(n)),
-            None => Err(format!("invalid RAM size: {size}")),
-        }
-    } else {
-        let (path, opt) = match spec.split_once(',') {
-            Some((p, o)) => (p, Some(o)),
-            None => (spec, None),
-        };
-        let read_only = match opt {
-            Some("ro") => true,
-            Some(o) => {
-                log::warn!("unknown block option '{o}', ignoring");
-                false
-            }
-            None => false,
-        };
-        if path.is_empty() {
-            return Err("empty file path".to_string());
-        }
-        Ok(BlockSpec::File {
-            path: path.to_string(),
-            read_only,
-        })
-    }
-}
-
-/// Parse a `--cdrom` spec (QEMU-style comma-separated options).
+/// Parse a `--disk` spec: `ram=<size>`, `ram=<size>`/`<path>[,ro]`.
 ///
-/// - `ram=<size>` → reserved (not yet supported).
-/// - `<path>` (suffix `.iso`) → flat ISO9660 CD-ROM.
-/// - `<dir>,live` → live ISO9660 CD-ROM over the directory.
-/// - `<dir>` / `<path>.d` / `,recovery=…` → bundle mode (not yet supported).
+/// - `ram=<size>` → RAM disk.
+/// - `cd=<path>` → lazy CD-ROM image.
+/// - `img=<path>`, `[img=]<path>[,ro]` → file block device (`img=` default).
 ///
 /// Unknown options are ignored with a warning (C behavior).
-fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
-    if spec.starts_with("ram=") {
-        return Err("ram= mode is not yet supported".to_string());
+fn parse_disk_spec(spec: &str) -> Result<DiskSpec, String> {
+    if let Some(size) = spec.strip_prefix("ram=") {
+        return match parse_size(size) {
+            Some(n) => Ok(DiskSpec::Ram(n)),
+            None => Err(format!("invalid RAM size: {size}")),
+        };
     }
-    let (path, options) = match spec.split_once(',') {
-        Some((p, o)) => (p, o),
+    if let Some(path) = spec.strip_prefix("cd=") {
+        if path.is_empty() {
+            return Err("empty `cd=` path".to_string());
+        }
+        return Ok(DiskSpec::Cdrom {
+            path: path.to_string(),
+        });
+    }
+    // Default key: `img=`. Strip it if present.
+    let rest = spec.strip_prefix("img=").unwrap_or(spec);
+    let (path, opt) = match rest.split_once(',') {
+        Some((p, o)) => (p, Some(o)),
+        None => (rest, None),
+    };
+    let read_only = match opt {
+        Some("ro") => true,
+        Some(o) => {
+            log::warn!("unknown disk option '{o}', ignoring");
+            false
+        }
+        None => false,
+    };
+    if path.is_empty() {
+        return Err("empty file path".to_string());
+    }
+    Ok(DiskSpec::Img {
+        path: path.to_string(),
+        read_only,
+    })
+}
+
+/// Parse a `--cdrom` spec (QEMU-style keyed value).
+///
+/// - `img=<iso>` → flat ISO9660 CD-ROM (full MMC).
+/// - `live=<dir>` → live ISO9660 CD-ROM over the directory.
+/// - `<path>.iso` → same as `img=<path>` (bare value: only `.iso` is
+///   auto-typed; anything else is rejected — no bundle auto-detection).
+/// - `bundle=` / `ram=` → reserved for Phase 3 / Phase 4.
+fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
+    if let Some(path) = spec.strip_prefix("bundle=") {
+        return Err(format!(
+            "{path}: bundle cdrom mode is not yet supported (Phase 3)"
+        ));
+    }
+    if spec.starts_with("ram=") {
+        return Err("ram= cdrom mode is not yet supported (Phase 4)".to_string());
+    }
+    let (value, opts) = match spec.split_once(',') {
+        Some((v, o)) => (v, o),
         None => (spec, ""),
+    };
+    let (path, live) = if let Some(p) = value.strip_prefix("live=") {
+        (p, true)
+    } else if let Some(p) = value.strip_prefix("img=") {
+        (p, false)
+    } else {
+        // Bare value: only `.iso` is auto-typed to `img=`; anything else is
+        // rejected rather than guessed (no live/bundle/ram by suffix).
+        (value, false)
     };
     if path.is_empty() {
         return Err("empty path".to_string());
     }
-    let mut live = false;
-    for opt in options.split(',') {
-        match opt {
-            "live" => live = true,
-            o if o.starts_with("recovery=") => {
-                return Err("bundle recovery mode is not yet supported".to_string());
-            }
-            o if !o.is_empty() => log::warn!("unknown cdrom option '{o}', ignoring"),
-            _ => {}
+    for opt in opts.split(',') {
+        if opt.starts_with("recovery=") {
+            return Err("bundle recovery mode is not yet supported".to_string());
+        }
+        if !opt.is_empty() {
+            log::warn!("unknown cdrom option '{opt}', ignoring");
         }
     }
     if live {
@@ -484,13 +517,20 @@ fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
             dir: path.to_string(),
         });
     }
+    if value.starts_with("img=") {
+        return Ok(CdromSpec::Flat {
+            path: path.to_string(),
+        });
+    }
     if path.to_ascii_lowercase().ends_with(".iso") {
         return Ok(CdromSpec::Flat {
             path: path.to_string(),
         });
     }
-    // Plain directory / `.d` suffix → bundle mode (Phase 3, not yet).
-    Err(format!("{path}: bundle cdrom mode is not yet supported"))
+    Err(format!(
+        "{path}: not a .iso file and no explicit cdrom key; use \
+         `--cdrom img=<iso>` / `--cdrom live=<dir>` / `--cdrom <file>.iso`"
+    ))
 }
 
 /// Resolve the work buffer size (default 256K), validating it against
@@ -556,35 +596,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_block_spec_ram() {
-        match parse_block_spec("ram=8M").unwrap() {
-            BlockSpec::Ram(n) => assert_eq!(n, 8 * 1024 * 1024),
+    fn parse_disk_spec_ram() {
+        match parse_disk_spec("ram=8M").unwrap() {
+            DiskSpec::Ram(n) => assert_eq!(n, 8 * 1024 * 1024),
             other => panic!("unexpected spec: {other:?}"),
         }
-        assert!(parse_block_spec("ram=bogus").is_err());
-        assert!(parse_block_spec("ram=").is_err());
-        assert!(parse_block_spec("ram=0").is_err());
+        assert!(parse_disk_spec("ram=bogus").is_err());
+        assert!(parse_disk_spec("ram=").is_err());
+        assert!(parse_disk_spec("ram=0").is_err());
     }
 
     #[test]
-    fn parse_block_spec_file() {
-        match parse_block_spec("disk.img").unwrap() {
-            BlockSpec::File { path, read_only } => {
-                assert_eq!(path, "disk.img");
-                assert!(!read_only);
-            }
+    fn parse_disk_spec_img() {
+        let DiskSpec::Img { path, read_only } = parse_disk_spec("disk.img").unwrap() else {
+            panic!("unexpected spec")
+        };
+        assert_eq!(path, "disk.img");
+        assert!(!read_only);
+        // Bare value and explicit `img=` are equivalent (default key).
+        match parse_disk_spec("img=cool.img").unwrap() {
+            DiskSpec::Img { path, .. } => assert_eq!(path, "cool.img"),
             other => panic!("unexpected spec: {other:?}"),
         }
-        match parse_block_spec("disk.img,ro").unwrap() {
-            BlockSpec::File { read_only, .. } => assert!(read_only),
+        // `.ro`, unknown option ignored (C behavior), empty path rejected.
+        match parse_disk_spec("disk.img,ro").unwrap() {
+            DiskSpec::Img { read_only, .. } => assert!(read_only),
             other => panic!("unexpected spec: {other:?}"),
         }
-        // Unknown options are ignored with a warning (C behavior).
-        match parse_block_spec("disk.img,bogus").unwrap() {
-            BlockSpec::File { read_only, .. } => assert!(!read_only),
+        match parse_disk_spec("disk.img,bogus").unwrap() {
+            DiskSpec::Img { read_only, .. } => assert!(!read_only),
             other => panic!("unexpected spec: {other:?}"),
         }
-        assert!(parse_block_spec(",ro").is_err());
+        assert!(parse_disk_spec(",ro").is_err());
+    }
+
+    #[test]
+    fn parse_disk_spec_cdrom_key() {
+        match parse_disk_spec("cd=disc.iso").unwrap() {
+            DiskSpec::Cdrom { path } => assert_eq!(path, "disc.iso"),
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        assert!(parse_disk_spec("cd=").is_err());
     }
 
     #[test]
@@ -601,8 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_cdrom_spec_live_dir() {
-        match parse_cdrom_spec("tree,live").unwrap() {
+    fn parse_cdrom_spec_explicit_keys() {
+        match parse_cdrom_spec("img=boot.iso").unwrap() {
+            CdromSpec::Flat { path } => assert_eq!(path, "boot.iso"),
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        match parse_cdrom_spec("live=tree").unwrap() {
             CdromSpec::Live { dir } => assert_eq!(dir, "tree"),
             other => panic!("unexpected spec: {other:?}"),
         }
@@ -610,7 +666,8 @@ mod tests {
 
     #[test]
     fn parse_cdrom_spec_unsupported_modes() {
-        // Bundle: plain directory, `.d` suffix, recovery option.
+        // Bundle: explicit keys and old-style plain directory / `.d` suffix.
+        assert!(parse_cdrom_spec("bundle=rw.d").is_err());
         assert!(parse_cdrom_spec("rw.d").is_err());
         assert!(parse_cdrom_spec("tree").is_err());
         assert!(parse_cdrom_spec("tree,recovery=delete").is_err());
@@ -657,19 +714,19 @@ mod tests {
     }
 
     #[test]
-    fn dual_mount_specs_collects_file_paths_only() {
+    fn dual_mount_specs_collects_disk_paths_only() {
         let specs = [
-            BlockSpec::Ram(1024),
-            BlockSpec::File {
+            DiskSpec::Ram(1024),
+            DiskSpec::Img {
                 path: "a.img".to_string(),
                 read_only: false,
             },
-            BlockSpec::File {
+            DiskSpec::Img {
                 path: "a.img".to_string(),
                 read_only: true,
             },
         ];
-        let d = dual_mount_specs(&specs, &[], &[]);
+        let d = dual_mount_specs(&specs, &[]);
         assert_eq!(
             d,
             vec![(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]
@@ -679,29 +736,29 @@ mod tests {
     }
 
     #[test]
-    fn dual_mount_cdblock_paths_are_collected() {
-        let cd = vec!["boot.iso".to_string()];
-        let d = dual_mount_specs(&[], &cd, &[]);
+    fn dual_mount_cdrom_key_paths_are_collected() {
+        let disk = [DiskSpec::Cdrom {
+            path: "boot.iso".to_string(),
+        }];
+        let d = dual_mount_specs(&disk, &[]);
         assert_eq!(d, vec![(DeviceKind::CdBlock, "boot.iso")]);
         assert!(check_dual_mount(&d).is_empty());
     }
 
     #[test]
-    fn dual_mount_block_and_cdblock_same_path_warns() {
-        let block = [BlockSpec::File {
+    fn dual_mount_img_and_cdrom_same_path_warns() {
+        let disk = [DiskSpec::Img {
             path: "boot.iso".to_string(),
             read_only: false,
         }];
-        let cd = vec!["boot.iso".to_string()];
-        let d = dual_mount_specs(&block, &cd, &[]);
-        assert_eq!(
-            d,
-            vec![
-                (DeviceKind::Block, "boot.iso"),
-                (DeviceKind::CdBlock, "boot.iso")
-            ]
-        );
-        let w = check_dual_mount(&d);
+        let cd = [DiskSpec::Cdrom {
+            path: "boot.iso".to_string(),
+        }];
+        let d = dual_mount_specs(&disk, &[]);
+        let e = dual_mount_specs(&cd, &[]);
+        let mut all = d;
+        all.extend(e);
+        let w = check_dual_mount(&all);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("boot.iso"));
         assert!(w[0].starts_with("warning:"));
@@ -717,7 +774,7 @@ mod tests {
                 dir: "tree".to_string(),
             },
         ];
-        let d = dual_mount_specs(&[], &[], &cdrom);
+        let d = dual_mount_specs(&[], &cdrom);
         assert_eq!(
             d,
             vec![
@@ -729,15 +786,15 @@ mod tests {
     }
 
     #[test]
-    fn dual_mount_block_and_cdrom_same_path_warns() {
-        let block = [BlockSpec::File {
+    fn dual_mount_disk_and_cdrom_same_path_warns() {
+        let disk = [DiskSpec::Img {
             path: "boot.iso".to_string(),
             read_only: false,
         }];
         let cdrom = vec![CdromSpec::Flat {
             path: "boot.iso".to_string(),
         }];
-        let d = dual_mount_specs(&block, &[], &cdrom);
+        let d = dual_mount_specs(&disk, &cdrom);
         let w = check_dual_mount(&d);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("boot.iso"));
@@ -745,20 +802,20 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_multiple_block_specs_and_flags() {
+    fn cli_accepts_multiple_disk_and_cdrom_specs() {
         let cli = Cli::try_parse_from([
             "snowscsi",
             "serve",
-            "--block",
+            "--disk",
             "ram=1M",
-            "--block",
-            "disk.img,ro",
-            "--cdblock",
-            "legacy.iso",
+            "--disk",
+            "img=disk.img,ro",
+            "--disk",
+            "cd=legacy.iso",
             "--cdrom",
-            "boot.iso",
+            "img=boot.iso",
             "--cdrom",
-            "tree,live",
+            "live=tree",
             "--iscsi",
             "127.0.0.1:3260",
             "--work-buf-size",
@@ -769,19 +826,29 @@ mod tests {
         match cli {
             Cli::Serve(a) => {
                 assert_eq!(
-                    a.block,
-                    vec!["ram=1M".to_string(), "disk.img,ro".to_string()]
+                    a.disk,
+                    vec![
+                        "ram=1M".to_string(),
+                        "img=disk.img,ro".to_string(),
+                        "cd=legacy.iso".to_string()
+                    ]
                 );
-                assert_eq!(a.cdblock, vec!["legacy.iso".to_string()]);
                 assert_eq!(
                     a.cdrom,
-                    vec!["boot.iso".to_string(), "tree,live".to_string()]
+                    vec!["img=boot.iso".to_string(), "live=tree".to_string()]
                 );
                 assert_eq!(a.iscsi.as_deref(), Some("127.0.0.1:3260"));
                 assert_eq!(a.work_buf_size.as_deref(), Some("256K"));
                 assert!(a.verbose);
             }
         }
+    }
+
+    #[test]
+    fn cli_rejects_legacy_flags() {
+        // `--block` / `--cdblock` were removed in the dual-plane redesign.
+        assert!(Cli::try_parse_from(["snowscsi", "serve", "--block", "ram=1M"]).is_err());
+        assert!(Cli::try_parse_from(["snowscsi", "serve", "--cdblock", "x.iso"]).is_err());
     }
 
     #[test]

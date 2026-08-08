@@ -24,7 +24,7 @@ fn no_subcommand_fails() {
 
 #[test]
 fn serve_requires_iscsi() {
-    let out = run(&["serve", "--block", "ram=1M"]);
+    let out = run(&["serve", "--disk", "ram=1M"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--iscsi"));
@@ -35,12 +35,12 @@ fn serve_requires_block() {
     let out = run(&["serve", "--iscsi", "127.0.0.1:3260"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--block"));
+    assert!(err.contains("--disk"));
 }
 
 #[test]
 fn serve_rejects_invalid_ram_size() {
-    let out = run(&["serve", "--block", "ram=bogus", "--iscsi", "127.0.0.1:3260"]);
+    let out = run(&["serve", "--disk", "ram=bogus", "--iscsi", "127.0.0.1:3260"]);
     assert!(!out.status.success());
 }
 
@@ -48,8 +48,8 @@ fn serve_rejects_invalid_ram_size() {
 fn serve_rejects_missing_file() {
     let out = run(&[
         "serve",
-        "--block",
-        "/nonexistent/snowscsi-missing.img",
+        "--disk",
+        "img=/nonexistent/snowscsi-missing.img",
         "--iscsi",
         "127.0.0.1:3260",
     ]);
@@ -60,7 +60,7 @@ fn serve_rejects_missing_file() {
 
 #[test]
 fn serve_rejects_invalid_address() {
-    let out = run(&["serve", "--block", "ram=1M", "--iscsi", "not-an-address"]);
+    let out = run(&["serve", "--disk", "ram=1M", "--iscsi", "not-an-address"]);
     assert!(!out.status.success());
 }
 
@@ -74,7 +74,7 @@ fn serve_rejects_unknown_option() {
 fn serve_rejects_work_buf_too_small() {
     let out = run(&[
         "serve",
-        "--block",
+        "--disk",
         "ram=1M",
         "--iscsi",
         "127.0.0.1:3260",
@@ -94,7 +94,7 @@ fn serve_exits_cleanly_on_sigint() {
     use std::time::Duration;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
-        .args(["serve", "--block", "ram=1M", "--iscsi", "127.0.0.1:0"])
+        .args(["serve", "--disk", "ram=1M", "--iscsi", "127.0.0.1:0"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -140,7 +140,7 @@ fn serve_exits_cleanly_on_sigint() {
     assert!(status.success(), "snowscsi should exit 0 after SIGINT");
 }
 
-/// The same file path on two `--block` LUNs emits a dual-mount warning on
+/// The same file path on two `--disk` LUNs emits a dual-mount warning on
 /// stderr while the server still starts and exits 0 after SIGINT.
 #[cfg(unix)]
 #[test]
@@ -157,9 +157,9 @@ fn serve_warns_on_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
         .args([
             "serve",
-            "--block",
+            "--disk",
             &path,
-            "--block",
+            "--disk",
             &path,
             "--iscsi",
             "127.0.0.1:0",
@@ -222,8 +222,9 @@ fn serve_warns_on_dual_mount() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// `serve --cdblock <iso>` starts with a CD-ROM LUN, announces 'listening'
-/// and exits 0 after SIGINT (graceful shutdown syncs the read-only backend).
+/// `serve --disk cd=<iso>` starts with a lazy CD-ROM LUN, announces
+/// 'listening' and exits 0 after SIGINT (graceful shutdown syncs the
+/// read-only backend).
 #[cfg(unix)]
 #[test]
 fn serve_starts_with_cdblock() {
@@ -240,7 +241,13 @@ fn serve_starts_with_cdblock() {
     let path = iso.to_string_lossy().to_string();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
-        .args(["serve", "--cdblock", &path, "--iscsi", "127.0.0.1:0"])
+        .args([
+            "serve",
+            "--disk",
+            &format!("cd={path}"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -349,7 +356,7 @@ fn serve_starts_with_cdrom_flat() {
     let _ = std::fs::remove_file(&iso);
 }
 
-/// `serve --cdrom <dir>,live` scans the directory into a live ISO9660
+/// `serve --cdrom live=<dir>` scans the directory into a live ISO9660
 /// CD-ROM, announces 'listening' and exits 0 after SIGINT.
 #[cfg(unix)]
 #[test]
@@ -368,7 +375,7 @@ fn serve_starts_with_cdrom_live() {
         .args([
             "serve",
             "--cdrom",
-            &format!("{path},live"),
+            &format!("live={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -417,17 +424,17 @@ fn serve_starts_with_cdrom_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A plain `--cdrom <dir>` (bundle mode) is rejected with "not yet
+/// A `--cdrom bundle=<dir>` (bundle mode) is rejected with "not yet
 /// supported" before the server binds.
 #[test]
 fn serve_rejects_bundle_cdrom() {
-    let out = run(&["serve", "--cdrom", "/tmp", "--iscsi", "127.0.0.1:0"]);
+    let out = run(&["serve", "--cdrom", "bundle=/tmp", "--iscsi", "127.0.0.1:0"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not yet supported"));
 }
 
-/// The same file path as both `--block` and `--cdrom` emits a dual-mount
+/// The same file path as both `--disk` and `--cdrom` emits a dual-mount
 /// warning on stderr before the server starts.
 #[cfg(unix)]
 #[test]
@@ -445,8 +452,8 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
         .args([
             "serve",
-            "--block",
-            &path,
+            "--disk",
+            &format!("img={path}"),
             "--cdrom",
             &path,
             "--iscsi",
@@ -508,8 +515,8 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// The same file path as both `--block` and `--cdblock` emits a dual-mount
-/// warning on stderr before the server starts.
+/// The same file path as both `--disk img=` and `--disk cd=` emits a
+/// dual-mount warning on stderr before the server starts.
 #[cfg(unix)]
 #[test]
 fn serve_warns_on_block_and_cdblock_dual_mount() {
@@ -525,10 +532,10 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
         .args([
             "serve",
-            "--block",
-            &path,
-            "--cdblock",
-            &path,
+            "--disk",
+            &format!("img={path}"),
+            "--disk",
+            &format!("cd={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
