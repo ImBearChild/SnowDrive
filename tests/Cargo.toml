@@ -9,8 +9,10 @@ description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 snowdrive = { path = "../snowdrive", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs"] }
 embedded-io = "0.7"
 # Independent ISO9660 reader used to cross-validate the live generator's
-# output (test-only; not a dependency of the library).
-hadris-iso = { version = "1", default-features = false, features = ["std", "read", "joliet"] }
+# output (test-only; not a dependency of the library). iso9660-no-std is
+# MIT OR Apache-2.0 with a permissive-only dependency tree (no GPL, no
+# FUSE/system requirements), and auto-selects the Joliet SVD root.
+iso9660-no-std = "0.1"
 
 [build-dependencies]
 pkg-config = "0.3"

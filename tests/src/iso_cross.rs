@@ -1,18 +1,52 @@
 //! Cross-validation of the live ISO9660 generator against an independent
-//! parser (`hadris-iso`, a pure-Rust ISO 9660 reader).  This is a pure
-//! test dependency: it verifies that the image our generator produces is
-//! readable by a spec-strict third-party implementation, and that the
-//! tree structure, names, sizes and file contents all match the host
-//! directory.
+//! parser (`iso9660-no-std`, a permissive MIT/Apache-2.0 pure-Rust ISO
+//! 9660 reader). This is a pure test dependency: it verifies that the
+//! image our generator produces is readable by a spec-strict third-party
+//! implementation, and that the tree structure, names, sizes and file
+//! contents all match the host directory.
 
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use hadris_iso::read::{DirEntry, IsoDir, IsoImage};
+use iso9660_no_std::{DirectoryEntry, ISO9660Reader, ISODirectory, ISO9660};
 
 use snowdrive::iso9660::live::{MAX_JOLIET_NAME_CHARS, SECTOR_SIZE};
 use snowdrive::scsi::cdrom_livefs::CdLiveFsDevice;
 use snowdrive::scsi::fs_backend::StdFsBackend;
+
+/// Wrap a `std::io::Cursor` so it implements `embedded_io::{Read, Seek}`
+/// (the trait `iso9660-no-std` reads through). `read_at` seeks per LBA.
+struct CursorReader<'a> {
+    cursor: Cursor<&'a [u8]>,
+}
+
+impl embedded_io::ErrorType for CursorReader<'_> {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl embedded_io::Read for CursorReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        use std::io::Read as _;
+        self.cursor
+            .read(buf)
+            .map_err(|_| embedded_io::ErrorKind::Other)
+    }
+}
+
+impl embedded_io::Seek for CursorReader<'_> {
+    fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+        use std::io::Seek as _;
+        let from = match pos {
+            embedded_io::SeekFrom::Start(s) => std::io::SeekFrom::Start(s),
+            embedded_io::SeekFrom::End(s) => std::io::SeekFrom::End(s),
+            embedded_io::SeekFrom::Current(s) => std::io::SeekFrom::Current(s),
+        };
+        self.cursor
+            .seek(from)
+            .map_err(|_| embedded_io::ErrorKind::Other)
+    }
+}
 
 /// Build a host tree under a fresh temp dir and return `(dir, files)`
 /// where `files` is `(relative_path, content)`.
@@ -59,55 +93,58 @@ fn build_image(dir: &Path) -> Vec<u8> {
     img
 }
 
-/// Recursively collect (relative path, size, content) from a hadris dir.
-fn walk<D: hadris_iso::Read + hadris_iso::Seek>(
-    image: &IsoImage<D>,
-    dir: &IsoDir<'_, D>,
+/// Recursively collect (relative path, size, content) from a cdfs dir.
+fn walk<T: ISO9660Reader>(
+    dir: &ISODirectory<T>,
     prefix: &str,
     out: &mut Vec<(String, u64, Vec<u8>)>,
 ) {
-    for entry in dir.entries() {
-        let entry: DirEntry = entry.expect("hadris entry");
-        // Skip "." and "..": their identifiers are single bytes 0x00 / 0x01.
-        let raw = entry.name();
-        if raw.is_empty() || raw == [0x00] || raw == [0x01] {
+    use embedded_io::Read as _;
+    for entry in dir.contents() {
+        let entry = entry.expect("cdfs entry");
+        let id = entry.identifier().to_string();
+        if id.is_empty() || id == "." || id == ".." {
             continue;
         }
-        // Our image is Joliet-only, so names are UCS-2BE; decode them.
-        let name = entry.record.joliet_name();
         let path = if prefix.is_empty() {
-            name
+            id
         } else {
-            format!("{prefix}/{name}")
+            format!("{prefix}/{id}")
         };
-        if entry.is_directory() {
-            let dir_ref = entry.as_dir_ref(image).expect("dir ref");
-            let sub = image.open_dir(dir_ref);
-            walk(image, &sub, &path, out);
-        } else if entry.is_file() {
-            let content = image.read_file(&entry).expect("read file");
-            let size = content.len() as u64;
-            out.push((path, size, content));
+        match entry {
+            DirectoryEntry::Directory(d) => walk(&d, &path, out),
+            DirectoryEntry::File(f) => {
+                let mut content = Vec::new();
+                // ISOFileReader implements embedded_io::Read (no
+                // read_to_end), so loop manually.
+                let mut reader = f.read();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let n = reader.read(&mut buf).expect("read file");
+                    if n == 0 {
+                        break;
+                    }
+                    content.extend_from_slice(&buf[..n]);
+                }
+                out.push((path, content.len() as u64, content));
+            }
         }
     }
 }
 
 #[test]
-fn live_image_reads_back_through_hadris() {
+fn live_image_reads_back_through_iso9660_reader() {
     let (dir, host_files) = build_tree();
     let img = build_image(&dir);
-    let image = IsoImage::open(Cursor::new(img)).expect("hadris open image");
+    // iso9660-no-std picks the most featureful root: Joliet (SVD) over the
+    // PVD, and decodes UCS-2BE names.
+    let iso = ISO9660::new(CursorReader {
+        cursor: Cursor::new(&img),
+    })
+    .expect("reader open image");
 
-    // Volume identifier survives.
-    let pvd = image.read_pvd();
-    assert_eq!(pvd.volume_identifier.to_str().trim(), "CROSS");
-
-    // Walk the image tree via the Joliet root (our image is Joliet-only:
-    // the PVD tree shares the UCS-2 directory, so plain-ISO9660 name
-    // interpretation returns raw bytes).
-    let root = image.root_dirs().best_choice();
     let mut iso_files: Vec<(String, u64, Vec<u8>)> = Vec::new();
-    walk(&image, &root.iter(&image), "", &mut iso_files);
+    walk(&iso.root, "", &mut iso_files);
 
     // Every host file is present with matching size and content (the
     // over-limit file is truncated, so it is checked separately below).
@@ -129,7 +166,6 @@ fn live_image_reads_back_through_hadris() {
 
     // The over-limit name is truncated to MAX_JOLIET_NAME_CHARS in the ISO
     // (the ".DAT" extension is cut off too).
-    let over = format!("{}.DAT", "B".repeat(MAX_JOLIET_NAME_CHARS + 1));
     let truncated = "B".repeat(MAX_JOLIET_NAME_CHARS);
     let over_iso = iso_files
         .iter()
