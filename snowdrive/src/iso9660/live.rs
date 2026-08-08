@@ -275,27 +275,27 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     out[80..84].copy_from_slice(&layout.total.to_le_bytes());
     out[84..88].copy_from_slice(&layout.total.to_be_bytes());
 
-    // Volume Set Size = 1
+    // Volume Set Size = 1 (LE 120..122, BE 122..124)
     out[120..122].copy_from_slice(&1u16.to_le_bytes());
-    out[124..126].copy_from_slice(&1u16.to_be_bytes());
+    out[122..124].copy_from_slice(&1u16.to_be_bytes());
 
-    // Volume Sequence Number = 1
+    // Volume Sequence Number = 1 (LE 124..126, BE 126..128)
     out[124..126].copy_from_slice(&1u16.to_le_bytes());
-    out[128..130].copy_from_slice(&1u16.to_be_bytes());
+    out[126..128].copy_from_slice(&1u16.to_be_bytes());
 
-    // Logical Block Size = 2048
+    // Logical Block Size = 2048 (LE 128..130, BE 130..132)
     out[128..130].copy_from_slice(&(SECTOR_SIZE as u16).to_le_bytes());
-    out[132..134].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
+    out[130..132].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
 
-    // Path Table Size (LE at 132, BE at 140): one root entry = 10 bytes
+    // Path Table Size (LE 132..136, BE 136..140): one root entry = 10 bytes
     let path_table_size = 10u32;
     out[132..136].copy_from_slice(&path_table_size.to_le_bytes());
-    out[140..144].copy_from_slice(&path_table_size.to_be_bytes());
+    out[136..140].copy_from_slice(&path_table_size.to_be_bytes());
 
-    // Location of LE Path Table
+    // Location of LE Path Table (140..144)
     out[140..144].copy_from_slice(&layout.path_table_lba.to_le_bytes());
 
-    // Location of BE Path Table
+    // Location of BE Path Table (148..152)
     out[148..152].copy_from_slice(&layout.path_table_lba.to_be_bytes());
 
     // Root Directory Record (34 bytes at 156)
@@ -346,27 +346,27 @@ fn write_svd(layout: &Layout, out: &mut [u8]) {
     out[80..84].copy_from_slice(&layout.total.to_le_bytes());
     out[84..88].copy_from_slice(&layout.total.to_be_bytes());
 
-    // Volume Set Size = 1
+    // Volume Set Size = 1 (LE 120..122, BE 122..124)
     out[120..122].copy_from_slice(&1u16.to_le_bytes());
-    out[124..126].copy_from_slice(&1u16.to_be_bytes());
+    out[122..124].copy_from_slice(&1u16.to_be_bytes());
 
-    // Volume Sequence Number = 1
+    // Volume Sequence Number = 1 (LE 124..126, BE 126..128)
     out[124..126].copy_from_slice(&1u16.to_le_bytes());
-    out[128..130].copy_from_slice(&1u16.to_be_bytes());
+    out[126..128].copy_from_slice(&1u16.to_be_bytes());
 
-    // Logical Block Size = 2048
+    // Logical Block Size = 2048 (LE 128..130, BE 130..132)
     out[128..130].copy_from_slice(&(SECTOR_SIZE as u16).to_le_bytes());
-    out[132..134].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
+    out[130..132].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
 
-    // Path Table Size
+    // Path Table Size (LE 132..136, BE 136..140)
     let path_table_size = 10u32;
     out[132..136].copy_from_slice(&path_table_size.to_le_bytes());
-    out[140..144].copy_from_slice(&path_table_size.to_be_bytes());
+    out[136..140].copy_from_slice(&path_table_size.to_be_bytes());
 
-    // Location of LE Path Table
+    // Location of LE Path Table (140..144)
     out[140..144].copy_from_slice(&layout.path_table_lba.to_le_bytes());
 
-    // Location of BE Path Table
+    // Location of BE Path Table (148..152)
     out[148..152].copy_from_slice(&layout.path_table_lba.to_be_bytes());
 
     // Root Directory Record
@@ -456,10 +456,16 @@ fn write_root_directory(layout: &Layout, lba: u32, out: &mut [u8]) {
         &[0x01],
     );
 
-    // File entries
+    // File entries: data length = actual file size (ECMA-119 §9.1.5),
+    // not the rounded-up extent size.
     for extent in &layout.extents {
-        let data_len = extent.sectors * SECTOR_SIZE;
-        emit(&mut offset, extent.lba, data_len, 0x00, &extent.name);
+        emit(
+            &mut offset,
+            extent.lba,
+            extent.size as u32,
+            0x00,
+            &extent.name,
+        );
     }
 }
 
@@ -483,11 +489,11 @@ fn write_dir_record(
 
     out[o] = rec_len as u8; // Length of Directory Record
     out[o + 1] = 0x00; // Extended Attribute Record Length
-                       // Location of Extent (LE + BE)
+                       // Location of Extent (both-endian: LE 2..6, BE 6..10)
     out[o + 2..o + 6].copy_from_slice(&extent_lba.to_le_bytes());
-    out[o + 10..o + 14].copy_from_slice(&extent_lba.to_be_bytes());
-    // Data Length (LE + BE)
-    out[o + 6..o + 10].copy_from_slice(&data_len.to_le_bytes());
+    out[o + 6..o + 10].copy_from_slice(&extent_lba.to_be_bytes());
+    // Data Length (both-endian: LE 10..14, BE 14..18)
+    out[o + 10..o + 14].copy_from_slice(&data_len.to_le_bytes());
     out[o + 14..o + 18].copy_from_slice(&data_len.to_be_bytes());
     // Recording Date and Time (7 bytes at o+18): zeros
     // File Flags
@@ -519,8 +525,8 @@ fn write_dir_record_root_pvd(out: &mut [u8], offset: usize, root_lba: u32, root_
     out[o] = 34; // Length (33 + 1 for "\0" name)
     out[o + 1] = 0x00; // Ext Attr Length
     out[o + 2..o + 6].copy_from_slice(&root_lba.to_le_bytes());
-    out[o + 10..o + 14].copy_from_slice(&root_lba.to_be_bytes());
-    out[o + 6..o + 10].copy_from_slice(&data_len.to_le_bytes());
+    out[o + 6..o + 10].copy_from_slice(&root_lba.to_be_bytes());
+    out[o + 10..o + 14].copy_from_slice(&data_len.to_le_bytes());
     out[o + 14..o + 18].copy_from_slice(&data_len.to_be_bytes());
     // Date (7 bytes): zeros
     out[o + 25] = 0x02; // Flags: directory
@@ -814,6 +820,75 @@ mod tests {
         assert_eq!(sector[o + 32], 20); // name length
         assert_eq!(sector[o + 33], 0x00); // 'R' high byte
         assert_eq!(sector[o + 34], b'R'); // 'R' low byte
+    }
+
+    /// ECMA-119 §9.1: both-endian extent LBA and data length must sit at
+    /// record offsets 2/6 and 10/14 respectively. A previous swap put the
+    /// data length at 6..10 and the LBA big-endian half at 10..14, so
+    /// readers (kernel/isoinfo) reported garbage sizes and corrupted
+    /// directory entries.
+    #[test]
+    fn dir_record_both_endian_layout() {
+        let files = make_entries();
+        let layout = compute_layout(&files, "T").unwrap();
+        let mut sector = [0u8; 2048];
+        gen_sector(&layout, layout.root_dir_lba, &mut sector);
+        let o = 70; // first file record ("README.TXT", LBA 21, 1000 B)
+                    // LBA: LE at 2..6, BE at 6..10.
+        assert_eq!(
+            u32::from_le_bytes(sector[o + 2..o + 6].try_into().unwrap()),
+            21
+        );
+        assert_eq!(
+            u32::from_be_bytes(sector[o + 6..o + 10].try_into().unwrap()),
+            21
+        );
+        // Data length (actual file size): LE at 10..14, BE at 14..18.
+        assert_eq!(
+            u32::from_le_bytes(sector[o + 10..o + 14].try_into().unwrap()),
+            1000
+        );
+        assert_eq!(
+            u32::from_be_bytes(sector[o + 14..o + 18].try_into().unwrap()),
+            1000
+        );
+    }
+
+    /// PVD/SVD both-endian 16-bit fields must be interleaved (LE then BE
+    /// within the same 4-byte slot), not shifted by a full 4 bytes.
+    #[test]
+    fn pvd_both_endian_16bit_fields() {
+        let files = make_entries();
+        let layout = compute_layout(&files, "T").unwrap();
+        let mut sector = [0u8; 2048];
+        gen_sector(&layout, PVD_LBA, &mut sector);
+        // Volume set size (120..124), volume seq number (124..128),
+        // logical block size (128..132).
+        assert_eq!(u16::from_le_bytes(sector[120..122].try_into().unwrap()), 1);
+        assert_eq!(u16::from_be_bytes(sector[122..124].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(sector[124..126].try_into().unwrap()), 1);
+        assert_eq!(u16::from_be_bytes(sector[126..128].try_into().unwrap()), 1);
+        assert_eq!(
+            u16::from_le_bytes(sector[128..130].try_into().unwrap()),
+            SECTOR_SIZE as u16
+        );
+        assert_eq!(
+            u16::from_be_bytes(sector[130..132].try_into().unwrap()),
+            SECTOR_SIZE as u16
+        );
+        // Path table size (132..140): 10 bytes.
+        assert_eq!(u32::from_le_bytes(sector[132..136].try_into().unwrap()), 10);
+        assert_eq!(u32::from_be_bytes(sector[136..140].try_into().unwrap()), 10);
+        // SVD uses the same layout.
+        gen_sector(&layout, SVD_LBA, &mut sector);
+        assert_eq!(
+            u16::from_le_bytes(sector[128..130].try_into().unwrap()),
+            2048
+        );
+        assert_eq!(
+            u16::from_be_bytes(sector[130..132].try_into().unwrap()),
+            2048
+        );
     }
 
     #[test]
