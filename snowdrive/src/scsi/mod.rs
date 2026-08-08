@@ -26,6 +26,8 @@ pub mod cdblock;
 pub mod cdrom;
 pub mod cdrom_common;
 pub mod device;
+#[cfg(feature = "std")]
+pub mod fs_backend;
 pub mod sbc;
 #[allow(clippy::module_inception)]
 pub mod scsi;
