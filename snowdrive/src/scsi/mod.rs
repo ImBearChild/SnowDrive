@@ -23,6 +23,8 @@ pub mod backend;
 pub mod block;
 #[cfg(feature = "std")]
 pub mod cdblock;
+pub mod cdrom;
+pub mod cdrom_common;
 pub mod device;
 pub mod sbc;
 #[allow(clippy::module_inception)]

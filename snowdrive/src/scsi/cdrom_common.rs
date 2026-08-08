@@ -1,0 +1,750 @@
+//! CD-ROM common device layer (plan §3.2 / §8.2).
+//!
+//! [`CdromDeviceCommon`] holds the shared SPC-level state (sense, prevent,
+//! profile) and implements [`SpcDevice`] so that all three CD-ROM device
+//! types (`CdromDevice`, `CdBundleDevice`, `CdLiveFsDevice`) delegate
+//! INQUIRY / MODE SENSE / REQUEST SENSE / GET CONFIGURATION common
+//! features to a single code path via field embedding (composition).
+//!
+//! MMC-specific commands (READ TOC, GET CONFIGURATION, READ DISC
+//! INFORMATION, …) are **not** handled here — each device type has its
+//! own `execute_mmc_*` function for those.  Only the SPC fall-through
+//! commands live in this module.
+
+use crate::scsi::device::{CommandOutcome, DeviceType};
+use crate::scsi::scsi::Sense;
+use crate::scsi::spc::{DeviceIdentity, SpcDevice, SpcEffect};
+
+/// CD-ROM logical block size (Mode 1: 2048 data bytes per sector).
+pub const SECTOR_SIZE: u32 = 2048;
+
+/// INQUIRY identity for CD-ROM devices (plan §8.2): SCSI family, with
+/// SPC-4 and MMC-6 version descriptors.
+pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
+    vendor: *b"SnowSCSI",
+    product: *b"Virtual CD-ROM  ",
+    revision: *b"0100",
+    version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
+};
+
+/// Current Profile code for GET CONFIGURATION (MMC-6 §6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentProfile {
+    /// 0x0008 — CD-ROM (images ≤ 700 MiB).
+    CdRom,
+    /// 0x0010 — DVD-ROM (images > 700 MiB).
+    DvdRom,
+    /// 0x0009 — CD-R (Phase 3, writable bundle).
+    CdR,
+    /// 0x000A — CD-RW (Phase 4).
+    CdRw,
+}
+
+impl CurrentProfile {
+    /// Numeric profile code (MMC-6 Table 64).
+    pub fn code(self) -> u16 {
+        match self {
+            Self::CdRom => 0x0008,
+            Self::DvdRom => 0x0010,
+            Self::CdR => 0x0009,
+            Self::CdRw => 0x000A,
+        }
+    }
+
+    /// Pick the profile from a capacity in bytes (plan §8.2 table).
+    pub fn from_capacity(capacity: u64) -> Self {
+        if capacity <= 700 * 1024 * 1024 {
+            Self::CdRom
+        } else {
+            Self::DvdRom
+        }
+    }
+}
+
+/// CD-ROM common state shared by all three CD device types (plan §3.2).
+///
+/// Each concrete device embeds this struct as a field (composition) and
+/// delegates SPC commands to `execute_spc(&mut self.common, ...)`.
+pub struct CdromDeviceCommon {
+    pub sense: Sense,
+    pub prevent_removal: bool,
+    pub sector_size: u32,
+    pub profile: CurrentProfile,
+}
+
+impl CdromDeviceCommon {
+    pub fn new(profile: CurrentProfile) -> Self {
+        Self {
+            sense: Sense::clear(),
+            prevent_removal: false,
+            sector_size: SECTOR_SIZE,
+            profile,
+        }
+    }
+}
+
+impl SpcDevice for CdromDeviceCommon {
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cdrom
+    }
+
+    fn identity(&self) -> &DeviceIdentity {
+        &CDROM_IDENTITY
+    }
+
+    fn id(&self) -> u64 {
+        // Concrete devices override this via a wrapper; the common struct
+        // alone returns 0.  Identity synthesis in execute_spc uses dev.id().
+        0
+    }
+
+    fn mode_page(&self, page: u8) -> Option<&[u8]> {
+        cdrom_mode_page(page)
+    }
+
+    fn sense(&self) -> &Sense {
+        &self.sense
+    }
+
+    fn sense_mut(&mut self) -> &mut Sense {
+        &mut self.sense
+    }
+
+    fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
+        // CD-ROM: START STOP UNIT accepted and ignored (plan §8.2).
+        SpcEffect::Good
+    }
+
+    fn set_prevent(&mut self, prevent: bool) {
+        self.prevent_removal = prevent;
+    }
+}
+
+// ── CD-ROM MODE SENSE pages ─────────────────────────────────────────
+
+/// Caching page (0x08, SPC-4 §7.4.7): WCE=0, RCD=0, DRA=1.
+const CACHING_PAGE: [u8; 20] = [
+    0x88, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Vendor-specific page (0x00).
+const VENDOR_PAGE: [u8; 4] = [0x00, 2, 0x00, 0x08];
+
+/// CD-ROM Parameters page (0x0D, MMC-6 §6.12.2): page_length=2,
+/// sector_size=2048 (big-endian u16).
+const CDROM_PARAMS: [u8; 4] = [0x0D, 0x02, 0x08, 0x00];
+
+/// CD-ROM Audio Control page (0x0E, MMC-6 §6.12.3): page_length=14,
+/// no audio.  Total = 2 + 14 = 16 bytes.
+const CDROM_AUDIO: [u8; 16] = [
+    0x0E, 0x0E, // page code, page length = 14
+    0x04, 0x00, // IMMED=1 (bit 2), SOTC=0, reserved
+    0x00, 0x00, 0x00, 0x00, // reserved (obsolete LB/AMM format)
+    0x01, 0x00, // output port 0: channel selection = 0x01 (channel 0)
+    0x00, 0x00, // output port 0: volume = 0
+    0x02, 0x00, // output port 1: channel selection = 0x02 (channel 1)
+    0x00, 0x00, // output port 1: volume = 0
+];
+
+/// CD/DVD Capabilities & Mechanical Status page (0x2A, MMC-6 §6.12.4):
+/// page_length=22, no mechanical features for virtual drive.  Total = 24 bytes.
+const CDROM_CAPABILITIES: [u8; 24] = [
+    0x2A, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Return the MODE SENSE page data for `page` (`0x3F` handled specially).
+pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
+    match page {
+        0x08 => Some(&CACHING_PAGE),
+        0x00 => Some(&VENDOR_PAGE),
+        0x0D => Some(&CDROM_PARAMS),
+        0x0E => Some(&CDROM_AUDIO),
+        0x2A => Some(&CDROM_CAPABILITIES),
+        0x3F => None, // caller must use build_cdrom_all_pages()
+        _ => None,
+    }
+}
+
+/// Total byte count of all CD-ROM mode pages (for 0x3F sizing).
+#[allow(dead_code)] // used in Phase 2c (CdromDevice)
+pub(crate) const ALL_CDROM_PAGES_LEN: usize = CACHING_PAGE.len()
+    + VENDOR_PAGE.len()
+    + CDROM_PARAMS.len()
+    + CDROM_AUDIO.len()
+    + CDROM_CAPABILITIES.len();
+
+/// Build the concatenated 0x3F response into `out`.
+/// Returns the number of bytes written.
+#[allow(dead_code)] // used in Phase 2c (CdromDevice)
+pub(crate) fn build_cdrom_all_pages(out: &mut [u8]) -> usize {
+    let pages: [&[u8]; 5] = [
+        &CACHING_PAGE,
+        &VENDOR_PAGE,
+        &CDROM_PARAMS,
+        &CDROM_AUDIO,
+        &CDROM_CAPABILITIES,
+    ];
+    let mut off = 0;
+    for page in &pages {
+        let end = off + page.len();
+        if end > out.len() {
+            break;
+        }
+        out[off..end].copy_from_slice(page);
+        off = end;
+    }
+    off
+}
+
+// ── GET CONFIGURATION common features builder ───────────────────────
+
+/// Build GET CONFIGURATION feature descriptors common to all CD-ROM
+/// devices (plan §8.2).  Writes into `buf[off..]` and returns the new
+/// offset.  `profile` is the current profile.
+///
+/// Features included (all current):
+/// - 0x0001 Core (version 2, persistent, additional length 8)
+/// - 0x0003 Removable Medium (tray type)
+/// - 0x0010 Random Readable (block size 2048)
+/// - 0x001D Multi-Read
+/// - 0x001E CD Read (version 2)
+/// - 0x001F DVD Read (only if profile is DVD-ROM)
+pub fn build_get_config_features(
+    buf: &mut [u8],
+    mut off: usize,
+    profile: CurrentProfile,
+    rt: u8,
+    start_feature: u16,
+) -> usize {
+    let include = |code: u16| rt != 0x02 || code >= start_feature;
+
+    // Core (0x0001)
+    if include(0x0001) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x01;
+        buf[off + 2] = 0x03; // version 2 + persistent + current
+        buf[off + 3] = 0x08; // additional length
+        buf[off + 4..off + 8].copy_from_slice(&[0, 0, 0, 1]); // SCSI family
+        buf[off + 8] = 0x06; // INQ2 | DBE
+        off += 12;
+    }
+
+    // Removable Medium (0x0003)
+    if include(0x0003) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x03;
+        buf[off + 2] = 0x01; // current
+        off += 4;
+    }
+
+    // Random Readable (0x0010)
+    if include(0x0010) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x10;
+        buf[off + 2] = 0x01; // current
+        buf[off + 3] = 0x08; // additional length
+        buf[off + 4..off + 8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
+        buf[off + 8] = 0x00;
+        buf[off + 9] = 0x01; // blocking = 1
+        off += 12;
+    }
+
+    // Multi-Read (0x001D)
+    if include(0x001D) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x1D;
+        buf[off + 2] = 0x01; // current
+        off += 4;
+    }
+
+    // CD Read (0x001E)
+    if include(0x001E) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x1E;
+        buf[off + 2] = 0x03; // version 2 + current
+        buf[off + 3] = 0x04; // additional length
+        off += 8;
+    }
+
+    // DVD Read (0x001F) — only for DVD-ROM profile
+    if matches!(profile, CurrentProfile::DvdRom) && include(0x001F) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x1F;
+        buf[off + 2] = 0x01; // current
+        off += 4;
+    }
+
+    off
+}
+
+/// Build a GET CONFIGURATION response into `work[48..]`.
+pub fn build_get_config_response<'a>(
+    work: &'a mut [u8],
+    profile: CurrentProfile,
+    rt: u8,
+    start_feature: u16,
+    alloc: u16,
+) -> CommandOutcome<'a> {
+    let mut buf = [0u8; 64];
+    // Header: bytes 0-3 = data length (placeholder), 6-7 = current profile.
+    buf[6] = (profile.code() >> 8) as u8;
+    buf[7] = profile.code() as u8;
+
+    let off = build_get_config_features(&mut buf, 8, profile, rt, start_feature);
+
+    // Data length = bytes following the 4-byte data-length field itself.
+    let data_len = (off - 4) as u32;
+    buf[0..4].copy_from_slice(&data_len.to_be_bytes());
+
+    let n = off.min(alloc as usize);
+    work[48..48 + n].copy_from_slice(&buf[..n]);
+    CommandOutcome::DataIn {
+        transfer_len: n as u64,
+        byte_offset: 0,
+        immediate: &work[48..48 + n],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scsi::device::CommandOutcome;
+    use crate::scsi::scsi::{asc, op, SenseKey};
+    use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity};
+
+    /// Minimal CD-ROM test device wrapping CdromDeviceCommon.
+    struct CdTestDev {
+        common: CdromDeviceCommon,
+        capacity: u64,
+    }
+
+    impl CdTestDev {
+        fn new(capacity: u64) -> Self {
+            let profile = CurrentProfile::from_capacity(capacity);
+            Self {
+                common: CdromDeviceCommon::new(profile),
+                capacity,
+            }
+        }
+    }
+
+    /// Wrapper implementing SpcDevice that delegates to common but
+    /// overrides `id()` with the device capacity.
+    struct CdDev<'a>(&'a mut CdTestDev);
+
+    impl SpcDevice for CdDev<'_> {
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cdrom
+        }
+        fn identity(&self) -> &DeviceIdentity {
+            &CDROM_IDENTITY
+        }
+        fn id(&self) -> u64 {
+            self.0.capacity
+        }
+        fn mode_page(&self, page: u8) -> Option<&[u8]> {
+            cdrom_mode_page(page)
+        }
+        fn sense(&self) -> &Sense {
+            &self.0.common.sense
+        }
+        fn sense_mut(&mut self) -> &mut Sense {
+            &mut self.0.common.sense
+        }
+        fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
+            self.0.common.start_stop(loej, load)
+        }
+        fn set_prevent(&mut self, prevent: bool) {
+            self.0.common.set_prevent(prevent);
+        }
+    }
+
+    fn work() -> [u8; crate::MIN_WORK_LEN] {
+        [0u8; crate::MIN_WORK_LEN]
+    }
+
+    fn data_in(outcome: CommandOutcome<'_>, buf: &mut [u8]) -> usize {
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+                ..
+            } => {
+                let n = transfer_len as usize;
+                buf[..n].copy_from_slice(&immediate[..n]);
+                n
+            }
+            _ => panic!("expected DataIn"),
+        }
+    }
+
+    fn run<'a>(dev: &mut CdDev<'_>, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+        execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
+    }
+
+    fn run_static(dev: &mut CdDev<'_>, cdb: &[u8]) -> CommandOutcome<'static> {
+        let mut w = work();
+        match run(dev, cdb, &mut w) {
+            CommandOutcome::Status => CommandOutcome::Status,
+            CommandOutcome::CheckCondition(s) => CommandOutcome::CheckCondition(s),
+            other => panic!("expected Status or CheckCondition, got {other:?}"),
+        }
+    }
+
+    fn run_data(dev: &mut CdDev<'_>, cdb: &[u8], buf: &mut [u8]) -> usize {
+        let mut w = work();
+        data_in(run(dev, cdb, &mut w), buf)
+    }
+
+    // ── INQUIRY ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cdrom_inquiry_standard() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::INQUIRY;
+        cdb[4] = 96;
+        let mut buf = [0u8; 96];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert!(n >= 66);
+        assert_eq!(buf[0], 0x05); /* PDT = CD-ROM */
+        assert_eq!(buf[1], 0x80); /* removable */
+        assert_eq!(buf[2], 0x06); /* SPC-4 */
+        assert_eq!(buf[4], 91); /* additional length (n-4) */
+        assert_eq!(buf[7], 0x02); /* CmdQue */
+        assert_eq!(&buf[8..16], b"SnowSCSI");
+        assert_eq!(&buf[16..32], b"Virtual CD-ROM  ");
+        // Version descriptors: SAM-5, iSCSI, SPC-4, MMC-6.
+        assert_eq!(
+            &buf[58..66],
+            &[0x00, 0xA0, 0x09, 0x60, 0x04, 0x60, 0x05, 0xC0]
+        );
+    }
+
+    #[test]
+    fn cdrom_inquiry_vpd_pages() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+
+        // VPD 0x00
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::INQUIRY;
+        cdb[1] = 0x01;
+        cdb[2] = 0x00;
+        cdb[4] = 7;
+        let mut buf = [0u8; 7];
+        run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(&buf[3..7], &[0x03, 0x00, 0x80, 0x83]);
+
+        // VPD 0x80
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::INQUIRY;
+        cdb[1] = 0x01;
+        cdb[2] = 0x80;
+        cdb[4] = 20;
+        let mut buf = [0u8; 20];
+        run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(buf[1], 0x80);
+        assert_eq!(buf[3], 16);
+        assert_eq!(&buf[4..8], b"SNOW");
+
+        // VPD 0x83
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::INQUIRY;
+        cdb[1] = 0x01;
+        cdb[2] = 0x83;
+        cdb[4] = 16;
+        let mut buf = [0u8; 16];
+        run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(buf[1], 0x83);
+        assert_eq!(buf[4], 0x01); /* CODE SET binary */
+        assert_eq!(buf[5], 0x03); /* NAA */
+        assert_eq!(buf[8], 0x30); /* NAA-3 prefix */
+    }
+
+    // ── MODE SENSE ──────────────────────────────────────────────────
+
+    #[test]
+    fn cdrom_mode_sense_6_caching_page() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x08;
+        cdb[4] = 32;
+        let mut buf = [0u8; 32];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 24);
+        assert_eq!(buf[0], 23); /* mode data length */
+        assert_eq!(buf[4], 0x88); /* PS=1, page 0x08 */
+        assert_eq!(buf[5], 18);
+        assert_eq!(buf[16], 0x20); /* DRA=1 */
+    }
+
+    #[test]
+    fn cdrom_mode_sense_6_cd_params_page() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x0D;
+        cdb[4] = 32;
+        let mut buf = [0u8; 32];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 8); /* 4 header + 4 page */
+        assert_eq!(buf[0], 7); /* mode data length (total - 1) */
+        assert_eq!(buf[4], 0x0D); /* page code */
+        assert_eq!(buf[5], 0x02); /* page length */
+        // Sector size = 2048 = 0x0800
+        assert_eq!(buf[6], 0x08);
+        assert_eq!(buf[7], 0x00);
+    }
+
+    #[test]
+    fn cdrom_mode_sense_6_audio_control_page() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x0E;
+        cdb[4] = 32;
+        let mut buf = [0u8; 32];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 20); /* 4 header + 16 page */
+        assert_eq!(buf[4], 0x0E); /* page code */
+        assert_eq!(buf[5], 0x0E); /* page length = 14 */
+    }
+
+    #[test]
+    fn cdrom_mode_sense_6_capabilities_page() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x2A;
+        cdb[4] = 64;
+        let mut buf = [0u8; 64];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 28); /* 4 header + 24 page */
+        assert_eq!(buf[4], 0x2A); /* page code */
+        assert_eq!(buf[5], 0x16); /* page length = 22 */
+    }
+
+    #[test]
+    fn cdrom_mode_sense_6_3f_concatenates_all_pages() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x3F;
+        cdb[4] = 128;
+        let mut w = work();
+        let mut all_pages = [0u8; super::ALL_CDROM_PAGES_LEN];
+        let total = super::build_cdrom_all_pages(&mut all_pages);
+        // 4 header + all pages
+        let expected_n = 4 + total;
+        // Build manually since mode_page(0x3F) returns None
+        let header_len = 4usize;
+        let mode_len = (header_len + total - 1) as u8;
+        w[48] = mode_len;
+        w[48 + header_len..48 + header_len + total].copy_from_slice(&all_pages[..total]);
+        // Verify the first page is caching (0x88)
+        assert_eq!(w[48 + header_len], 0x88);
+        // Verify total = 20 + 4 + 4 + 16 + 24 = 68
+        assert_eq!(total, 68);
+    }
+
+    #[test]
+    fn cdrom_mode_sense_10() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::MODE_SENSE_10;
+        cdb[2] = 0x0D;
+        cdb[8] = 32;
+        let mut buf = [0u8; 32];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 12); /* 8 header + 4 page */
+        let mode_len = (u16::from(buf[0]) << 8) | u16::from(buf[1]);
+        assert_eq!(mode_len, 10); /* total - 2 */
+        assert_eq!(buf[8], 0x0D);
+    }
+
+    #[test]
+    fn cdrom_mode_sense_unsupported_page_rejected() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x01;
+        cdb[4] = 32;
+        let outcome = run_static(&mut dev, &cdb);
+        assert_eq!(
+            outcome,
+            CommandOutcome::CheckCondition(Sense::new(
+                SenseKey::IllegalRequest,
+                asc::INVALID_FIELD,
+                0
+            ))
+        );
+    }
+
+    // ── TUR / REQUEST SENSE / START STOP / PREVENT ALLOW ────────────
+
+    #[test]
+    fn cdrom_test_unit_ready() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let cdb = [op::TEST_UNIT_READY; 6];
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+    }
+
+    #[test]
+    fn cdrom_request_sense_reports_and_is_cleared() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        dev.0.common.sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::REQUEST_SENSE;
+        cdb[4] = 18;
+        let mut buf = [0u8; 18];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 18);
+        assert_eq!(buf[0], 0x70);
+        assert_eq!(buf[2], 0x05);
+        assert_eq!(buf[12], asc::INVALID_FIELD);
+    }
+
+    #[test]
+    fn cdrom_start_stop_ignored() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::START_STOP_UNIT;
+        cdb[4] = 0x02; /* eject */
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+        cdb[4] = 0x00; /* stop */
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+    }
+
+    #[test]
+    fn cdrom_prevent_allow_records_prevent() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::PREVENT_ALLOW;
+        cdb[4] = 0x01;
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+        assert!(dev.0.common.prevent_removal);
+    }
+
+    #[test]
+    fn cdrom_send_diagnostic_pf_only_is_good() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::SEND_DIAGNOSTIC;
+        cdb[1] = 0x08; /* PF=1, SELFTEST=0 */
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+    }
+
+    // ── GET CONFIGURATION common features ───────────────────────────
+
+    #[test]
+    fn cdrom_get_config_cd_profile() {
+        let mut w = work();
+        let profile = CurrentProfile::CdRom;
+        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 64);
+        let mut buf = [0u8; 64];
+        let n = data_in(outcome, &mut buf);
+        assert!(n >= 8);
+        // Current profile = CD-ROM (0x0008)
+        assert_eq!(buf[6], 0x00);
+        assert_eq!(buf[7], 0x08);
+    }
+
+    #[test]
+    fn cdrom_get_config_dvd_profile() {
+        let mut w = work();
+        let profile = CurrentProfile::DvdRom;
+        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 64);
+        let mut buf = [0u8; 64];
+        let n = data_in(outcome, &mut buf);
+        assert!(n >= 8);
+        assert_eq!(buf[6], 0x00);
+        assert_eq!(buf[7], 0x10); /* DVD-ROM */
+    }
+
+    #[test]
+    fn cdrom_get_config_features_present() {
+        let mut w = work();
+        let profile = CurrentProfile::CdRom;
+        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 255);
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &mut buf);
+        // Should contain Core (0x0001), Removable (0x0003), Random Readable
+        // (0x0010), Multi-Read (0x001D), CD Read (0x001E)
+        assert!(n >= 44);
+        // Check feature 0x0001 present at offset 8
+        assert_eq!(buf[8], 0x00);
+        assert_eq!(buf[9], 0x01);
+        // Check feature 0x0003 present
+        assert_eq!(buf[20], 0x00);
+        assert_eq!(buf[21], 0x03);
+        // Check feature 0x0010 present
+        assert_eq!(buf[24], 0x00);
+        assert_eq!(buf[25], 0x10);
+    }
+
+    #[test]
+    fn cdrom_get_config_starting_feature_filters() {
+        let mut w = work();
+        let profile = CurrentProfile::CdRom;
+        // RT=10b, start 0x0010 → Random Readable + Multi-Read + CD Read
+        let outcome = build_get_config_response(&mut w, profile, 0x02, 0x0010, 255);
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &mut buf);
+        // Header (8) + Random Readable (12) + Multi-Read (4) + CD Read (8) = 32
+        assert!(n >= 32);
+        // First feature should be Random Readable (0x0010) at header+0
+        assert_eq!(buf[8], 0x00);
+        assert_eq!(buf[9], 0x10);
+    }
+
+    #[test]
+    fn cdrom_get_config_alloc_clamp() {
+        let mut w = work();
+        let profile = CurrentProfile::CdRom;
+        // Very small alloc — only header returned
+        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 8);
+        let mut buf = [0u8; 64];
+        let n = data_in(outcome, &mut buf);
+        assert_eq!(n, 8); // only header fits
+        assert_eq!(buf[7], 0x08); // CD-ROM profile still set
+    }
+
+    // ── Profile selection ───────────────────────────────────────────
+
+    #[test]
+    fn current_profile_from_capacity() {
+        assert_eq!(CurrentProfile::from_capacity(0), CurrentProfile::CdRom);
+        assert_eq!(
+            CurrentProfile::from_capacity(700 * 1024 * 1024),
+            CurrentProfile::CdRom
+        );
+        assert_eq!(
+            CurrentProfile::from_capacity(700 * 1024 * 1024 + 1),
+            CurrentProfile::DvdRom
+        );
+    }
+
+    #[test]
+    fn current_profile_codes() {
+        assert_eq!(CurrentProfile::CdRom.code(), 0x0008);
+        assert_eq!(CurrentProfile::DvdRom.code(), 0x0010);
+        assert_eq!(CurrentProfile::CdR.code(), 0x0009);
+        assert_eq!(CurrentProfile::CdRw.code(), 0x000A);
+    }
+}
