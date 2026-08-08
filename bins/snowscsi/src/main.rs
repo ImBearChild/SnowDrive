@@ -238,6 +238,8 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         let result = match dev {
             Device::Block(d) => d.backend().sync(),
             Device::CdBlock(d) => d.backend().sync(),
+            Device::CdFlat(d) => d.backend().sync(),
+            Device::CdLiveFs(d) => d.sync().map_err(Into::into),
         };
         if let Err(e) = result {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");

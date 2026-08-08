@@ -172,6 +172,11 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         &self.layout
     }
 
+    /// Flush the underlying filesystem (graceful-shutdown path).
+    pub fn sync(&mut self) -> Result<(), FsError> {
+        self.fs.sync()
+    }
+
     pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
         self.common.sense = Sense::new(key, asc, ascq);
     }
