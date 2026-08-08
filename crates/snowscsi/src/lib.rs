@@ -3,8 +3,14 @@
 //! SCSI device emulation + iSCSI target protocol.
 //!
 //! ## Modules
-//! - [`scsi`]: opcodes, sense data, CDB field parsing (SPC-4 / SBC-3)
-//! - [`device`]: command outcome + device types (device.h)
+//! - [`scsi`]: opcodes, sense data, CDB field parsing (SPC-4 / SBC-3) —
+//!   now a thin re-export of `snowdrive::scsi::scsi` (moved in the
+//!   unified lib crate).
+//! - [`device`]: command outcome + device types — the simple types
+//!   (`CommandOutcome` / `DeviceType` / `Error`) are re-exported from
+//!   `snowdrive::scsi::device`; the `ScsiDevice` trait and the
+//!   `Device<'_>` enum still live here until the rest of `snowscsi` is
+//!   folded in.
 //! - [`backend`]: file block backend + re-exports of the storage seam
 //!   (`BlockStorage` / `BlockStorageError` / `RamBackend` live in
 //!   `snowcommon::block_storage`)

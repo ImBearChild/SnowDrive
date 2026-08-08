@@ -1,7 +1,7 @@
 //! # SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit.
 //!
-//! This is the `snowdrive` lib crate (plan §15.7).  All functionality is
-//! gated by Cargo features so the public surface matches the use case:
+//! This is the `snowdrive` lib crate.  All functionality is gated by
+//! Cargo features so the public surface matches the use case:
 //!
 //! | Use case | Required features |
 //! |----------|-------------------|
@@ -14,7 +14,7 @@
 //! ## Modules
 //! - [`common`]: zero-alloc storage seams + unified logging macros
 //!   (always available, no feature gate).
-//! - `scsi` *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
+//! - [`scsi`] *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
 //! - `iso9660` *(gated by `iso9660`)*: ISO9660/Joliet algorithms.
 //! - `capi` *(gated by `capi`)*: C ABI exports (`#[allow(unsafe_code)]`).
 
@@ -22,3 +22,5 @@
 #![deny(unsafe_code)]
 
 pub mod common;
+#[cfg(feature = "scsi")]
+pub mod scsi;
