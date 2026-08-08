@@ -24,3 +24,9 @@
 pub mod common;
 #[cfg(feature = "scsi")]
 pub mod scsi;
+
+/// Minimum work-buffer size: BHS (48) + MaxRecvDataSegmentLength (8192) +
+/// padding (≤ 3) = 8240 (derived in the plan; see also the iSCSI target
+/// state machine). Any `&mut [u8]` passed to `do_cmd` / `step` must be
+/// at least this long.
+pub const MIN_WORK_LEN: usize = 48 + 8192;

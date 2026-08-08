@@ -23,3 +23,4 @@ pub mod backend;
 pub mod device;
 #[allow(clippy::module_inception)]
 pub mod scsi;
+pub mod spc;
