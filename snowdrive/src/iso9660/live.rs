@@ -94,6 +94,12 @@ const MAX_DIR_REC_LEN: usize = 33 + MAX_JOLIET_NAME_BYTES + 1;
 /// Largest path-table record: 8-byte header + identifier + pad-to-even.
 const MAX_PT_REC_LEN: usize = 8 + MAX_JOLIET_NAME_BYTES + 1;
 
+/// Fixed recording date for directory records (7 bytes: year-1900, month,
+/// day, hour, minute, second, GMT offset in 15-min units). The generator
+/// has no clock, so a valid sentinel (1980-01-01 00:00:00 +0, the FAT
+/// epoch) is recorded; all-zero dates display as garbage (e.g. 1899).
+const FIXED_RECORDING_DATE: [u8; 7] = [80, 1, 1, 0, 0, 0, 0];
+
 // ── Input types ─────────────────────────────────────────────────────
 
 /// File tree entry provided by the device layer.
@@ -804,7 +810,8 @@ fn write_dir_record(
     // Data Length (both-endian: LE 10..14, BE 14..18)
     out[o + 10..o + 14].copy_from_slice(&data_len.to_le_bytes());
     out[o + 14..o + 18].copy_from_slice(&data_len.to_be_bytes());
-    // Recording Date and Time (7 bytes at o+18): zeros
+    // Recording Date and Time (7 bytes at o+18): fixed sentinel.
+    out[o + 18..o + 25].copy_from_slice(&FIXED_RECORDING_DATE);
     // File Flags
     out[o + 25] = flags;
     // File Unit Size
@@ -837,7 +844,8 @@ fn write_dir_record_root_pvd(out: &mut [u8], offset: usize, root_lba: u32, root_
     out[o + 6..o + 10].copy_from_slice(&root_lba.to_be_bytes());
     out[o + 10..o + 14].copy_from_slice(&data_len.to_le_bytes());
     out[o + 14..o + 18].copy_from_slice(&data_len.to_be_bytes());
-    // Date (7 bytes): zeros
+    // Recording Date and Time (7 bytes at o+18): fixed sentinel.
+    out[o + 18..o + 25].copy_from_slice(&FIXED_RECORDING_DATE);
     out[o + 25] = 0x02; // Flags: directory
     out[o + 26] = 0x00; // File Unit Size
     out[o + 27] = 0x00; // Interleave Gap Size
@@ -1284,10 +1292,13 @@ mod tests {
         assert_eq!(sector[25], 0x02); // directory flag
         assert_eq!(sector[32], 0x01); // name length
         assert_eq!(sector[33], 0x00); // root name
-                                      // ".." entry starts at offset 35
+                                      // Fixed sentinel recording date (1980-01-01 +0), not zeros.
+        assert_eq!(&sector[18..25], &FIXED_RECORDING_DATE);
+        // ".." entry starts at offset 35
         assert_eq!(sector[35], 35);
         assert_eq!(sector[35 + 25], 0x02);
         assert_eq!(sector[35 + 33], 0x01); // parent name
+        assert_eq!(&sector[35 + 18..35 + 25], &FIXED_RECORDING_DATE);
     }
 
     #[test]
