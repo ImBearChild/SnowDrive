@@ -3,15 +3,27 @@
 //! Reports itself as a CD-ROM (PDT=0x05) while reading a flat ISO image
 //! through a read-only [`FileBackend`]. Implements a minimal MMC command set
 //! (READ TOC, GET CONFIGURATION); SPC commands (INQUIRY, MODE SENSE, ...) are
-//! delegated to [`crate::spc`]; all write commands return DATA PROTECT.
+//! delegated to [`crate::scsi::spc`]; all write commands return DATA PROTECT.
 //! Because the backing store is always a read-only file, this module is
 //! `std`-gated (`RamBackend` images are not supported).
+//!
+//! ## Scope boundary
+//!
+//! This device is a **deliberately independent, self-contained implementation
+//! that lives in the SCSI core**: no filesystem backend, no external
+//! dependencies. It is a "lazy CD" — it only does the minimum needed to be a
+//! mountable read-only CD-ROM, and it does **not** chase burner-tool
+//! compatibility (READ BUFFER CAPACITY, SET SPEED, write-parameters mode
+//! page, READ DISC/TRACK INFO, ...). Tools like `cdrwtool` probe that full
+//! MMC surface and will fail against this device — use [`crate::cdrom`]
+//! (`CdromDevice` / `CdLiveFsDevice`) when a complete MMC command set is
+//! required. READ TOC (0x43) is kept because the
+//! Linux `sr`/generic-cdrom driver needs it to mount `/dev/srX`.
 
 use crate::scsi::backend::{BlockStorage, BlockStorageError, FileBackend};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 use crate::scsi::scsi::{
-    asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
-    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, Sense, SenseKey,
+    asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, op, Sense, SenseKey,
 };
 use crate::scsi::spc::{
     block_mode_page, execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect,
@@ -120,19 +132,27 @@ impl CDBlockDevice {
         let outcome = if let Some(cmd) = parse_spc(cdb) {
             execute_spc(self, cmd, work, dsl)
         } else {
-            match cdb_opcode(cdb) {
-                op::READ_6 => self.read_cmd(u64::from(cdb_lba6(cdb)), cdb_transfer_len6(cdb), work),
-                op::READ_10 => self.read_cmd(
-                    u64::from(cdb_lba10(cdb)),
-                    u32::from(cdb_transfer_len10(cdb)),
-                    work,
-                ),
-                op::READ_12 => {
-                    self.read_cmd(u64::from(cdb_lba12(cdb)), cdb_transfer_len12(cdb), work)
+            // Total: `do_cmd` is public API — reject CDBs shorter than
+            // their opcode group's fixed length (SPC-4 §7.3) before any
+            // field access, instead of panicking on a short slice.
+            let Some(op) = cdb_opcode(cdb) else {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+            };
+            if cdb.len() < usize::from(cdb_len_from_opcode(op)) {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+            }
+            match op {
+                op::READ_6 | op::READ_10 | op::READ_12 | op::READ_16 => {
+                    let Some((lba, count)) = cdb_read_args(op, cdb) else {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+                    };
+                    self.read_cmd(lba, count, work)
                 }
-                op::READ_16 => self.read_cmd(cdb_lba16(cdb), cdb_transfer_len16(cdb), work),
                 op::READ_CAPACITY_10 => {
-                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, cdb_lba10(cdb), work)
+                    let Some(lba) = cdb_lba10(cdb) else {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+                    };
+                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, work)
                 }
                 op::SERVICE_ACTION_IN => {
                     let alloc = (u32::from(cdb[10]) << 24)

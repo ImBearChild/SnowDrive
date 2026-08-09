@@ -498,10 +498,11 @@ mod tests {
         assert_eq!(&bhs[20..24], &be32(0xFFFF_FFFF));
     }
 
-    // ── Invalid LUN → Reject 0x09 with the rejected header ─────────
+    // ── Unsupported LUN → SCSI Check Condition / LOGICAL UNIT NOT SUPPORTED ──
+    // ── Malformed (multi-level) LUN → Reject 0x09 with the rejected header ──
 
     #[test]
-    fn reject_invalid_lun() {
+    fn unsupported_lun_check_condition() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
         let mut work = vec![0u8; MIN_WORK_LEN];
@@ -512,6 +513,43 @@ mod tests {
 
         let mut cmd = read10_bhs(0, 1, 0x1111, 0);
         cmd[9] = 5; // LUN out of range (only LUN 0 exists)
+        conn.feed(&cmd, &[]);
+        // A well-formed single-level LUN that is absent is a SCSI-level
+        // error, not a session-level protocol failure → the connection
+        // stays open (Processed), and the response carries the sense.
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::CHECK_CONDITION);
+        assert_eq!(&bhs[16..20], &be32(0x1111)); // ITT echoed
+        // Data segment: 2-byte SenseLength (18) + fixed sense 70h.
+        assert_eq!(&data[0..2], &[0x00, 18]);
+        assert_eq!(data[2], 0x70); // response code (fixed format)
+        assert_eq!(data[4], 0x05); // ILLEGAL REQUEST
+        assert_eq!(data[14], 0x25); // ASC = LOGICAL UNIT NOT SUPPORTED
+        assert_eq!(data[15], 0x00); // ASCQ
+    }
+
+    #[test]
+    fn multi_level_lun_rejected_as_pdu_field() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // SAM-2 multi-level (logical unit) addressing: byte 8 address
+        // method bits 6-3 = 0100b. Byte 9 alone is meaningless for this
+        // encoding, so the target must not reinterpret it as a LUN id.
+        let mut cmd = read10_bhs(0, 1, 0x2222, 0);
+        cmd[8] = 0x40;
+        cmd[9] = 0; // would decode to LUN 0 (in range) if mis-read
         conn.feed(&cmd, &[]);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
@@ -1017,9 +1055,11 @@ mod tests {
     }
 
     #[test]
-    fn report_luns_rejects_out_of_range_lun() {
+    fn report_luns_on_unsupported_lun_check_condition() {
         // The LUN-validity check happens before the REPORT LUNS intercept,
-        // so an out-of-range LUN in the BHS still gets Rejected.
+        // so an out-of-range single-level LUN in the BHS still yields a
+        // SCSI error — CHECK CONDITION / LOGICAL UNIT NOT SUPPORTED
+        // (SPC-3 §6.21) — not an iSCSI Reject.
         let mut ram = vec![0u8; 16 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -1034,11 +1074,15 @@ mod tests {
         conn.feed(&cmd, &[]);
         assert_eq!(
             session.step(&mut conn, &mut work, &mut devs),
-            StepResult::Closed
+            StepResult::Processed
         );
-        let (bhs, _) = conn.take_pdu().unwrap();
-        assert_eq!(bhs[0] & 0x3F, op::REJECT);
-        assert_eq!(bhs[2], reject::INVALID_PDU_FIELD);
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::CHECK_CONDITION);
+        assert_eq!(&bhs[16..20], &be32(0xDEAD)); // ITT echoed
+        assert_eq!(data[2], 0x70);
+        assert_eq!(data[4], 0x05); // ILLEGAL REQUEST
+        assert_eq!(data[14], 0x25); // LOGICAL UNIT NOT SUPPORTED
     }
 
     // ── Mixed heterogeneous LUNs: Device enum (Block + CdBlock) ───────
@@ -1143,9 +1187,9 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_cdflat_and_livefs_dispatch() {
+        use snowdrive::cdrom::CdLiveFsDevice;
+        use snowdrive::cdrom::CdromDevice;
         use snowdrive::scsi::backend::{BlockBackend, FileBackend};
-        use snowdrive::scsi::cdrom::CdromDevice;
-        use snowdrive::scsi::cdrom_livefs::CdLiveFsDevice;
         use snowdrive::scsi::device::Device;
         use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
 

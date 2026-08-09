@@ -42,6 +42,7 @@ pub mod asc {
     pub const INVALID_COMMAND: u8 = 0x20;
     pub const LBA_OUT_OF_RANGE: u8 = 0x21;
     pub const INVALID_FIELD: u8 = 0x24;
+    pub const LOGICAL_UNIT_NOT_SUPPORTED: u8 = 0x25;
     pub const WRITE_PROTECTED: u8 = 0x27;
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
     pub const MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
@@ -108,74 +109,143 @@ impl Sense {
     }
 }
 
-/// CDB operation code: byte 0 (SPC-4 §7.3).
-pub fn cdb_opcode(cdb: &[u8]) -> u8 {
-    cdb[0]
+/// Fixed CDB length for an opcode group code (SPC-4 §7.3).
+///
+/// Groups: 0→6, 1/2→10, 4→16, 5→12 bytes; reserved/vendor groups default
+/// to 6. This is the canonical mapping — the iSCSI layer uses it to extract
+/// the CDB from the BHS (RFC 3720 §10.3.5) and the parser layers use it as
+/// a total-ness gate before field access.
+pub const fn cdb_len_from_opcode(opcode: u8) -> u8 {
+    match (opcode >> 5) & 0x07 {
+        0 => 6,
+        1 | 2 => 10,
+        4 => 16,
+        5 => 12,
+        _ => 6,
+    }
+}
+
+/// CDB operation code: byte 0 (SPC-4 §7.3). Returns `None` for an empty
+/// CDB.
+///
+/// Every accessor in this module returns `Option` so the public parsing
+/// surface is total — a caller holding a group-length CDB (the iSCSI
+/// target always is) can unwrap safely, and short/empty slices yield
+/// `None` instead of panicking.
+pub fn cdb_opcode(cdb: &[u8]) -> Option<u8> {
+    cdb.first().copied()
 }
 
 /// READ(6)/WRITE(6) logical block address: byte1[4:0], byte2, byte3.
 ///
 /// LBA is 21 bits: `(cdb[1] & 0x1F) << 16 | cdb[2] << 8 | cdb[3]`
-/// (SBC-3 §5.10).
-pub fn cdb_lba6(cdb: &[u8]) -> u32 {
-    (u32::from(cdb[1] & 0x1F) << 16) | (u32::from(cdb[2]) << 8) | u32::from(cdb[3])
+/// (SBC-3 §5.10). Requires at least 4 bytes.
+pub fn cdb_lba6(cdb: &[u8]) -> Option<u32> {
+    if cdb.len() < 4 {
+        return None;
+    }
+    Some((u32::from(cdb[1] & 0x1F) << 16) | (u32::from(cdb[2]) << 8) | u32::from(cdb[3]))
 }
 
 /// READ(6)/WRITE(6) transfer length (byte4). A value of 0 means 256
-/// logical blocks (SBC-3 §5.10).
-pub fn cdb_transfer_len6(cdb: &[u8]) -> u32 {
-    let raw = cdb[4];
-    if raw == 0 {
-        256
-    } else {
-        u32::from(raw)
+/// logical blocks (SBC-3 §5.10). Requires at least 5 bytes.
+pub fn cdb_transfer_len6(cdb: &[u8]) -> Option<u32> {
+    if cdb.len() < 5 {
+        return None;
     }
+    let raw = cdb[4];
+    Some(if raw == 0 { 256 } else { u32::from(raw) })
 }
 
 /// READ(10)/WRITE(10) logical block address: bytes 2..=5 (SBC-3 §5.11).
-pub fn cdb_lba10(cdb: &[u8]) -> u32 {
-    (u32::from(cdb[2]) << 24)
-        | (u32::from(cdb[3]) << 16)
-        | (u32::from(cdb[4]) << 8)
-        | u32::from(cdb[5])
+/// Requires at least 6 bytes.
+pub fn cdb_lba10(cdb: &[u8]) -> Option<u32> {
+    if cdb.len() < 6 {
+        return None;
+    }
+    Some(
+        (u32::from(cdb[2]) << 24)
+            | (u32::from(cdb[3]) << 16)
+            | (u32::from(cdb[4]) << 8)
+            | u32::from(cdb[5]),
+    )
 }
 
 /// READ(10)/WRITE(10) transfer length: bytes 7..=8 (SBC-3 §5.11).
-pub fn cdb_transfer_len10(cdb: &[u8]) -> u16 {
-    (u16::from(cdb[7]) << 8) | u16::from(cdb[8])
+/// Requires at least 9 bytes.
+pub fn cdb_transfer_len10(cdb: &[u8]) -> Option<u16> {
+    if cdb.len() < 9 {
+        return None;
+    }
+    Some((u16::from(cdb[7]) << 8) | u16::from(cdb[8]))
 }
 
 /// READ(12)/WRITE(12) logical block address: bytes 2..=5 (SBC-3 §5.12).
-pub fn cdb_lba12(cdb: &[u8]) -> u32 {
+/// Requires at least 6 bytes (the LBA field occupies bytes 2-5).
+pub fn cdb_lba12(cdb: &[u8]) -> Option<u32> {
     cdb_lba10(cdb)
 }
 
 /// READ(12)/WRITE(12) transfer length: bytes 6..=9 (SBC-3 §5.12).
-pub fn cdb_transfer_len12(cdb: &[u8]) -> u32 {
-    (u32::from(cdb[6]) << 24)
-        | (u32::from(cdb[7]) << 16)
-        | (u32::from(cdb[8]) << 8)
-        | u32::from(cdb[9])
+/// Requires at least 10 bytes.
+pub fn cdb_transfer_len12(cdb: &[u8]) -> Option<u32> {
+    if cdb.len() < 10 {
+        return None;
+    }
+    Some(
+        (u32::from(cdb[6]) << 24)
+            | (u32::from(cdb[7]) << 16)
+            | (u32::from(cdb[8]) << 8)
+            | u32::from(cdb[9]),
+    )
 }
 
 /// READ(16)/WRITE(16) logical block address: bytes 2..=9 (SBC-3 §5.13).
-pub fn cdb_lba16(cdb: &[u8]) -> u64 {
-    (u64::from(cdb[2]) << 56)
-        | (u64::from(cdb[3]) << 48)
-        | (u64::from(cdb[4]) << 40)
-        | (u64::from(cdb[5]) << 32)
-        | (u64::from(cdb[6]) << 24)
-        | (u64::from(cdb[7]) << 16)
-        | (u64::from(cdb[8]) << 8)
-        | u64::from(cdb[9])
+/// Requires at least 10 bytes.
+pub fn cdb_lba16(cdb: &[u8]) -> Option<u64> {
+    if cdb.len() < 10 {
+        return None;
+    }
+    Some(
+        (u64::from(cdb[2]) << 56)
+            | (u64::from(cdb[3]) << 48)
+            | (u64::from(cdb[4]) << 40)
+            | (u64::from(cdb[5]) << 32)
+            | (u64::from(cdb[6]) << 24)
+            | (u64::from(cdb[7]) << 16)
+            | (u64::from(cdb[8]) << 8)
+            | u64::from(cdb[9]),
+    )
 }
 
 /// READ(16)/WRITE(16) transfer length: bytes 10..=13 (SBC-3 §5.13).
-pub fn cdb_transfer_len16(cdb: &[u8]) -> u32 {
-    (u32::from(cdb[10]) << 24)
-        | (u32::from(cdb[11]) << 16)
-        | (u32::from(cdb[12]) << 8)
-        | u32::from(cdb[13])
+/// Requires at least 14 bytes.
+pub fn cdb_transfer_len16(cdb: &[u8]) -> Option<u32> {
+    if cdb.len() < 14 {
+        return None;
+    }
+    Some(
+        (u32::from(cdb[10]) << 24)
+            | (u32::from(cdb[11]) << 16)
+            | (u32::from(cdb[12]) << 8)
+            | u32::from(cdb[13]),
+    )
+}
+
+/// `(lba, count)` for a READ(6/10/12/16) opcode, or `None` if `op` is not a
+/// READ variant or the CDB is too short to hold the fields. Convenience
+/// wrapper for device dispatch (the CD devices).
+pub fn cdb_read_args(op: u8, cdb: &[u8]) -> Option<(u64, u32)> {
+    match op {
+        op::READ_6 => Some((u64::from(cdb_lba6(cdb)?), cdb_transfer_len6(cdb)?)),
+        op::READ_10 => Some((
+            u64::from(cdb_lba10(cdb)?),
+            u32::from(cdb_transfer_len10(cdb)?),
+        )),
+        op::READ_12 => Some((u64::from(cdb_lba12(cdb)?), cdb_transfer_len12(cdb)?)),
+        op::READ_16 => Some((cdb_lba16(cdb)?, cdb_transfer_len16(cdb)?)),
+        _ => None,
+    }
 }
 
 /// Human-readable opcode name.
@@ -275,55 +345,95 @@ mod tests {
     #[test]
     fn cdb6_opcode_lba_transfer_roundtrip() {
         let cdb = make_cdb6(op::READ_6, 0x0012345, 1);
-        assert_eq!(cdb_opcode(&cdb), op::READ_6);
-        assert_eq!(cdb_lba6(&cdb), 0x0012345);
-        assert_eq!(cdb_transfer_len6(&cdb), 1);
+        assert_eq!(cdb_opcode(&cdb), Some(op::READ_6));
+        assert_eq!(cdb_lba6(&cdb), Some(0x0012345));
+        assert_eq!(cdb_transfer_len6(&cdb), Some(1));
     }
 
     #[test]
     fn cdb6_lba_masks_upper_bits_of_byte1() {
         let mut cdb = make_cdb6(op::READ_6, 0x1F0000, 0);
         cdb[1] |= 0xE0; /* upper 3 bits are not part of the LBA */
-        assert_eq!(cdb_lba6(&cdb), 0x1F0000);
+        assert_eq!(cdb_lba6(&cdb), Some(0x1F0000));
     }
 
     #[test]
     fn cdb6_transfer_len_zero_means_256() {
         let cdb = make_cdb6(op::READ_6, 0, 0);
-        assert_eq!(cdb_transfer_len6(&cdb), 256);
+        assert_eq!(cdb_transfer_len6(&cdb), Some(256));
         let cdb = make_cdb6(op::READ_6, 0, 0xFF);
-        assert_eq!(cdb_transfer_len6(&cdb), 255);
+        assert_eq!(cdb_transfer_len6(&cdb), Some(255));
     }
 
     #[test]
     fn cdb10_opcode_lba_transfer_roundtrip() {
         let cdb = make_cdb10(op::READ_10, 0x89ABCDEF, 0x1234);
-        assert_eq!(cdb_opcode(&cdb), op::READ_10);
-        assert_eq!(cdb_lba10(&cdb), 0x89ABCDEF);
-        assert_eq!(cdb_transfer_len10(&cdb), 0x1234);
+        assert_eq!(cdb_opcode(&cdb), Some(op::READ_10));
+        assert_eq!(cdb_lba10(&cdb), Some(0x89ABCDEF));
+        assert_eq!(cdb_transfer_len10(&cdb), Some(0x1234));
     }
 
     #[test]
     fn cdb12_opcode_lba_transfer_roundtrip() {
         let cdb = make_cdb12(op::WRITE_12, 0x89ABCDEF, 0x01020304);
-        assert_eq!(cdb_opcode(&cdb), op::WRITE_12);
-        assert_eq!(cdb_lba12(&cdb), 0x89ABCDEF);
-        assert_eq!(cdb_transfer_len12(&cdb), 0x01020304);
+        assert_eq!(cdb_opcode(&cdb), Some(op::WRITE_12));
+        assert_eq!(cdb_lba12(&cdb), Some(0x89ABCDEF));
+        assert_eq!(cdb_transfer_len12(&cdb), Some(0x01020304));
     }
 
     #[test]
     fn cdb16_opcode_lba_transfer_roundtrip() {
         let lba: u64 = 0x0123456789ABCDEF;
         let cdb = make_cdb16(op::WRITE_16, lba, 0xDEADBEEF);
-        assert_eq!(cdb_opcode(&cdb), op::WRITE_16);
-        assert_eq!(cdb_lba16(&cdb), lba);
-        assert_eq!(cdb_transfer_len16(&cdb), 0xDEADBEEF);
+        assert_eq!(cdb_opcode(&cdb), Some(op::WRITE_16));
+        assert_eq!(cdb_lba16(&cdb), Some(lba));
+        assert_eq!(cdb_transfer_len16(&cdb), Some(0xDEADBEEF));
     }
 
     #[test]
     fn cdb16_lba_full_range() {
         let cdb = make_cdb16(op::READ_16, u64::MAX, 1);
-        assert_eq!(cdb_lba16(&cdb), u64::MAX);
+        assert_eq!(cdb_lba16(&cdb), Some(u64::MAX));
+    }
+
+    #[test]
+    fn field_accessors_are_total_on_empty_and_short_slices() {
+        /* Empty CDB: opcode is None, so no other accessor is reachable. */
+        assert_eq!(cdb_opcode(&[]), None);
+        assert_eq!(cdb_opcode(&[0x28]), Some(0x28));
+
+        /* Short slices: field accessors return None instead of panicking. */
+        assert_eq!(cdb_lba6(&[0; 3]), None);
+        assert_eq!(cdb_transfer_len6(&[0; 4]), None);
+        assert_eq!(cdb_lba10(&[0; 5]), None);
+        assert_eq!(cdb_transfer_len10(&[0; 8]), None);
+        assert_eq!(cdb_lba12(&[0; 5]), None);
+        assert_eq!(cdb_transfer_len12(&[0; 9]), None);
+        assert_eq!(cdb_lba16(&[0; 9]), None);
+        assert_eq!(cdb_transfer_len16(&[0; 13]), None);
+
+        /* Group-length slices still parse. */
+        assert_eq!(cdb_lba6(&[0, 0, 0, 0, 0, 0]), Some(0));
+        assert_eq!(cdb_transfer_len10(&[0; 9]), Some(0));
+        assert_eq!(cdb_transfer_len12(&[0; 10]), Some(0));
+        assert_eq!(cdb_transfer_len16(&[0; 14]), Some(0));
+    }
+
+    #[test]
+    fn cdb_len_from_opcode_groups() {
+        /* Group 0 (000b) → 6 bytes */
+        assert_eq!(cdb_len_from_opcode(0x00), 6);
+        assert_eq!(cdb_len_from_opcode(0x12), 6);
+        /* Group 1 (001b) → 10 bytes */
+        assert_eq!(cdb_len_from_opcode(0x28), 10);
+        /* Group 2 (010b) → 10 bytes */
+        assert_eq!(cdb_len_from_opcode(0x4C), 10);
+        /* Group 4 (100b) → 16 bytes */
+        assert_eq!(cdb_len_from_opcode(0x8F), 16);
+        /* Group 5 (101b) → 12 bytes */
+        assert_eq!(cdb_len_from_opcode(0xA0), 12);
+        /* Reserved/vendor groups (3, 6, 7) default to 6 */
+        assert_eq!(cdb_len_from_opcode(0xE0), 6);
     }
 
     #[test]

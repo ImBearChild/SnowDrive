@@ -18,8 +18,8 @@ iso9660 = []
 
 # Composite features (depend on others).
 iscsi = ["scsi"]
-cdrom = ["scsi", "iso9660"]
-livefs = ["cdrom"]
+cdrom = ["scsi"]
+livefs = ["cdrom", "iso9660"]
 
 # Optional features.
 capi = ["std"]

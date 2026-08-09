@@ -457,7 +457,9 @@ fn multi_lun_routes_by_lun() {
         assert_eq!(data[0] & 0x1F, 0, "LUN {lun} PDT must be 0");
     }
 
-    // LUN 3 is out of range — the target must Reject.
+    // LUN 3 is out of range — the target must answer with a SCSI Check
+    // Condition (LOGICAL UNIT NOT SUPPORTED), not GOOD, and keep the
+    // session alive (no Reject / connection teardown).
     let t = iscsi.test_unit_ready(3);
     assert_ne!(
         t.status(),

@@ -9,8 +9,8 @@ use crate::scsi::backend::BlockStorage;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{
-    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10, cdb_transfer_len12,
-    cdb_transfer_len16, cdb_transfer_len6, op,
+    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode, cdb_transfer_len10,
+    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
 };
 use crate::scsi::spc::{parse_spc, SpcCommand};
 
@@ -66,43 +66,51 @@ pub enum SbcCommand {
 }
 
 /// Parse `cdb` as an SBC command (SPC fall-through included). Returns `None`
-/// for unknown opcodes.
+/// for unknown opcodes or CDBs truncated below the opcode's fixed group
+/// length (SPC-4 §7.3) — this function never panics.
 pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
     if let Some(cmd) = parse_spc(cdb) {
         return Some(SbcCommand::Spc(cmd));
     }
-    match cdb_opcode(cdb) {
+    // Total: `parse_spc` already rejected CDBs shorter than 6 bytes, but the
+    // 10/12/16-byte group opcodes below need their full group length before
+    // field access.
+    let op = cdb_opcode(cdb)?;
+    if cdb.len() < usize::from(cdb_len_from_opcode(op)) {
+        return None;
+    }
+    match op {
         op::READ_6 => Some(SbcCommand::Read6 {
-            lba: cdb_lba6(cdb),
-            count: cdb_transfer_len6(cdb),
+            lba: cdb_lba6(cdb)?,
+            count: cdb_transfer_len6(cdb)?,
         }),
         op::WRITE_6 => Some(SbcCommand::Write6 {
-            lba: cdb_lba6(cdb),
-            count: cdb_transfer_len6(cdb),
+            lba: cdb_lba6(cdb)?,
+            count: cdb_transfer_len6(cdb)?,
         }),
         op::READ_10 => Some(SbcCommand::Read10 {
-            lba: cdb_lba10(cdb),
-            count: cdb_transfer_len10(cdb),
+            lba: cdb_lba10(cdb)?,
+            count: cdb_transfer_len10(cdb)?,
         }),
         op::WRITE_10 => Some(SbcCommand::Write10 {
-            lba: cdb_lba10(cdb),
-            count: cdb_transfer_len10(cdb),
+            lba: cdb_lba10(cdb)?,
+            count: cdb_transfer_len10(cdb)?,
         }),
         op::READ_12 => Some(SbcCommand::Read12 {
-            lba: cdb_lba12(cdb),
-            count: cdb_transfer_len12(cdb),
+            lba: cdb_lba12(cdb)?,
+            count: cdb_transfer_len12(cdb)?,
         }),
         op::WRITE_12 => Some(SbcCommand::Write12 {
-            lba: cdb_lba12(cdb),
-            count: cdb_transfer_len12(cdb),
+            lba: cdb_lba12(cdb)?,
+            count: cdb_transfer_len12(cdb)?,
         }),
         op::READ_16 => Some(SbcCommand::Read16 {
-            lba: cdb_lba16(cdb),
-            count: cdb_transfer_len16(cdb),
+            lba: cdb_lba16(cdb)?,
+            count: cdb_transfer_len16(cdb)?,
         }),
         op::WRITE_16 => Some(SbcCommand::Write16 {
-            lba: cdb_lba16(cdb),
-            count: cdb_transfer_len16(cdb),
+            lba: cdb_lba16(cdb)?,
+            count: cdb_transfer_len16(cdb)?,
         }),
         op::READ_CAPACITY_10 => Some(SbcCommand::ReadCapacity10 {
             pmi: cdb[1] & 0x01 != 0,
@@ -380,5 +388,26 @@ mod tests {
     fn parse_unknown_opcode_returns_none() {
         assert_eq!(parse_sbc(&[0xFF; 10]), None);
         assert_eq!(parse_sbc(&[op::REPORT_LUNS; 12]), None);
+    }
+
+    #[test]
+    fn parse_is_total_on_empty_and_truncated_cdbs() {
+        /* Empty / shorter-than-group CDBs → None, never a panic. */
+        assert_eq!(parse_sbc(&[]), None);
+        assert_eq!(parse_sbc(&[op::READ_10; 5]), None);
+        assert_eq!(parse_sbc(&[op::READ_12; 9]), None);
+        assert_eq!(parse_sbc(&[op::WRITE_16; 13]), None);
+        /* A truncated group-0 SPC opcode falls through to SBC's None. */
+        assert_eq!(parse_sbc(&[op::INQUIRY; 5]), None);
+        /* 10-byte SPC opcode needs its full group length. */
+        assert_eq!(parse_sbc(&[op::MODE_SENSE_10; 9]), None);
+        /* Full-length CDBs still parse. */
+        assert_eq!(
+            parse_sbc(&make_cdb10(op::READ_10, 0x89ABCDEF, 0x1234)),
+            Some(SbcCommand::Read10 {
+                lba: 0x89ABCDEF,
+                count: 0x1234
+            })
+        );
     }
 }

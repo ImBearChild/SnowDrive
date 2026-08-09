@@ -8,7 +8,8 @@
 //! | SCSI block device core | `scsi` |
 //! | ISO9660 algorithm library | `iso9660` |
 //! | iSCSI target over a TCP socket | `scsi`, `iscsi`, `std` |
-//! | CD-ROM device (flat / live / bundle) | `cdrom` (implies `scsi`+`iso9660`) |
+//! | Flat CD-ROM device (`CdromDevice`) | `cdrom` (implies `scsi`) |
+//! | Live ISO9660 CD-ROM (`CdLiveFsDevice`) | `livefs` (implies `cdrom`+`iso9660`) |
 //! | C ABI exports | `capi` (implies `std`) |
 //!
 //! ## Modules
@@ -16,6 +17,7 @@
 //!   (always available, no feature gate).
 //! - [`scsi`] *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
 //! - `iso9660` *(gated by `iso9660`)*: ISO9660/Joliet algorithms.
+//! - `cdrom` *(gated by `cdrom`)*: CD-ROM device emulation (flat / live).
 //! - `capi` *(gated by `capi`)*: C ABI exports (`#[allow(unsafe_code)]`).
 //!
 //! ## ISO9660 name limits
@@ -29,6 +31,9 @@
 #![deny(unsafe_code)]
 
 pub mod common;
+
+#[cfg(feature = "cdrom")]
+pub mod cdrom;
 #[cfg(feature = "iscsi")]
 pub mod iscsi;
 #[cfg(feature = "iso9660")]

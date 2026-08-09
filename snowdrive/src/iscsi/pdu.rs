@@ -191,6 +191,15 @@ impl Bhs {
         self.0[9]
     }
 
+    /// True when the 64-bit LUN field uses single-level peripheral device
+    /// addressing (SAM-2 address method 0000b): byte 8 = 0, bytes 10-15 =
+    /// 0, LUN id in byte 9. Other encodings (multi-level logical unit,
+    /// flat space, extended) are unsupported and rejected as a PDU field
+    /// error (RFC 3720 §10.2.1.7).
+    pub fn lun_is_single_level(&self) -> bool {
+        self.0[8] == 0 && self.0[10..16].iter().all(|&b| b == 0)
+    }
+
     /// Clear the 8-byte LUN field and set the single-level LUN id in byte 9.
     pub fn set_lun(&mut self, lun: u8) {
         self.0[8..16].fill(0);
@@ -435,17 +444,10 @@ pub const fn pdu_pad_len(data_segment_len: u32) -> u32 {
 
 /// CDB length derived from the CDB opcode group code (SPC-4 §7.3).
 ///
-/// Groups: 0→6, 1/2→10, 4→16, 5→12 bytes; reserved/vendor groups default
-/// to 6 (matches legacy `snowscsi_iscsi_cdb_len_from_opcode`).
-pub const fn cdb_len_from_opcode(opcode: u8) -> u8 {
-    match (opcode >> 5) & 0x07 {
-        0 => 6,
-        1 | 2 => 10,
-        4 => 16,
-        5 => 12,
-        _ => 6,
-    }
-}
+/// Canonical definition lives in the SCSI core
+/// ([`crate::scsi::scsi::cdb_len_from_opcode`]) so the parser layers share
+/// it; this re-export keeps the historical `snowdrive::iscsi::pdu` path.
+pub use crate::scsi::scsi::cdb_len_from_opcode;
 
 /// Human-readable name for an iSCSI PDU opcode (RFC 3720 §10.2.1.2).
 pub fn iscsi_opcode_name(opcode: u8) -> &'static str {
@@ -623,6 +625,30 @@ mod tests {
         assert_eq!(b.0[9], 0x03);
         assert_eq!(b.0[10], 0x00);
         assert_eq!(b.0[15], 0x00);
+    }
+
+    #[test]
+    fn lun_is_single_level_detects_other_address_methods() {
+        let mut b = bhs();
+        assert!(b.lun_is_single_level());
+        b.set_lun(3);
+        assert!(b.lun_is_single_level());
+        /* SAM-2 logical unit (multi-level) addressing: byte 8 bits 6-3 = 0100b */
+        b.0[8] = 0x40;
+        assert!(!b.lun_is_single_level());
+        b.0[8] = 0x00;
+        /* Flat space addressing: byte 8 bits 6-3 = 0010b */
+        b.0[8] = 0x20;
+        assert!(!b.lun_is_single_level());
+        b.0[8] = 0x00;
+        /* Reserved high LUN bytes must be zero */
+        b.0[10] = 0x01;
+        assert!(!b.lun_is_single_level());
+        b.0[10] = 0x00;
+        b.0[15] = 0xFF;
+        assert!(!b.lun_is_single_level());
+        b.0[15] = 0x00;
+        assert!(b.lun_is_single_level());
     }
 
     #[test]

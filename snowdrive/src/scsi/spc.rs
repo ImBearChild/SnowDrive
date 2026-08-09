@@ -7,7 +7,7 @@
 //! handled in their own modules and fall through to this one.
 
 use crate::scsi::device::{CommandOutcome, DeviceType};
-use crate::scsi::scsi::{asc, cdb_opcode, op, Sense, SenseKey};
+use crate::scsi::scsi::{asc, cdb_len_from_opcode, cdb_opcode, op, Sense, SenseKey};
 
 /// INQUIRY standard data length (additional length = 91 per SPC-3 (n-4)).
 const INQUIRY_STD_LEN: usize = 95;
@@ -106,9 +106,17 @@ pub enum SpcCommand {
 }
 
 /// Parse `cdb` as an SPC command. Returns `None` for opcodes that belong to a
-/// device-specific command set (SBC/MMC) or are unknown.
+/// device-specific command set (SBC/MMC), are unknown, or are truncated
+/// (shorter than the opcode's fixed group length, SPC-4 §7.3) — this
+/// function never panics.
 pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
-    match cdb_opcode(cdb) {
+    // Total: gate on the opcode group length before any field access.
+    // All SPC opcodes handled here are group 0 (6 bytes) or group 2
+    // (10 bytes).
+    if cdb.len() < usize::from(cdb_len_from_opcode(cdb_opcode(cdb)?)) {
+        return None;
+    }
+    match cdb_opcode(cdb)? {
         op::TEST_UNIT_READY => Some(SpcCommand::TestUnitReady),
         op::REQUEST_SENSE => Some(SpcCommand::RequestSense { alloc: cdb[4] }),
         op::INQUIRY => Some(SpcCommand::Inquiry {

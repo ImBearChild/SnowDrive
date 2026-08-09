@@ -7,15 +7,14 @@
 //!
 //! Write commands return DATA PROTECT (read-only device).
 
-use crate::scsi::backend::{BlockStorage, BlockStorageError};
-use crate::scsi::cdrom_common::{
+use crate::cdrom::common::{
     build_get_config_response, cdrom_mode_page, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY,
     SECTOR_SIZE,
 };
+use crate::scsi::backend::{BlockStorage, BlockStorageError};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 use crate::scsi::scsi::{
-    asc, cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_opcode, cdb_transfer_len10,
-    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op, Sense, SenseKey,
+    asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, op, Sense, SenseKey,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
 
@@ -119,22 +118,30 @@ impl<B: BlockStorage> CdromDevice<B> {
         let outcome = if let Some(cmd) = parse_spc(cdb) {
             execute_spc(&mut self.common, cmd, work, dsl)
         } else {
-            match cdb_opcode(cdb) {
+            // Total: `do_cmd` is public API — reject CDBs shorter than
+            // their opcode group's fixed length (SPC-4 §7.3) before any
+            // field access, instead of panicking on a short slice.
+            let Some(op) = cdb_opcode(cdb) else {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+            };
+            if cdb.len() < usize::from(cdb_len_from_opcode(op)) {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+            }
+            match op {
                 // READ(6/10/12/16) — same as CDBlockDevice
-                op::READ_6 => self.read_cmd(u64::from(cdb_lba6(cdb)), cdb_transfer_len6(cdb), work),
-                op::READ_10 => self.read_cmd(
-                    u64::from(cdb_lba10(cdb)),
-                    u32::from(cdb_transfer_len10(cdb)),
-                    work,
-                ),
-                op::READ_12 => {
-                    self.read_cmd(u64::from(cdb_lba12(cdb)), cdb_transfer_len12(cdb), work)
+                op::READ_6 | op::READ_10 | op::READ_12 | op::READ_16 => {
+                    let Some((lba, count)) = cdb_read_args(op, cdb) else {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+                    };
+                    self.read_cmd(lba, count, work)
                 }
-                op::READ_16 => self.read_cmd(cdb_lba16(cdb), cdb_transfer_len16(cdb), work),
 
                 // READ CAPACITY(10)
                 op::READ_CAPACITY_10 => {
-                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, cdb_lba10(cdb), work)
+                    let Some(lba) = cdb_lba10(cdb) else {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+                    };
+                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, work)
                 }
 
                 // READ CAPACITY(16) via SERVICE ACTION IN

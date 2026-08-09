@@ -19,7 +19,7 @@ use crate::iscsi::pdu::{
 };
 use crate::scsi::device::{CommandOutcome, ScsiDevice};
 use crate::scsi::scsi::op as scsi_op;
-use crate::scsi::scsi::{opcode_name, Sense};
+use crate::scsi::scsi::{asc, opcode_name, Sense, SenseKey};
 
 /// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
 const LOGIN_MAX: usize = 4096;
@@ -448,9 +448,24 @@ impl Session {
         self.cmd_sn = recv_cmd_sn;
 
         let itt = bhs.itt();
+        // LUN field format: only single-level peripheral device addressing
+        // is supported (SAM-2 address method 0000b — byte 8 = 0, LUN id in
+        // byte 9, bytes 10-15 reserved). Any other 64-bit encoding
+        // (multi-level, flat space, extended) is a PDU field error
+        // (RFC 3720 §10.2.1.7) → Reject 0x09.
+        if !bhs.lun_is_single_level() {
+            return self.reject(conn, work, reject::INVALID_PDU_FIELD, bhs);
+        }
         let lun = bhs.lun() as usize;
         if lun >= devs.len() {
-            return self.reject(conn, work, reject::INVALID_PDU_FIELD, bhs);
+            // Well-formed single-level LUN that is not present: a SCSI-level
+            // error — CHECK CONDITION / LOGICAL UNIT NOT SUPPORTED
+            // (SPC-4 §6.21, ASC 0x25) — NOT an iSCSI Reject. Linux treats a
+            // Reject as a session-level protocol failure and tears down the
+            // connection; the Check Condition lets the initiator REQUEST
+            // SENSE and keep the session alive.
+            let sense = Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
+            return self.send_scsi_response(conn, work, itt, status::CHECK_CONDITION, Some(&sense));
         }
         if pdu.dsl > MAX_DATA_SEGMENT as usize {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);

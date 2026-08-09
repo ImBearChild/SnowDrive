@@ -30,12 +30,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{Args, Parser};
+use snowdrive::cdrom::CdLiveFsDevice;
+use snowdrive::cdrom::CdromDevice;
 use snowdrive::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowdrive::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowdrive::scsi::block::BlockDevice;
 use snowdrive::scsi::cdblock::CDBlockDevice;
-use snowdrive::scsi::cdrom::CdromDevice;
-use snowdrive::scsi::cdrom_livefs::CdLiveFsDevice;
 use snowdrive::scsi::device::Device;
 use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
 use snowdrive::MIN_WORK_LEN;

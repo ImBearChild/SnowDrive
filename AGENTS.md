@@ -42,7 +42,8 @@ snowdrive/
 │   ├── src/
 │   │   ├── lib.rs        # #![no_std] (unless std feature); deny(unsafe_code)
 │   │   ├── common/       # always on: BlockStorage/FsStorage seams + logging macros
-│   │   ├── scsi/         # feature "scsi": SCSI core, block/cdblock/cdrom, spc/sbc
+│   │   ├── scsi/         # feature "scsi": SCSI core, block/cdblock, spc/sbc
+│   │   ├── cdrom/        # feature "cdrom": CD-ROM device emulation (flat/live, full MMC)
 │   │   ├── iscsi/        # feature "iscsi": PDU codec, Conn, target, transport
 │   │   └── iso9660/      # feature "iso9660": ISO9660/Joliet live-generation
 │   ├── build.rs          # cbindgen (feature "capi")
@@ -58,7 +59,8 @@ snowdrive/
 
 | Component | Status |
 |-----------|--------|
-| `snowdrive::scsi` | Done — SBC + RAM/File backends + SPC/SBC layers + block/cdblock/cdrom devices + iSCSI PDU/target loop |
+| `snowdrive::scsi` | Done — SBC + RAM/File backends + SPC/SBC layers + block/cdblock devices + iSCSI PDU/target loop |
+| `snowdrive::cdrom` | Done — flat (`CdromDevice`) + live (`CdLiveFsDevice`) CD-ROM, full MMC surface (README TOC, GET CONFIGURATION, READ BUFFER CAPACITY, …) |
 | `snowdrive::iscsi` | Done — PDU codec, Conn trait, Session state machine, BSD transport |
 | `snowdrive::iso9660` | Done — live ISO9660/Joliet generation algorithms (`live.rs`) |
 | `snowdrive::capi` | Postponed — C ABI (`feature = "capi"` declared, no exports yet) |

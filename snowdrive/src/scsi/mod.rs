@@ -10,10 +10,10 @@
 //! - `spc`: SPC command parsing + shared execution (INQUIRY, MODE SENSE, ...).
 //! - `sbc`: SBC command parsing + execution (block device set, SBC-3 §5).
 //! - `block`: SBC block device command set (block.c).
-//! - `cdblock`: CDBlock device — read-only CD-ROM over a flat file
-//!   (gated by `std`).
-//! - `cdrom_common`: shared CD-ROM SPC/MMC layer.
-//! - `cdrom`: `CdromDevice<B>` — flat ISO/RAM CD-ROM (gated by `cdrom`).
+//! - `cdblock`: `CDBlockDevice` — minimal read-only CD-ROM over a flat file,
+//!   self-contained in the SCSI core (no filesystem backend, no external
+//!   deps; gated by `std`). The MMC-complete CD-ROM series lives in
+//!   `snowdrive::cdrom` instead.
 //! - `iscsi_pdu`: iSCSI PDU (BHS) field codec (RFC 3720 §10.x).
 //! - `conn`: connection abstraction (`embedded_io::Read + Write`).
 //! - `iscsi_target`: iSCSI target session state machine (RFC 3720 §5/§10).
@@ -23,10 +23,6 @@ pub mod backend;
 pub mod block;
 #[cfg(feature = "std")]
 pub mod cdblock;
-pub mod cdrom;
-pub mod cdrom_common;
-#[cfg(feature = "livefs")]
-pub mod cdrom_livefs;
 pub mod device;
 #[cfg(feature = "std")]
 pub mod fs_backend;

@@ -1,13 +1,14 @@
 //! Device abstraction: result outcomes, device types, the SCSI device
 //! seam, and the borrowed type-erased container that targets drive.
 
+#[cfg(feature = "cdrom")]
+use crate::cdrom::device::CdromDevice;
+#[cfg(all(feature = "livefs", feature = "std"))]
+use crate::cdrom::livefs::CdLiveFsDevice;
 use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
-use crate::scsi::cdrom::CdromDevice;
-#[cfg(all(feature = "livefs", feature = "std"))]
-use crate::scsi::cdrom_livefs::CdLiveFsDevice;
 #[cfg(all(feature = "livefs", feature = "std"))]
 use crate::scsi::fs_backend::FsBackend;
 use crate::scsi::scsi::Sense;
@@ -122,6 +123,7 @@ pub enum Device<'a> {
     #[cfg(feature = "std")]
     CdBlock(CDBlockDevice),
     /// Flat ISO/RAM CD-ROM (Phase 2c).
+    #[cfg(feature = "cdrom")]
     CdFlat(CdromDevice<BlockBackend<'a>>),
     /// Live ISO9660 CD-ROM over a host directory (Phase 2e).
     #[cfg(all(feature = "livefs", feature = "std"))]
@@ -139,6 +141,7 @@ impl ScsiDevice for Device<'_> {
             Self::Block(dev) => dev.do_cmd(cdb, work, dsl),
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.do_cmd(cdb, work, dsl),
+            #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.do_cmd(cdb, work, dsl),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.do_cmd(cdb, work, dsl),
@@ -150,6 +153,7 @@ impl ScsiDevice for Device<'_> {
             Self::Block(dev) => dev.read_data(byte_offset, buf),
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.read_data(byte_offset, buf),
+            #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.read_data(byte_offset, buf),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.read_data(byte_offset, buf),
@@ -161,6 +165,7 @@ impl ScsiDevice for Device<'_> {
             Self::Block(dev) => dev.write_data(byte_offset, buf),
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.write_data(byte_offset, buf),
+            #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.write_data(byte_offset, buf),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.write_data(byte_offset, buf),
@@ -172,6 +177,7 @@ impl ScsiDevice for Device<'_> {
             Self::Block(dev) => dev.sense(),
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.sense(),
+            #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.sense(),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.sense(),
@@ -183,6 +189,7 @@ impl ScsiDevice for Device<'_> {
             Self::Block(dev) => dev.device_type(),
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => <CDBlockDevice as ScsiDevice>::device_type(dev),
+            #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => <CdromDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => <CdLiveFsDevice<FsBackend> as ScsiDevice>::device_type(dev),
@@ -242,9 +249,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    #[cfg(feature = "cdrom")]
     #[test]
     fn device_enum_cdflat_dispatch() {
-        use crate::scsi::cdrom::CdromDevice;
+        use crate::cdrom::device::CdromDevice;
         let mut img = vec![0xAAu8; 2048 * 100];
         let dev = Device::CdFlat(CdromDevice::new(BlockBackend::Ram(RamBackend::new(
             &mut img,
@@ -266,7 +274,7 @@ mod tests {
     #[cfg(all(feature = "livefs", feature = "std"))]
     #[test]
     fn device_enum_cdlivefs_dispatch() {
-        use crate::scsi::cdrom_livefs::CdLiveFsDevice;
+        use crate::cdrom::livefs::CdLiveFsDevice;
         use crate::scsi::fs_backend::{FsBackend, StdFsBackend};
         let dir =
             std::env::temp_dir().join(format!("snowscsi_device_livefs_{}", std::process::id()));

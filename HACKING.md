@@ -8,7 +8,8 @@ SCSI device emulation toolkit — unified Rust lib crate + two binaries.
 |-----------|----------|-------------|
 | **snowdrive** | `snowdrive/` | Unified lib crate (`no_std` + `std` feature) |
 | — `common` | `snowdrive/src/common/` | Zero-alloc storage seams (`BlockStorage` / `FsStorage`) + unified logging macros |
-| — `scsi` | `snowdrive/src/scsi/` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), file/fs backends |
+| — `scsi` | `snowdrive/src/scsi/` | SCSI core, block/CDBlock devices (SBC/SPC), file/fs backends |
+| — `cdrom` | `snowdrive/src/cdrom/` | CD-ROM device emulation — flat (`CdromDevice`) / live (`CdLiveFsDevice`), full MMC |
 | — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
 | **snowscsi** | `bins/snowscsi/` | Binary — `snowscsi serve` starts iSCSI target |
@@ -21,10 +22,12 @@ snowdrive/
 ├── Cargo.lock
 ├── snowdrive/            # unified lib crate (feature-gated modules)
 │   ├── src/
-│   │   ├── lib.rs        # common, scsi, iscsi, iso9660 (feature-gated)
+│   │   ├── lib.rs        # common, scsi, cdrom, iscsi, iso9660 (feature-gated)
 │   │   ├── common/       # BlockStorage / FsStorage seams + logging macros
-│   │   ├── scsi/         # SCSI core, block/cdblock/cdrom, spc/sbc, backends
-│   │   └── iscsi/        # PDU codec, Conn, target, transport
+│   │   ├── scsi/         # SCSI core, block/cdblock devices, spc/sbc, backends
+│   │   ├── cdrom/        # CD-ROM device emulation (flat / live, full MMC)
+│   │   ├── iscsi/        # PDU codec, Conn, target, transport
+│   │   └── iso9660/      # ISO9660/Joliet live-generation algorithms
 ├── bins/
 │   ├── snowscsi/         # iSCSI target CLI (binary)
 │   └── snow9660/         # ISO9660 CLI (binary, stub)
@@ -41,9 +44,10 @@ snowdrive-tests ┘
 ```
 
 Feature map (`snowdrive/Cargo.toml`): `std`, `scsi`, `iscsi` (→ `scsi`),
-`iso9660`, `cdrom` (→ `scsi`+`iso9660`), `capi`, `log` / `defmt`. The lib's
-default is `["std", "scsi", "iscsi", "iso9660"]`; the `snowscsi` bin enables
-`cdrom` on top (the `--cdblock` option needs it).
+`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `capi`,
+`log` / `defmt`. The lib's default is `["std", "scsi", "iscsi", "iso9660"]`;
+the `snowscsi` bin enables `cdrom` + `livefs` on top (the `--cdrom` option
+needs them; `--cdblock` needs only `scsi`).
 
 ## Commit Messages
 
