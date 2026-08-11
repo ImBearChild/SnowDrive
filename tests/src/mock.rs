@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
         assert_eq!(bhs[3], status::CHECK_CONDITION);
         assert_eq!(&bhs[16..20], &be32(0x1111)); // ITT echoed
-        // Data segment: 2-byte SenseLength (18) + fixed sense 70h.
+                                                 // Data segment: 2-byte SenseLength (18) + fixed sense 70h.
         assert_eq!(&data[0..2], &[0x00, 18]);
         assert_eq!(data[2], 0x70); // response code (fixed format)
         assert_eq!(data[4], 0x05); // ILLEGAL REQUEST
