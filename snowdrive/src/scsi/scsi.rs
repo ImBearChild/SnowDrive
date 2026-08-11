@@ -46,6 +46,9 @@ pub mod asc {
     pub const WRITE_PROTECTED: u8 = 0x27;
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
     pub const MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
+    /// ASCQ for [`MEDIUM_REMOVAL_PREVENTED`]. ASC 53h/02h is MEDIUM
+    /// REMOVAL PREVENTED; 53h/00h decodes as MEDIA LOAD OR EJECT FAILED.
+    pub const MEDIUM_REMOVAL_PREVENTED_ASCQ: u8 = 0x02;
 }
 
 /// Sense key (SPC-4 §4.5.6).

@@ -1021,7 +1021,7 @@ mod tests {
             CommandOutcome::CheckCondition(Sense::new(
                 SenseKey::IllegalRequest,
                 asc::MEDIUM_REMOVAL_PREVENTED,
-                0
+                asc::MEDIUM_REMOVAL_PREVENTED_ASCQ
             ))
         );
 

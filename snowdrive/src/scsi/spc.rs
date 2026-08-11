@@ -238,7 +238,14 @@ pub fn execute_spc<'a, D: SpcDevice>(
         SpcCommand::StartStop { loej, load } => match dev.start_stop(loej, load) {
             SpcEffect::Good => CommandOutcome::Status,
             SpcEffect::RemovalPrevented => {
-                cc(dev, SenseKey::IllegalRequest, asc::MEDIUM_REMOVAL_PREVENTED)
+                // MEDIUM REMOVAL PREVENTED is ASC 53h / ASCQ 02h; ASCQ 00h
+                // would decode as MEDIA LOAD OR EJECT FAILED (SPC-4 §4.5.6).
+                cc_q(
+                    dev,
+                    SenseKey::IllegalRequest,
+                    asc::MEDIUM_REMOVAL_PREVENTED,
+                    asc::MEDIUM_REMOVAL_PREVENTED_ASCQ,
+                )
             }
         },
 
@@ -348,9 +355,14 @@ fn inquiry<'a, D: SpcDevice>(
     }
 }
 
-/// Set sense and return CHECK CONDITION.
+/// Set sense and return CHECK CONDITION (ASCQ 0).
 fn cc<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8) -> CommandOutcome<'a> {
-    let s = Sense::new(key, asc, 0);
+    cc_q(dev, key, asc, 0)
+}
+
+/// Set sense with an explicit ASCQ and return CHECK CONDITION.
+fn cc_q<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8, ascq: u8) -> CommandOutcome<'a> {
+    let s = Sense::new(key, asc, ascq);
     *dev.sense_mut() = s;
     CommandOutcome::CheckCondition(s)
 }
@@ -779,10 +791,11 @@ mod tests {
             CommandOutcome::CheckCondition(Sense::new(
                 SenseKey::IllegalRequest,
                 asc::MEDIUM_REMOVAL_PREVENTED,
-                0
+                asc::MEDIUM_REMOVAL_PREVENTED_ASCQ
             ))
         );
         assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.ascq, asc::MEDIUM_REMOVAL_PREVENTED_ASCQ);
     }
 
     #[test]
