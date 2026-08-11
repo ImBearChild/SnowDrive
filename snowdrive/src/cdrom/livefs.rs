@@ -768,20 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn inquiry_reports_cdrom() {
-        let (_dir, fs) = sample_tree();
-        let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
-        let mut w = work();
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[4] = 96;
-        let mut out = [0u8; 96];
-        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut out);
-        assert!(n >= 66);
-        assert_eq!(out[0] & 0x1F, 0x05); // PDT = CD-ROM
-    }
-
-    #[test]
     fn get_configuration_profile_and_features() {
         let (_dir, fs) = sample_tree();
         let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();

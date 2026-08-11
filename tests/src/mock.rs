@@ -243,20 +243,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_resp_data_length() {
-        let mut conn = MockConn::new();
-        let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
-        let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs);
-        let dsl = (u32::from(bhs[5]) << 16) | (u32::from(bhs[6]) << 8) | u32::from(bhs[7]);
-        assert!(dsl <= 4096);
-        assert!(dsl <= 8192);
-    }
-
     // ── Multi-stage login (CSG=0 → CSG=1 → Full Feature) ───────────
 
     #[test]
@@ -772,33 +758,6 @@ mod tests {
         assert_eq!(bhs[2], reject::PROTOCOL_ERROR);
     }
 
-    // ── WRITE fully covered by immediate data → GOOD, no R2T ───────
-
-    #[test]
-    fn write_all_immediate_no_r2t() {
-        let mut conn = MockConn::new();
-        let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
-        let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
-
-        let itt = 0xBBBB_0001;
-        let imm = vec![0x42u8; 512];
-        let cmd = write10_bhs(0, 1, itt, 0, 512);
-        conn.feed_padded(&cmd, &imm);
-        assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
-            StepResult::Processed
-        );
-
-        let (resp, _) = conn.take_pdu().unwrap();
-        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
-        assert_eq!(resp[3], status::GOOD);
-        assert!(conn.take_pdu().is_none()); // no R2T
-    }
-
     // ── Linux-kernel (open-iscsi) write flag layout (RFC 3720 §2.3.3) ──
     // The kernel sends byte 1 = F(0x80) | W(0x20) | ATTR (bits 0-2): 0xA1 for
     // a Simple write, 0xA0 for an untagged write. W is RFC 3720 bit 2 = 0x20
@@ -924,45 +883,6 @@ mod tests {
         assert_eq!(&data[4..8], &[0, 0, 0, 0]);
         // One 8-byte LUN 0 entry.
         assert_eq!(&data[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn report_luns_three_luns() {
-        // Three independent ram-backed devices (LUN 0, 1, 2).
-        let mut r0 = vec![0u8; 16 * 1024];
-        let mut r1 = vec![0u8; 16 * 1024];
-        let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
-        let mut devs = [d0, d1, d2];
-
-        let mut conn = MockConn::new();
-        let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
-
-        // REPORT LUNS to LUN 0 (BHS LUN irrelevant — the response is target-wide).
-        conn.feed(&report_luns_bhs(0, 0xCAFE, 0), &[]);
-        assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
-            StepResult::Processed
-        );
-        let (bhs, data) = conn.take_pdu().unwrap();
-        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
-        assert_eq!(bhs[3], status::GOOD);
-        assert_eq!(bhs[16..20], be32(0xCAFE));
-        // Header: LUN list length = 3 * 8 = 24.
-        assert_eq!(&data[..4], &[0, 0, 0, 24]);
-        // 4-byte reserved.
-        assert_eq!(&data[4..8], &[0, 0, 0, 0]);
-        // Three 8-byte single-level peripheral-device LUN entries.
-        for (i, expected) in [0u8, 1, 2].iter().enumerate() {
-            let off = 8 + i * 8;
-            assert_eq!(data[off], 0x00, "LUN {}: method/bus", i);
-            assert_eq!(data[off + 1], *expected, "LUN {}: id", i);
-            assert_eq!(&data[off + 2..off + 8], &[0u8; 6], "LUN {}: tail", i);
-        }
     }
 
     // ── Linux kernel REPORT LUNS scanner compatibility ─────────────

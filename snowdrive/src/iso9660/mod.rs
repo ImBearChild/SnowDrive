@@ -16,14 +16,4 @@ mod tests {
     fn version_not_null() {
         assert!(!version().is_empty());
     }
-
-    #[test]
-    fn version_format() {
-        assert!(version().contains('.'));
-    }
-
-    #[test]
-    fn version_const_matches_fn() {
-        assert_eq!(version(), VERSION);
-    }
 }

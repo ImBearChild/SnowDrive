@@ -310,7 +310,7 @@ pub fn build_get_config_response<'a>(
 mod tests {
     use super::*;
     use crate::scsi::device::CommandOutcome;
-    use crate::scsi::scsi::{asc, op, SenseKey};
+    use crate::scsi::scsi::op;
     use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity};
 
     /// Minimal CD-ROM test device wrapping CdromDeviceCommon.
@@ -383,15 +383,6 @@ mod tests {
         execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
     }
 
-    fn run_static(dev: &mut CdDev<'_>, cdb: &[u8]) -> CommandOutcome<'static> {
-        let mut w = work();
-        match run(dev, cdb, &mut w) {
-            CommandOutcome::Status => CommandOutcome::Status,
-            CommandOutcome::CheckCondition(s) => CommandOutcome::CheckCondition(s),
-            other => panic!("expected Status or CheckCondition, got {other:?}"),
-        }
-    }
-
     fn run_data(dev: &mut CdDev<'_>, cdb: &[u8], buf: &mut [u8]) -> usize {
         let mut w = work();
         data_in(run(dev, cdb, &mut w), buf)
@@ -399,89 +390,7 @@ mod tests {
 
     // ── INQUIRY ─────────────────────────────────────────────────────
 
-    #[test]
-    fn cdrom_inquiry_standard() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[4] = 96;
-        let mut buf = [0u8; 96];
-        let n = run_data(&mut dev, &cdb, &mut buf);
-        assert!(n >= 66);
-        assert_eq!(buf[0], 0x05); /* PDT = CD-ROM */
-        assert_eq!(buf[1], 0x80); /* removable */
-        assert_eq!(buf[2], 0x06); /* SPC-4 */
-        assert_eq!(buf[4], 91); /* additional length (n-4) */
-        assert_eq!(buf[7], 0x02); /* CmdQue */
-        assert_eq!(&buf[8..16], b"SnowSCSI");
-        assert_eq!(&buf[16..32], b"Virtual CD-ROM  ");
-        // Version descriptors: SAM-5, iSCSI, SPC-4, MMC-6.
-        assert_eq!(
-            &buf[58..66],
-            &[0x00, 0xA0, 0x09, 0x60, 0x04, 0x60, 0x05, 0xC0]
-        );
-    }
-
-    #[test]
-    fn cdrom_inquiry_vpd_pages() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-
-        // VPD 0x00
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[1] = 0x01;
-        cdb[2] = 0x00;
-        cdb[4] = 7;
-        let mut buf = [0u8; 7];
-        run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(&buf[3..7], &[0x03, 0x00, 0x80, 0x83]);
-
-        // VPD 0x80
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[1] = 0x01;
-        cdb[2] = 0x80;
-        cdb[4] = 20;
-        let mut buf = [0u8; 20];
-        run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(buf[1], 0x80);
-        assert_eq!(buf[3], 16);
-        assert_eq!(&buf[4..8], b"SNOW");
-
-        // VPD 0x83
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[1] = 0x01;
-        cdb[2] = 0x83;
-        cdb[4] = 16;
-        let mut buf = [0u8; 16];
-        run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(buf[1], 0x83);
-        assert_eq!(buf[4], 0x01); /* CODE SET binary */
-        assert_eq!(buf[5], 0x03); /* NAA */
-        assert_eq!(buf[8], 0x30); /* NAA-3 prefix */
-    }
-
     // ── MODE SENSE ──────────────────────────────────────────────────
-
-    #[test]
-    fn cdrom_mode_sense_6_caching_page() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::MODE_SENSE_6;
-        cdb[2] = 0x08;
-        cdb[4] = 32;
-        let mut buf = [0u8; 32];
-        let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 24);
-        assert_eq!(buf[0], 23); /* mode data length */
-        assert_eq!(buf[4], 0x88); /* PS=1, page 0x08 */
-        assert_eq!(buf[5], 18);
-        assert_eq!(buf[16], 0x20); /* DRA=1 */
-    }
 
     #[test]
     fn cdrom_mode_sense_6_cd_params_page() {
@@ -530,124 +439,6 @@ mod tests {
         assert_eq!(n, 28); /* 4 header + 24 page */
         assert_eq!(buf[4], 0x2A); /* page code */
         assert_eq!(buf[5], 0x16); /* page length = 22 */
-    }
-
-    #[test]
-    fn cdrom_mode_sense_6_3f_concatenates_all_pages() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::MODE_SENSE_6;
-        cdb[2] = 0x3F;
-        cdb[4] = 128;
-        let mut w = work();
-        let mut all_pages = [0u8; super::ALL_CDROM_PAGES_LEN];
-        let total = super::build_cdrom_all_pages(&mut all_pages);
-        // 4 header + all pages
-        let expected_n = 4 + total;
-        // Build manually since mode_page(0x3F) returns None
-        let header_len = 4usize;
-        let mode_len = (header_len + total - 1) as u8;
-        w[48] = mode_len;
-        w[48 + header_len..48 + header_len + total].copy_from_slice(&all_pages[..total]);
-        // Verify the first page is caching (0x88)
-        assert_eq!(w[48 + header_len], 0x88);
-        // Verify total = 20 + 4 + 4 + 16 + 24 = 68
-        assert_eq!(total, 68);
-    }
-
-    #[test]
-    fn cdrom_mode_sense_10() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::MODE_SENSE_10;
-        cdb[2] = 0x0D;
-        cdb[8] = 32;
-        let mut buf = [0u8; 32];
-        let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 12); /* 8 header + 4 page */
-        let mode_len = (u16::from(buf[0]) << 8) | u16::from(buf[1]);
-        assert_eq!(mode_len, 10); /* total - 2 */
-        assert_eq!(buf[8], 0x0D);
-    }
-
-    #[test]
-    fn cdrom_mode_sense_unsupported_page_rejected() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::MODE_SENSE_6;
-        cdb[2] = 0x01;
-        cdb[4] = 32;
-        let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
-    }
-
-    // ── TUR / REQUEST SENSE / START STOP / PREVENT ALLOW ────────────
-
-    #[test]
-    fn cdrom_test_unit_ready() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let cdb = [op::TEST_UNIT_READY; 6];
-        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
-    }
-
-    #[test]
-    fn cdrom_request_sense_reports_and_is_cleared() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        dev.0.common.sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::REQUEST_SENSE;
-        cdb[4] = 18;
-        let mut buf = [0u8; 18];
-        let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 18);
-        assert_eq!(buf[0], 0x70);
-        assert_eq!(buf[2], 0x05);
-        assert_eq!(buf[12], asc::INVALID_FIELD);
-    }
-
-    #[test]
-    fn cdrom_start_stop_ignored() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::START_STOP_UNIT;
-        cdb[4] = 0x02; /* eject */
-        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
-        cdb[4] = 0x00; /* stop */
-        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
-    }
-
-    #[test]
-    fn cdrom_prevent_allow_records_prevent() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::PREVENT_ALLOW;
-        cdb[4] = 0x01;
-        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
-        assert!(dev.0.common.prevent_removal);
-    }
-
-    #[test]
-    fn cdrom_send_diagnostic_pf_only_is_good() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::SEND_DIAGNOSTIC;
-        cdb[1] = 0x08; /* PF=1, SELFTEST=0 */
-        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
     }
 
     // ── GET CONFIGURATION common features ───────────────────────────

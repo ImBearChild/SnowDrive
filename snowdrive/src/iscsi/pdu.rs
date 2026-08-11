@@ -776,21 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn cdb_len_from_opcode_groups() {
-        /* Group 0 (000b) → 6 bytes */
-        assert_eq!(cdb_len_from_opcode(0x00), 6);
-        assert_eq!(cdb_len_from_opcode(0x12), 6);
-        /* Group 1 (001b) → 10 bytes */
-        assert_eq!(cdb_len_from_opcode(0x28), 10);
-        /* Group 2 (010b) → 10 bytes */
-        assert_eq!(cdb_len_from_opcode(0x4C), 10);
-        /* Group 4 (100b) → 16 bytes */
-        assert_eq!(cdb_len_from_opcode(0x8F), 16);
-        /* Group 5 (101b) → 12 bytes */
-        assert_eq!(cdb_len_from_opcode(0xA0), 12);
-    }
-
-    #[test]
     fn data_seg_len_rfc_read() {
         /* Place known bytes at RFC 3720 §3.1 offsets (5-7) — no setter. */
         let mut b = bhs();

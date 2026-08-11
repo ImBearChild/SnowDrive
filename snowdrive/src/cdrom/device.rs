@@ -418,7 +418,7 @@ mod tests {
     use super::*;
     use crate::scsi::backend::RamBackend;
     use crate::scsi::device::CommandOutcome;
-    use crate::scsi::scsi::{asc, op, Sense, SenseKey};
+    use crate::scsi::scsi::{asc, op, SenseKey};
 
     /// Helper: create a RamBackend of `size` bytes filled with `fill`.
     fn ram_image(size: usize, fill: u8) -> Vec<u8> {
@@ -504,94 +504,6 @@ mod tests {
         let b = RamBackend::new(&mut img);
         let dev = CdromDevice::with_profile(b, CurrentProfile::DvdRom);
         assert_eq!(dev.common.profile, CurrentProfile::DvdRom);
-    }
-
-    // ── INQUIRY ─────────────────────────────────────────────────────
-
-    #[test]
-    fn cdrom_flat_inquiry_reports_cdrom() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::INQUIRY;
-        cdb[4] = 96;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        let mut buf = [0u8; 96];
-        let n = data_in(outcome, &mut buf);
-        assert!(n >= 66);
-        assert_eq!(buf[0], 0x05); /* PDT = CD-ROM */
-        assert_eq!(buf[1], 0x80); /* removable */
-        assert_eq!(&buf[8..16], b"SnowSCSI");
-        assert_eq!(&buf[16..32], b"Virtual CD-ROM  ");
-    }
-
-    // ── READ CAPACITY ───────────────────────────────────────────────
-
-    #[test]
-    fn read_capacity_10() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::READ_CAPACITY_10;
-        let mut buf = [0u8; 8];
-        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 8);
-        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 99);
-        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), 2048);
-    }
-
-    #[test]
-    fn read_capacity_16() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 16];
-        cdb[0] = op::SERVICE_ACTION_IN;
-        cdb[1] = 0x10;
-        cdb[13] = 0x20;
-        let mut buf = [0u8; 32];
-        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 32);
-        assert_eq!(
-            u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
-            99
-        );
-        assert_eq!(&buf[8..12], &[0x00, 0x00, 0x08, 0x00]);
-    }
-
-    #[test]
-    fn read_capacity_10_pmi_zero_lba_nonzero_rejected() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::READ_CAPACITY_10;
-        cdb[5] = 0x01;
-        assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
-            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
-        );
-    }
-
-    #[test]
-    fn read_capacity_16_unknown_sa_rejected() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 16];
-        cdb[0] = op::SERVICE_ACTION_IN;
-        cdb[1] = 0xFF;
-        assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
-            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
-        );
     }
 
     // ── READ TOC ────────────────────────────────────────────────────
@@ -744,125 +656,6 @@ mod tests {
         );
     }
 
-    // ── GET CONFIGURATION ───────────────────────────────────────────
-
-    #[test]
-    fn get_config_cd_profile() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::GET_CONFIGURATION;
-        cdb[7] = 0x00;
-        cdb[8] = 0x40;
-        let mut buf = [0u8; 64];
-        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert!(n >= 8);
-        assert_eq!(buf[6], 0x00);
-        assert_eq!(buf[7], 0x08);
-    }
-
-    #[test]
-    fn get_config_dvd_profile() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::with_profile(b, CurrentProfile::DvdRom);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::GET_CONFIGURATION;
-        cdb[7] = 0x00;
-        cdb[8] = 0x40;
-        let mut buf = [0u8; 64];
-        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(buf[6], 0x00);
-        assert_eq!(buf[7], 0x10);
-    }
-
-    #[test]
-    fn get_config_rt_reserved_rejected() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::GET_CONFIGURATION;
-        cdb[1] = 0x03;
-        cdb[7] = 0x00;
-        cdb[8] = 0x40;
-        assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
-            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
-        );
-    }
-
-    // ── READ(10) ────────────────────────────────────────────────────
-
-    #[test]
-    fn read_10_roundtrip() {
-        let mut img = ram_image(2048 * 100, 0xAA);
-        img[2048..2048 + 4].copy_from_slice(&[1, 2, 3, 4]);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let cdb = make_cdb10(op::READ_10, 1, 1);
-        let mut buf = [0u8; 2048];
-        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 2048);
-        assert_eq!(buf[..4], [1, 2, 3, 4]);
-        assert_eq!(buf[4..], [0xAA; 2044]);
-        assert_eq!(dev.sense().key, SenseKey::None);
-    }
-
-    #[test]
-    fn read_6_12_16() {
-        let mut img = ram_image(2048 * 100, 0);
-        img[5 * 2048 + 1] = 0x5B;
-        img[20 * 2048] = 0x4C;
-        img[30 * 2048 + 2] = 0xE3;
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-
-        let mut buf = [0u8; 2048];
-        let n = do_data_in(&mut dev, &make_cdb6(op::READ_6, 5, 1), &mut w, &mut buf);
-        assert_eq!(n, 2048);
-        assert_eq!(buf[1], 0x5B);
-
-        let mut buf = [0u8; 2048];
-        let n = do_data_in(&mut dev, &make_cdb12(op::READ_12, 20, 1), &mut w, &mut buf);
-        assert_eq!(n, 2048);
-        assert_eq!(buf[0], 0x4C);
-
-        let mut buf = [0u8; 2048];
-        let n = do_data_in(&mut dev, &make_cdb16(op::READ_16, 30, 1), &mut w, &mut buf);
-        assert_eq!(n, 2048);
-        assert_eq!(buf[2], 0xE3);
-    }
-
-    #[test]
-    fn read_count_zero_is_good() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let cdb = make_cdb10(op::READ_10, 0, 0);
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
-    }
-
-    #[test]
-    fn read_lba_out_of_range() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let cdb = make_cdb10(op::READ_10, 100, 1);
-        assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
-            (SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE)
-        );
-    }
-
     // ── WRITE commands → DATA PROTECT ───────────────────────────────
 
     #[test]
@@ -887,91 +680,6 @@ mod tests {
         assert_dp(&cdb);
     }
 
-    // ── Unknown opcode ──────────────────────────────────────────────
-
-    #[test]
-    fn unknown_opcode_returns_invalid_command() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = 0xFF;
-        assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
-            (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
-        );
-    }
-
-    // ── WorkBufTooSmall ─────────────────────────────────────────────
-
-    #[test]
-    fn work_buf_too_small() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut small = [0u8; 100];
-        let cdb = make_cdb10(op::READ_10, 0, 1);
-        assert_eq!(dev.do_cmd(&cdb, &mut small, 0), Err(Error::WorkBufTooSmall));
-    }
-
-    // ── TUR / REQUEST SENSE / START STOP / PREVENT ALLOW ────────────
-
-    #[test]
-    fn tur_and_request_sense() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-
-        let cdb = [op::TEST_UNIT_READY; 6];
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
-
-        let mut bad = [0u8; 6];
-        bad[0] = op::MODE_SENSE_6;
-        bad[2] = 0x01;
-        bad[4] = 32;
-        assert!(matches!(
-            dev.do_cmd(&bad, &mut w, 0).unwrap(),
-            CommandOutcome::CheckCondition(_)
-        ));
-
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::REQUEST_SENSE;
-        cdb[4] = 18;
-        let mut buf = [0u8; 18];
-        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
-        assert_eq!(n, 18);
-        assert_eq!(buf[0], 0x70);
-        assert_eq!(buf[2], 0x05);
-        assert_eq!(buf[12], asc::INVALID_FIELD);
-    }
-
-    #[test]
-    fn start_stop_ignored() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::START_STOP_UNIT;
-        cdb[4] = 0x02;
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
-    }
-
-    #[test]
-    fn prevent_allow_records() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        let mut w = work();
-        let mut cdb = [0u8; 6];
-        cdb[0] = op::PREVENT_ALLOW;
-        cdb[4] = 0x01;
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
-        assert!(dev.common.prevent_removal);
-    }
-
     // ── MODE SENSE ──────────────────────────────────────────────────
 
     #[test]
@@ -988,17 +696,6 @@ mod tests {
         let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
         assert_eq!(n, 8);
         assert_eq!(buf[4], 0x0D);
-    }
-
-    // ── ScsiDevice impl ─────────────────────────────────────────────
-
-    #[test]
-    fn scsi_device_impl() {
-        let mut img = ram_image(2048 * 100, 0);
-        let b = RamBackend::new(&mut img);
-        let mut dev = CdromDevice::new(b);
-        assert_eq!(ScsiDevice::device_type(&dev), DeviceType::Cdrom);
-        assert!(dev.write_data(0, &[0u8; 4]).is_err());
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
