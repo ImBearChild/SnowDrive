@@ -102,6 +102,42 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## Code Coverage
+
+Coverage is measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)
+(LLVM source-based instrumentation — the compiler's own counters, no ptrace).
+
+```bash
+# One-time setup
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+
+# Whole workspace (lib + bin + tests)
+cargo llvm-cov --workspace
+
+# Lib-only coverage (exclude the thin bin shell)
+cargo llvm-cov --workspace --ignore-filename-regex 'bins/'
+
+# HTML report (writes target/llvm-cov-html/)
+cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html
+
+# lcov for CI / Codecov (writes target/coverage.lcov)
+cargo llvm-cov --workspace --lcov --output-path target/coverage.lcov
+```
+
+Baseline (Aug 2026, `cargo llvm-cov --workspace`): **TOTAL ~90% lines**,
+with `iso9660/live.rs` (99%), `spc.rs` (99%), `pdu.rs` (97%) the strongest
+modules.
+
+Notes:
+
+- `--no-default-features` builds only the always-on `common` module (~3%);
+  meaningful feature-matrix runs must enable `--features scsi` etc.
+- **Pre-existing gap**: `cargo test -p snowdrive --no-default-features
+  --features scsi` does not compile (unit tests use `Vec`/`String` without
+  pulling in `std`). This predates coverage tooling and is a separate bug.
+- Coverage artifacts land under `target/` (already gitignored).
+
 ## Pre-commit Workflow
 
 1. `cargo build --workspace`
