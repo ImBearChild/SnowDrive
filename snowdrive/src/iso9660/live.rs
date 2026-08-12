@@ -26,8 +26,8 @@
 //!
 //! # Name limits
 //!
-//! - [`MAX_JOLIET_NAME_CHARS`] — Joliet identifier width (default 32
-//!   UCS-2 chars, ECMA-119 Annex J allows 64). Longer names are
+//! - [`MAX_JOLIET_NAME_CHARS`] — Joliet identifier width (default 64
+//!   UCS-2 chars, the ECMA-119 Annex J Level 1 limit). Longer names are
 //!   truncated in the generated metadata; raise the constant to widen.
 //! - [`MAX_PATH_LEN`] — maximum relative host path accepted by the live
 //!   scanner (default 512 bytes); deeper paths fail the layout build.
@@ -66,16 +66,16 @@ pub const MAX_LABEL_LEN: usize = 16;
 /// characters.
 ///
 /// ECMA-119 Annex J (Joliet) allows identifiers up to **64** UCS-2
-/// characters; this library defaults to **32**. Identifiers longer than
-/// this are **truncated** in the generated ISO9660 metadata (the host-side
-/// name is untouched). Raise this constant (and rebuild) for wider names;
-/// all buffers, record sizes and `Vec` capacities below are derived from
-/// it, so no other edit is required.
+/// characters — the Level 1 limit matching the `%/@` escape sequence we
+/// emit. Identifiers longer than this are **truncated** in the generated
+/// ISO9660 metadata (the host-side name is untouched). Raise this constant
+/// (and rebuild) for wider names; all buffers, record sizes and `Vec`
+/// capacities below are derived from it, so no other edit is required.
 ///
 /// The related host-side limits — `DirEntry.name` (`String<256>`, the FS
 /// seam) and [`MAX_PATH_LEN`] — sit above this value, so the Joliet
 /// identifier width is the binding constraint.
-pub const MAX_JOLIET_NAME_CHARS: usize = 32;
+pub const MAX_JOLIET_NAME_CHARS: usize = 64;
 
 /// Byte length of a Joliet identifier (2 bytes per character).
 pub const MAX_JOLIET_NAME_BYTES: usize = MAX_JOLIET_NAME_CHARS * 2;
@@ -594,12 +594,10 @@ fn write_svd(layout: &Layout, out: &mut [u8]) {
     out[0] = 0x02; // SVD type
     out[1..6].copy_from_slice(b"CD001");
     out[6] = 0x01; // version
-                   // Escape sequences (BP 89-120 → bytes 88-119): UCS-2 Level 1, the
-                   // remainder space-filled (ECMA-119 §8.5.6). Strict readers compare the
-                   // whole 32-byte field.
-    for i in 0..32 {
-        out[88 + i] = b' ';
-    }
+                   // Escape sequences (BP 89-120 → bytes 88-119): UCS-2 Level 1 `%/@`
+                   // (Joliet Annex C.3.1, Table C.1). The remaining bytes stay (00) —
+                   // ECMA-119 §8.5.6 requires unused positions in this field to be (00),
+                   // and `gen_sector` zero-fills the sector first.
     out[88] = 0x25; // %
     out[89] = 0x2F; // /
     out[90] = 0x40; // @
@@ -1243,9 +1241,9 @@ mod tests {
         assert_eq!(sector[88], 0x25);
         assert_eq!(sector[89], 0x2F);
         assert_eq!(sector[90], 0x40);
-        // Remainder of the field is space-filled, not zero (strict readers
-        // compare the whole 32-byte escape sequence field).
-        assert_eq!(sector[91], b' ');
+        // Remainder of the field is (00) per ECMA-119 §8.5.6 (strict
+        // readers compare the whole 32-byte escape sequence field).
+        assert_eq!(&sector[91..120], &[0u8; 29]);
         // UCS-2BE volume ID "JOL" (BP 41-72 → byte 40).
         assert_eq!(sector[40], 0x00);
         assert_eq!(sector[41], b'J');

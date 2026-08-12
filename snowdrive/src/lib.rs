@@ -22,8 +22,8 @@
 //!
 //! ## ISO9660 name limits
 //! The live generator (`iso9660::live`) truncates Joliet identifiers
-//! longer than [`iso9660::live::MAX_JOLIET_NAME_CHARS`] (default 32 UCS-2
-//! chars) and accepts host paths up to
+//! longer than [`iso9660::live::MAX_JOLIET_NAME_CHARS`] (default 64 UCS-2
+//! chars, the Annex J Level 1 limit) and accepts host paths up to
 //! [`iso9660::live::MAX_PATH_LEN`] bytes. Both are public constants you
 //! can raise when wider names are required.
 
