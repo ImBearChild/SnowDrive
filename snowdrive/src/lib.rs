@@ -41,8 +41,10 @@ pub mod iso9660;
 #[cfg(feature = "scsi")]
 pub mod scsi;
 
-/// Minimum work-buffer size: BHS (48) + MaxRecvDataSegmentLength (8192) +
-/// padding (≤ 3) = 8240 (derived in the plan; see also the iSCSI target
-/// state machine). Any `&mut [u8]` passed to `do_cmd` / `step` must be
-/// at least this long.
-pub const MIN_WORK_LEN: usize = 48 + 8192;
+/// Minimum data-area size for `ScsiDevice::do_cmd`: 8192 bytes
+/// (= MaxRecvDataSegmentLength). The `data` argument is a pure data
+/// region, transport-layout independent (each transport derives its own
+/// scratch buffer from it — iSCSI prepends its 48-byte BHS, USB MSC uses
+/// it directly). Any `&mut [u8]` passed as `data` to `do_cmd` must be at
+/// least this long.
+pub const MIN_DATA_LEN: usize = 8192;

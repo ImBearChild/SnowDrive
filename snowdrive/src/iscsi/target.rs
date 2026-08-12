@@ -225,14 +225,14 @@ impl Session {
     /// Blocks on the connection for as much input as the transaction needs
     /// (Login → Login Response; SCSI Command → full Data-In/Data-Out flow and
     /// final status; TMF / NOP / Logout → response). `work` must be at least
-    /// [`crate::MIN_WORK_LEN`] bytes.
+    /// [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes (BHS + data area).
     pub fn step<C: Conn, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
         work: &mut [u8],
         devs: &mut [D],
     ) -> StepResult {
-        if work.len() < crate::MIN_WORK_LEN {
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
             return StepResult::Error(TargetError::WorkBufTooSmall);
         }
         let pdu = match recv_pdu(conn, work) {
@@ -493,7 +493,9 @@ impl Session {
             recv_cmd_sn,
             pdu.dsl
         );
-        let outcome = match dev.do_cmd(cdb, work, pdu.dsl) {
+        // The data area is `work[BHS_SIZE..]` — synthesized responses land in
+        // the PDU data-segment slot, zero-copy.
+        let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..], pdu.dsl) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
                 return StepResult::Error(TargetError::WorkBufTooSmall)
@@ -520,7 +522,7 @@ impl Session {
                 immediate,
             } => {
                 if !immediate.is_empty() {
-                    // Synthesized response already resident at work[48..48+n].
+                    // Synthesized response already resident at work[BHS_SIZE..].
                     let n = immediate.len();
                     crate::debug!("  -> DataIn (synthesized, {} bytes)", n);
                     self.send_data_in_final(conn, work, itt, n, 0, 0, status::GOOD)
@@ -593,7 +595,7 @@ impl Session {
         // 8-byte header (4-byte LUN list length + 4-byte reserved) +
         // 8 bytes per LUN. 256 LUNs is the single-level peripheral device
         // addressing limit (SAM-2) and fits comfortably in
-        // `MIN_WORK_LEN = 48 + 8192`.
+        // `MIN_DATA_LEN = 8192`.
         let list_len = u32::try_from(num_luns)
             .ok()
             .and_then(|n| n.checked_mul(8))
@@ -995,7 +997,8 @@ pub enum StepResult {
 /// Target-level error (no_std).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetError {
-    /// Caller's work buffer is smaller than [`crate::MIN_WORK_LEN`].
+    /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
+    /// `BHS_SIZE` (data area too small for the SCSI layer).
     WorkBufTooSmall,
     /// Connection I/O failure (details logged by the transport).
     Io,
@@ -1006,7 +1009,7 @@ pub enum TargetError {
 impl core::fmt::Display for TargetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_WORK_LEN"),
+            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN + BHS_SIZE"),
             Self::Io => write!(f, "connection I/O failure"),
             Self::Internal => write!(f, "internal target error"),
         }
@@ -1017,15 +1020,15 @@ impl core::error::Error for TargetError {}
 
 /// Blocking wrapper: run `session.step` until the connection closes.
 ///
-/// Validates `work.len() >= MIN_WORK_LEN` up front. I/O errors inside `step`
-/// surface as `Closed`; only caller bugs propagate as `Err`.
+/// Validates `work.len() >= MIN_DATA_LEN + BHS_SIZE` up front. I/O errors
+/// inside `step` surface as `Closed`; only caller bugs propagate as `Err`.
 pub fn serve_conn<C: Conn, D: ScsiDevice>(
     conn: &mut C,
     work: &mut [u8],
     session: &mut Session,
     devs: &mut [D],
 ) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_WORK_LEN {
+    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
         return Err(TargetError::WorkBufTooSmall);
     }
     loop {
@@ -1045,7 +1048,7 @@ struct Pdu {
 }
 
 /// Receive one PDU: 48-byte BHS, optional AHS (skipped), data segment
-/// (into `work[48..]` when it fits, otherwise discarded), and padding.
+/// (into `work[BHS_SIZE..]` when it fits, otherwise discarded), and padding.
 /// Never leaves bytes behind — keeps TCP synchronized (fix #1).
 fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<Pdu, ()> {
     let mut raw = [0u8; BHS_SIZE];

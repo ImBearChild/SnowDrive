@@ -99,9 +99,9 @@ impl<B: BlockStorage> BlockDevice<B> {
         }
     }
 
-    /// Process one SCSI command (`snowscsi_do_cmd`). `work` must be at
-    /// least [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length of data
-    /// already received into `work[48..48+dsl]` (immediate data for WRITE).
+    /// Process one SCSI command (`snowscsi_do_cmd`). `data` must be at
+    /// least [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length of data
+    /// already received into `data[0..dsl]` (immediate data for WRITE).
     ///
     /// The CDB is parsed by [`parse_sbc`]: SPC commands are dispatched to
     /// [`execute_spc`] (via the `SbcCommand::Spc` fall-through), SBC commands
@@ -109,18 +109,18 @@ impl<B: BlockStorage> BlockDevice<B> {
     pub fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        if work.len() < crate::MIN_WORK_LEN {
+        if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
         let Some(cmd) = parse_sbc(cdb) else {
             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
         };
         let outcome = match cmd {
-            SbcCommand::Spc(cmd) => execute_spc(self, cmd, work, dsl),
-            cmd => execute_sbc(self, cmd, work, dsl),
+            SbcCommand::Spc(cmd) => execute_spc(self, cmd, data, dsl),
+            cmd => execute_sbc(self, cmd, data, dsl),
         };
         if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
             self.sense = Sense::clear();
@@ -134,7 +134,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         max_lba: u64,
         lba: u64,
         count: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if count == 0 {
             return CommandOutcome::Status;
@@ -149,7 +149,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         CommandOutcome::DataIn {
             transfer_len: bytes as u64,
             byte_offset: lba * u64::from(self.sector_size),
-            immediate: &work[48..48],
+            immediate: &data[0..0],
         }
     }
 
@@ -159,7 +159,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         max_lba: u64,
         lba: u64,
         count: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> CommandOutcome<'a> {
         if count == 0 {
@@ -172,11 +172,11 @@ impl<B: BlockStorage> BlockDevice<B> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
         let bytes = bytes as usize;
-        let imm = dsl.min(bytes).min(work.len() - 48);
+        let imm = dsl.min(bytes).min(data.len());
         CommandOutcome::DataOut {
             transfer_len: bytes as u64,
             byte_offset: lba * u64::from(self.sector_size),
-            immediate: &work[48..48 + imm],
+            immediate: &data[0..imm],
         }
     }
 
@@ -198,7 +198,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         &mut self,
         pmi: bool,
         req_lba: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -207,11 +207,11 @@ impl<B: BlockStorage> BlockDevice<B> {
         let mut buf = [0u8; 8];
         buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
         buf[4..8].copy_from_slice(&self.sector_size.to_be_bytes());
-        work[48..56].copy_from_slice(&buf);
+        data[0..8].copy_from_slice(&buf);
         CommandOutcome::DataIn {
             transfer_len: 8,
             byte_offset: 0,
-            immediate: &work[48..56],
+            immediate: &data[0..8],
         }
     }
 
@@ -219,7 +219,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         &mut self,
         sa: u8,
         alloc: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -229,11 +229,11 @@ impl<B: BlockStorage> BlockDevice<B> {
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&self.sector_size.to_be_bytes());
         let n = 32.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 }
@@ -280,10 +280,10 @@ impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
     fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        self.do_cmd(cdb, work, dsl)
+        self.do_cmd(cdb, data, dsl)
     }
 
     fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
@@ -367,8 +367,8 @@ mod tests {
         cdb
     }
 
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     fn ram_dev<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
@@ -433,7 +433,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
-        w[48..48 + 512].copy_from_slice(&pattern);
+        w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb10(op::WRITE_10, 10, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
@@ -567,7 +567,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
-        w[48..48 + 512].copy_from_slice(&pattern);
+        w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb6(op::WRITE_6, 5, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
@@ -597,7 +597,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let pattern: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-        w[48..48 + 1024].copy_from_slice(&pattern);
+        w[0..1024].copy_from_slice(&pattern);
 
         let cdb = make_cdb12(op::WRITE_12, 20, 2);
         let outcome = dev.do_cmd(&cdb, &mut w, 1024).unwrap();
@@ -627,7 +627,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let pattern: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-        w[48..48 + 1024].copy_from_slice(&pattern);
+        w[0..1024].copy_from_slice(&pattern);
 
         let cdb = make_cdb16(op::WRITE_16, 30, 2);
         let outcome = dev.do_cmd(&cdb, &mut w, 1024).unwrap();
@@ -786,7 +786,7 @@ mod tests {
         let mut dev = BlockDevice::new(backend, 512).unwrap();
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
-        w[48..48 + 512].copy_from_slice(&pattern);
+        w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();

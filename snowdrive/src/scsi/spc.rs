@@ -178,13 +178,13 @@ pub trait SpcDevice {
 }
 
 /// Execute one parsed SPC command against `dev`. Synthesized responses are
-/// written into `work[48..]` and borrowed back via
+/// written into `data[0..]` and borrowed back via
 /// [`CommandOutcome::DataIn`]. `_dsl` is reserved for the incoming data
 /// segment length (unused by the current SPC command set).
 pub fn execute_spc<'a, D: SpcDevice>(
     dev: &mut D,
     cmd: SpcCommand,
-    work: &'a mut [u8],
+    data: &'a mut [u8],
     _dsl: usize,
 ) -> CommandOutcome<'a> {
     match cmd {
@@ -194,15 +194,15 @@ pub fn execute_spc<'a, D: SpcDevice>(
             let mut buf = [0u8; SENSE_LEN];
             let n = dev.sense().write_fixed(&mut buf);
             let n = n.min(alloc as usize);
-            work[48..48 + n].copy_from_slice(&buf[..n]);
+            data[0..n].copy_from_slice(&buf[..n]);
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
                 byte_offset: 0,
-                immediate: &work[48..48 + n],
+                immediate: &data[0..n],
             }
         }
 
-        SpcCommand::Inquiry { evpd, page, alloc } => inquiry(dev, evpd, page, alloc, work),
+        SpcCommand::Inquiry { evpd, page, alloc } => inquiry(dev, evpd, page, alloc, data),
 
         SpcCommand::ModeSense { long, page, alloc } => {
             let Some(page_bytes) = dev.mode_page(page) else {
@@ -220,11 +220,11 @@ pub fn execute_spc<'a, D: SpcDevice>(
             }
             buf[header_len..total].copy_from_slice(page_bytes);
             let n = total.min(alloc as usize);
-            work[48..48 + n].copy_from_slice(&buf[..n]);
+            data[0..n].copy_from_slice(&buf[..n]);
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
                 byte_offset: 0,
-                immediate: &work[48..48 + n],
+                immediate: &data[0..n],
             }
         }
 
@@ -263,11 +263,11 @@ pub fn execute_spc<'a, D: SpcDevice>(
 
         SpcCommand::ReceiveDiagnosticResults { alloc } => {
             let n = 4.min(alloc as usize);
-            work[48..48 + n].fill(0);
+            data[0..n].fill(0);
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
                 byte_offset: 0,
-                immediate: &work[48..48 + n],
+                immediate: &data[0..n],
             }
         }
     }
@@ -279,18 +279,18 @@ fn inquiry<'a, D: SpcDevice>(
     evpd: bool,
     page: u8,
     alloc: u16,
-    work: &'a mut [u8],
+    data: &'a mut [u8],
 ) -> CommandOutcome<'a> {
     if evpd {
-        let data: &[u8] = match page {
+        let data_out: &[u8] = match page {
             0x00 => {
                 let mut buf = [0u8; VPD_PAGE_LIST_LEN];
                 buf[3] = 3;
                 buf[4] = 0x00;
                 buf[5] = 0x80;
                 buf[6] = 0x83;
-                work[48..48 + VPD_PAGE_LIST_LEN].copy_from_slice(&buf);
-                &work[48..48 + VPD_PAGE_LIST_LEN]
+                data[0..VPD_PAGE_LIST_LEN].copy_from_slice(&buf);
+                &data[0..VPD_PAGE_LIST_LEN]
             }
             0x80 => {
                 let mut buf = [0u8; VPD_SERIAL_LEN];
@@ -300,8 +300,8 @@ fn inquiry<'a, D: SpcDevice>(
                 buf[4..8].copy_from_slice(b"SNOW");
                 let hex = format_hex16(id);
                 buf[8..20].copy_from_slice(&hex[4..16]);
-                work[48..48 + VPD_SERIAL_LEN].copy_from_slice(&buf);
-                &work[48..48 + VPD_SERIAL_LEN]
+                data[0..VPD_SERIAL_LEN].copy_from_slice(&buf);
+                &data[0..VPD_SERIAL_LEN]
             }
             0x83 => {
                 let mut buf = [0u8; VPD_ID_LEN];
@@ -312,16 +312,16 @@ fn inquiry<'a, D: SpcDevice>(
                 buf[7] = 8;
                 let id = 0x3000_0000_0000_0000u64 | (dev.id() & 0x0FFF_FFFF_FFFF_FFFF);
                 buf[8..16].copy_from_slice(&id.to_be_bytes());
-                work[48..48 + VPD_ID_LEN].copy_from_slice(&buf);
-                &work[48..48 + VPD_ID_LEN]
+                data[0..VPD_ID_LEN].copy_from_slice(&buf);
+                &data[0..VPD_ID_LEN]
             }
             _ => return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD),
         };
-        let n = data.len().min(alloc as usize);
+        let n = data_out.len().min(alloc as usize);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     } else {
         if page != 0 {
@@ -346,11 +346,11 @@ fn inquiry<'a, D: SpcDevice>(
             buf[59 + 2 * i] = (d & 0xFF) as u8;
         }
         let n = INQUIRY_STD_LEN.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 }
@@ -431,8 +431,8 @@ mod tests {
         }
     }
 
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     /// Extract the DataIn payload, returning the number of bytes transferred.

@@ -43,14 +43,14 @@ pub enum CommandOutcome<'a> {
     /// Device → host. `immediate` is empty for backend reads (READ*):
     /// the target reads `transfer_len` bytes from the backend at
     /// `byte_offset`. Non-empty `immediate` (INQUIRY, MODE SENSE, ...)
-    /// is a synthesized response already placed at work[48..48+len].
+    /// is a synthesized response already placed at `data[0..len]`.
     DataIn {
         transfer_len: u64,
         byte_offset: u64,
         immediate: &'a [u8],
     },
     /// Host → device: write `transfer_len` bytes starting at `byte_offset`.
-    /// `immediate` borrows the caller's work buffer (already-received data).
+    /// `immediate` borrows the caller's data buffer (already-received data).
     DataOut {
         transfer_len: u64,
         byte_offset: u64,
@@ -63,14 +63,14 @@ pub enum CommandOutcome<'a> {
 /// Core command-processing error (no_std, `core::error::Error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Caller's work buffer is smaller than [`crate::MIN_WORK_LEN`].
+    /// Caller's data buffer is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_WORK_LEN"),
+            Self::WorkBufTooSmall => write!(f, "data buffer smaller than MIN_DATA_LEN"),
         }
     }
 }
@@ -82,13 +82,13 @@ impl core::error::Error for Error {}
 /// homogeneous `&mut [BlockDevice<B>]` or a heterogeneous `&mut [Device<'_>]`
 /// equally.
 pub trait ScsiDevice {
-    /// Process one SCSI command. `work` must be at least
-    /// [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length of data already
-    /// received into `work[48..48+dsl]`.
+    /// Process one SCSI command. `data` must be at least
+    /// [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length of data already
+    /// received into `data[0..dsl]`.
     fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error>;
 
@@ -134,17 +134,17 @@ impl ScsiDevice for Device<'_> {
     fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
         match self {
-            Self::Block(dev) => dev.do_cmd(cdb, work, dsl),
+            Self::Block(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.do_cmd(cdb, work, dsl),
+            Self::CdBlock(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => dev.do_cmd(cdb, work, dsl),
+            Self::CdFlat(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => dev.do_cmd(cdb, work, dsl),
+            Self::CdLiveFs(dev) => dev.do_cmd(cdb, data, dsl),
         }
     }
 
@@ -202,8 +202,8 @@ mod tests {
     use super::*;
     use crate::scsi::backend::RamBackend;
     use crate::scsi::scsi::op;
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     fn inquiry_pdt(dev: &mut Device<'_>, w: &mut [u8]) -> u8 {

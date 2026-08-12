@@ -38,7 +38,7 @@ use snowdrive::scsi::block::BlockDevice;
 use snowdrive::scsi::cdblock::CDBlockDevice;
 use snowdrive::scsi::device::Device;
 use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
-use snowdrive::MIN_WORK_LEN;
+use snowdrive::MIN_DATA_LEN;
 
 /// Default work buffer size (256 KiB).
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
@@ -534,16 +534,16 @@ fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
 }
 
 /// Resolve the work buffer size (default 256K), validating it against
-/// [`MIN_WORK_LEN`].
+/// [`MIN_DATA_LEN`].
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     let bytes = match s {
         None => DEFAULT_WORK_BUF_SIZE as u64,
         Some(v) => parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
     };
     let n = usize::try_from(bytes).map_err(|_| format!("--work-buf-size {bytes} is too large"))?;
-    if n < MIN_WORK_LEN {
+    if n < MIN_DATA_LEN {
         return Err(format!(
-            "--work-buf-size {n} is below the minimum {MIN_WORK_LEN}"
+            "--work-buf-size {n} is below the minimum {MIN_DATA_LEN}"
         ));
     }
     Ok(n)
@@ -689,7 +689,7 @@ mod tests {
     fn parse_work_size_defaults_and_validation() {
         assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
         assert_eq!(parse_work_size(Some("128K")).unwrap(), 128 * 1024);
-        assert!(parse_work_size(Some("1000")).is_err()); // below MIN_WORK_LEN
+        assert!(parse_work_size(Some("1000")).is_err()); // below MIN_DATA_LEN
         assert!(parse_work_size(Some("bogus")).is_err());
     }
 

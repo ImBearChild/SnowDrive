@@ -111,8 +111,8 @@ impl CDBlockDevice {
         }
     }
 
-    /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `work`
-    /// must be at least [`crate::MIN_WORK_LEN`] bytes; `dsl` is the length
+    /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `data`
+    /// must be at least [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length
     /// of data already received (immediate data, never used by this
     /// read-only device).
     ///
@@ -123,14 +123,14 @@ impl CDBlockDevice {
     pub fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        if work.len() < crate::MIN_WORK_LEN {
+        if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
         let outcome = if let Some(cmd) = parse_spc(cdb) {
-            execute_spc(self, cmd, work, dsl)
+            execute_spc(self, cmd, data, dsl)
         } else {
             // Total: `do_cmd` is public API — reject CDBs shorter than
             // their opcode group's fixed length (SPC-4 §7.3) before any
@@ -146,23 +146,23 @@ impl CDBlockDevice {
                     let Some((lba, count)) = cdb_read_args(op, cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
                     };
-                    self.read_cmd(lba, count, work)
+                    self.read_cmd(lba, count, data)
                 }
                 op::READ_CAPACITY_10 => {
                     let Some(lba) = cdb_lba10(cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
                     };
-                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, work)
+                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, data)
                 }
                 op::SERVICE_ACTION_IN => {
                     let alloc = (u32::from(cdb[10]) << 24)
                         | (u32::from(cdb[11]) << 16)
                         | (u32::from(cdb[12]) << 8)
                         | u32::from(cdb[13]);
-                    self.read_capacity_16_cmd(cdb[1], alloc, work)
+                    self.read_capacity_16_cmd(cdb[1], alloc, data)
                 }
-                op::READ_TOC => self.read_toc_cmd(cdb, work),
-                op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, work),
+                op::READ_TOC => self.read_toc_cmd(cdb, data),
+                op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
                 op::WRITE_6
                 | op::WRITE_10
                 | op::WRITE_12
@@ -185,7 +185,7 @@ impl CDBlockDevice {
         &mut self,
         lba: u64,
         count: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if count == 0 {
             return CommandOutcome::Status;
@@ -202,7 +202,7 @@ impl CDBlockDevice {
         CommandOutcome::DataIn {
             transfer_len: bytes as u64,
             byte_offset: lba * u64::from(SECTOR_SIZE),
-            immediate: &work[48..48],
+            immediate: &data[0..0],
         }
     }
 
@@ -218,7 +218,7 @@ impl CDBlockDevice {
         &mut self,
         pmi: bool,
         req_lba: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -227,11 +227,11 @@ impl CDBlockDevice {
         let mut buf = [0u8; 8];
         buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
         buf[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
-        work[48..56].copy_from_slice(&buf);
+        data[0..8].copy_from_slice(&buf);
         CommandOutcome::DataIn {
             transfer_len: 8,
             byte_offset: 0,
-            immediate: &work[48..56],
+            immediate: &data[0..8],
         }
     }
 
@@ -239,7 +239,7 @@ impl CDBlockDevice {
         &mut self,
         sa: u8,
         alloc: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -249,11 +249,11 @@ impl CDBlockDevice {
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         let n = 32.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 
@@ -265,7 +265,7 @@ impl CDBlockDevice {
     /// returns just the lead-out descriptor; MSF selects MSF-form addresses
     /// (LBA 0 → 00:02:00); the response is clamped to the allocation length
     /// without shrinking the TOC Data Length field.
-    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         let msf = cdb[1] & 0x02 != 0;
         let format = cdb[2] & 0x0F;
         let track = cdb[6];
@@ -322,11 +322,11 @@ impl CDBlockDevice {
             _ => return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
         };
         let n = n.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 
@@ -357,7 +357,7 @@ impl CDBlockDevice {
     /// features; RT=10b filters to the Starting Feature Number and higher;
     /// RT=11b is rejected. The response is clamped to the allocation length
     /// without shrinking the Data Length field.
-    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         let rt = cdb[1] & 0x03;
         let start = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
@@ -423,11 +423,11 @@ impl CDBlockDevice {
         buf[0..4].copy_from_slice(&data_len.to_be_bytes());
 
         let n = off.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 
@@ -483,10 +483,10 @@ impl ScsiDevice for CDBlockDevice {
     fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        self.do_cmd(cdb, work, dsl)
+        self.do_cmd(cdb, data, dsl)
     }
 
     fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
@@ -600,8 +600,8 @@ mod tests {
         assert_eq!(buf, [0x42; 4]);
     }
 
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     /// Run one full SCSI command via `do_cmd` and fetch the payload, reading

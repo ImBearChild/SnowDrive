@@ -278,9 +278,9 @@ pub fn build_get_config_features(
     off
 }
 
-/// Build a GET CONFIGURATION response into `work[48..]`.
+/// Build a GET CONFIGURATION response into `data[0..]`.
 pub fn build_get_config_response<'a>(
-    work: &'a mut [u8],
+    data: &'a mut [u8],
     profile: CurrentProfile,
     rt: u8,
     start_feature: u16,
@@ -298,11 +298,11 @@ pub fn build_get_config_response<'a>(
     buf[0..4].copy_from_slice(&data_len.to_be_bytes());
 
     let n = off.min(alloc as usize);
-    work[48..48 + n].copy_from_slice(&buf[..n]);
+    data[0..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
         byte_offset: 0,
-        immediate: &work[48..48 + n],
+        immediate: &data[0..n],
     }
 }
 
@@ -360,8 +360,8 @@ mod tests {
         }
     }
 
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     fn data_in(outcome: CommandOutcome<'_>, buf: &mut [u8]) -> usize {

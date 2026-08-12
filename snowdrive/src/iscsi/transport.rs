@@ -81,7 +81,7 @@ pub fn serve<D: ScsiDevice>(
     devs: &mut [D],
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_WORK_LEN {
+    if work.len() < crate::MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE {
         return Err(TargetError::WorkBufTooSmall);
     }
     loop {
@@ -118,7 +118,7 @@ mod tests {
     use crate::iscsi::conn::{read_exact, write_all};
     use crate::iscsi::pdu::{flag, op, stage};
     use crate::scsi::block::BlockDevice;
-    use crate::MIN_WORK_LEN;
+    use crate::MIN_DATA_LEN;
     use std::io::{Read as _, Write as _};
 
     fn be32(v: u32) -> [u8; 4] {
@@ -204,7 +204,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = AtomicBool::new(false);
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];

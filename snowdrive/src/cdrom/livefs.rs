@@ -266,14 +266,14 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
     pub fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        if work.len() < crate::MIN_WORK_LEN {
+        if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
         let outcome = if let Some(cmd) = parse_spc(cdb) {
-            execute_spc(&mut self.common, cmd, work, dsl)
+            execute_spc(&mut self.common, cmd, data, dsl)
         } else {
             // Total: `do_cmd` is public API — reject CDBs shorter than
             // their opcode group's fixed length (SPC-4 §7.3) before any
@@ -290,7 +290,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
                     let Some((lba, count)) = cdb_read_args(op, cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
                     };
-                    self.read_cmd(lba, count, work)
+                    self.read_cmd(lba, count, data)
                 }
 
                 // READ CAPACITY(10)
@@ -298,7 +298,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
                     let Some(lba) = cdb_lba10(cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
                     };
-                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, work)
+                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, data)
                 }
 
                 // READ CAPACITY(16) via SERVICE ACTION IN
@@ -307,14 +307,14 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
                         | (u32::from(cdb[11]) << 16)
                         | (u32::from(cdb[12]) << 8)
                         | u32::from(cdb[13]);
-                    self.read_capacity_16_cmd(cdb[1], alloc, work)
+                    self.read_capacity_16_cmd(cdb[1], alloc, data)
                 }
 
                 // READ TOC (0x43)
-                op::READ_TOC => self.read_toc_cmd(cdb, work),
+                op::READ_TOC => self.read_toc_cmd(cdb, data),
 
                 // GET CONFIGURATION (0x46)
-                op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, work),
+                op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
 
                 // WRITE commands → DATA PROTECT (read-only)
                 op::WRITE_6
@@ -335,7 +335,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
 
     // ── READ handler ────────────────────────────────────────────────
 
-    fn read_cmd<'a>(&mut self, lba: u64, count: u32, _work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn read_cmd<'a>(&mut self, lba: u64, count: u32, _data: &'a mut [u8]) -> CommandOutcome<'a> {
         if count == 0 {
             return CommandOutcome::Status;
         }
@@ -368,7 +368,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         &mut self,
         pmi: bool,
         req_lba: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -377,11 +377,11 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         let mut buf = [0u8; 8];
         buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
         buf[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
-        work[48..56].copy_from_slice(&buf);
+        data[0..8].copy_from_slice(&buf);
         CommandOutcome::DataIn {
             transfer_len: 8,
             byte_offset: 0,
-            immediate: &work[48..56],
+            immediate: &data[0..8],
         }
     }
 
@@ -389,7 +389,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         &mut self,
         sa: u8,
         alloc: u32,
-        work: &'a mut [u8],
+        data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -399,17 +399,17 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         let n = 32.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 
     // ── READ TOC ────────────────────────────────────────────────────
 
-    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         let msf = cdb[1] & 0x02 != 0;
         let format = cdb[2] & 0x0F;
         let track = cdb[6];
@@ -457,11 +457,11 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             _ => return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
         };
         let n = n.min(alloc as usize);
-        work[48..48 + n].copy_from_slice(&buf[..n]);
+        data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
             byte_offset: 0,
-            immediate: &work[48..48 + n],
+            immediate: &data[0..n],
         }
     }
 
@@ -478,7 +478,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
 
     // ── GET CONFIGURATION ───────────────────────────────────────────
 
-    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         let rt = cdb[1] & 0x03;
         let start = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
@@ -487,7 +487,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
 
-        build_get_config_response(work, self.common.profile, rt, start, alloc)
+        build_get_config_response(data, self.common.profile, rt, start, alloc)
     }
 }
 
@@ -533,10 +533,10 @@ impl<F: FsStorage> ScsiDevice for CdLiveFsDevice<F> {
     fn do_cmd<'a>(
         &mut self,
         cdb: &[u8],
-        work: &'a mut [u8],
+        data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
-        self.do_cmd(cdb, work, dsl)
+        self.do_cmd(cdb, data, dsl)
     }
 
     fn read_data(
@@ -585,8 +585,8 @@ mod tests {
         dir
     }
 
-    fn work() -> [u8; crate::MIN_WORK_LEN] {
-        [0u8; crate::MIN_WORK_LEN]
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
     }
 
     /// Build a temp tree: README.TXT (1000 B), DATA.BIN (4096 B), SUB/NOTES.TXT (256 B).

@@ -136,32 +136,32 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
 pub(crate) fn execute_sbc<'a, B: BlockStorage>(
     dev: &mut BlockDevice<B>,
     cmd: SbcCommand,
-    work: &'a mut [u8],
+    data: &'a mut [u8],
     dsl: usize,
 ) -> CommandOutcome<'a> {
     match cmd {
         SbcCommand::Read6 { lba, count } => {
-            dev.read_cmd(dev.max_lba(), u64::from(lba), count, work)
+            dev.read_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Write6 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), count, work, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data, dsl)
         }
         SbcCommand::Read10 { lba, count } => {
-            dev.read_cmd(dev.max_lba(), u64::from(lba), u32::from(count), work)
+            dev.read_cmd(dev.max_lba(), u64::from(lba), u32::from(count), data)
         }
         SbcCommand::Write10 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), u32::from(count), work, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), u32::from(count), data, dsl)
         }
         SbcCommand::Read12 { lba, count } => {
-            dev.read_cmd(dev.max_lba(), u64::from(lba), count, work)
+            dev.read_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Write12 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), count, work, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data, dsl)
         }
-        SbcCommand::Read16 { lba, count } => dev.read_cmd(dev.max_lba(), lba, count, work),
-        SbcCommand::Write16 { lba, count } => dev.write_cmd(dev.max_lba(), lba, count, work, dsl),
-        SbcCommand::ReadCapacity10 { pmi, lba } => dev.read_capacity_10_cmd(pmi, lba, work),
-        SbcCommand::ReadCapacity16 { sa, alloc } => dev.read_capacity_16_cmd(sa, alloc, work),
+        SbcCommand::Read16 { lba, count } => dev.read_cmd(dev.max_lba(), lba, count, data),
+        SbcCommand::Write16 { lba, count } => dev.write_cmd(dev.max_lba(), lba, count, data, dsl),
+        SbcCommand::ReadCapacity10 { pmi, lba } => dev.read_capacity_10_cmd(pmi, lba, data),
+        SbcCommand::ReadCapacity16 { sa, alloc } => dev.read_capacity_16_cmd(sa, alloc, data),
         SbcCommand::SynchronizeCache => {
             let _ = dev.backend().sync();
             CommandOutcome::Status

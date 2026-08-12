@@ -6,11 +6,14 @@
 mod tests {
     use crate::mock_conn::MockConn;
     use snowdrive::common::block_storage::RamBackend;
-    use snowdrive::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response};
+    use snowdrive::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowdrive::iscsi::target::{LoginStage, Session, StepResult};
     use snowdrive::scsi::block::BlockDevice;
     use snowdrive::scsi::device::ScsiDevice;
-    use snowdrive::MIN_WORK_LEN;
+    use snowdrive::MIN_DATA_LEN;
+
+    /// iSCSI target scratch buffer: BHS header + data area.
+    const WORK_LEN: usize = MIN_DATA_LEN + BHS_SIZE;
 
     /// Login parameters as sent by a Linux open-iscsi initiator
     /// (concatenated literals preserve embedded NUL separators).
@@ -122,7 +125,7 @@ mod tests {
     fn login_resp_bhs_rfc() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -159,7 +162,7 @@ mod tests {
     fn login_resp_no_skipped_keys() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -180,7 +183,7 @@ mod tests {
     fn login_resp_has_required_keys() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -199,7 +202,7 @@ mod tests {
     fn login_resp_echoes_all_keys() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -249,7 +252,7 @@ mod tests {
     fn multi_stage_login() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -302,7 +305,7 @@ mod tests {
     fn data_in_buffer_offset() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -350,7 +353,7 @@ mod tests {
     fn write_flow_r2t_and_response() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -404,7 +407,7 @@ mod tests {
     fn write_multi_r2t_bounded_by_max_burst() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -462,7 +465,7 @@ mod tests {
     fn nop_in_echoes_ttt() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -491,7 +494,7 @@ mod tests {
     fn unsupported_lun_check_condition() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -524,7 +527,7 @@ mod tests {
     fn multi_level_lun_rejected_as_pdu_field() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -555,7 +558,7 @@ mod tests {
     fn cmd_sn_out_of_window_ignored() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -587,7 +590,7 @@ mod tests {
     fn first_command_reuses_login_cmd_sn() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -630,7 +633,7 @@ mod tests {
     fn immediate_tmf_abort_task_complete() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -660,7 +663,7 @@ mod tests {
     fn tmf_bad_cmd_sn_ignored() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -685,7 +688,7 @@ mod tests {
     fn logout_closes_connection() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -711,7 +714,7 @@ mod tests {
     fn text_request_rejected() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -738,7 +741,7 @@ mod tests {
     fn ahs_rejected() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -768,7 +771,7 @@ mod tests {
     fn linux_kernel_write_flag_layout_accepted() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -809,7 +812,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -858,7 +861,7 @@ mod tests {
     fn report_luns_single_lun() {
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
         let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -917,7 +920,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
         conn.feed(&report_luns_bhs(0, 0xBEEF, 0), &[]);
@@ -959,7 +962,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
         conn.feed(&report_luns_bhs(1, 0xCAFE, 0), &[]);
@@ -986,7 +989,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
         let mut cmd = report_luns_bhs(5, 0xDEAD, 0); // LUN 5 doesn't exist
@@ -1039,7 +1042,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
         // INQUIRY LUN 0 → PDT 0x00 (disk).
@@ -1144,7 +1147,7 @@ mod tests {
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
-        let mut work = vec![0u8; MIN_WORK_LEN];
+        let mut work = vec![0u8; WORK_LEN];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
         // INQUIRY: LUN 0 → PDT 0x00, LUN 1/2 → PDT 0x05.
