@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-//! `snowscsi` CLI — SnowDrive SCSI target and ISO9660 image tools
-//! (`snowscsi_main.c`).
+//! `snowdrive` CLI — SnowDrive SCSI target and ISO9660 image tools
+//! (`snowdrive_main.c`).
 //!
 //! Subcommands:
 //! - `serve`: run the iSCSI target (serial accept loop)
@@ -54,7 +54,7 @@ const ISO_SECTOR_SIZE: u32 = 2048;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "snowscsi",
+    name = "snowdrive",
     about = "SnowDrive SCSI target and ISO9660 tools",
     version
 )]
@@ -93,7 +93,7 @@ struct ServeArgs {
     work_buf_size: Option<String>,
 }
 
-/// Arguments for `snowscsi mkisofs`: build an ISO9660/Joliet image from a
+/// Arguments for `snowdrive mkisofs`: build an ISO9660/Joliet image from a
 /// host directory (the live-generation algorithm dumped to a file).
 #[derive(Args, Debug)]
 struct MkisofsArgs {
@@ -123,27 +123,27 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 
     let addr = match args.iscsi.as_deref() {
         None => {
-            eprintln!("snowscsi: --iscsi is required");
+            eprintln!("snowdrive: --iscsi is required");
             return ExitCode::FAILURE;
         }
         Some(s) => match s.parse::<SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
-                eprintln!("snowscsi: invalid --iscsi address: {s}");
+                eprintln!("snowdrive: invalid --iscsi address: {s}");
                 return ExitCode::FAILURE;
             }
         },
     };
 
     if args.disk.is_empty() && args.cdrom.is_empty() {
-        eprintln!("snowscsi: --disk or --cdrom is required (at least one device)");
+        eprintln!("snowdrive: --disk or --cdrom is required (at least one device)");
         return ExitCode::FAILURE;
     }
 
     let work_size = match parse_work_size(args.work_buf_size.as_deref()) {
         Ok(n) => n,
         Err(msg) => {
-            eprintln!("snowscsi: {msg}");
+            eprintln!("snowdrive: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -153,7 +153,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         let parsed = match parse_disk_spec(spec) {
             Ok(p) => p,
             Err(msg) => {
-                eprintln!("snowscsi: invalid --disk spec '{spec}': {msg}");
+                eprintln!("snowdrive: invalid --disk spec '{spec}': {msg}");
                 return ExitCode::FAILURE;
             }
         };
@@ -165,7 +165,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         let parsed = match parse_cdrom_spec(spec) {
             Ok(p) => p,
             Err(msg) => {
-                eprintln!("snowscsi: invalid --cdrom spec '{spec}': {msg}");
+                eprintln!("snowdrive: invalid --cdrom spec '{spec}': {msg}");
                 return ExitCode::FAILURE;
             }
         };
@@ -179,7 +179,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         match spec {
             DiskSpec::Img { path, .. } | DiskSpec::Cdrom { path } => {
                 if !Path::new(path).is_file() {
-                    eprintln!("snowscsi: file not found: {path}");
+                    eprintln!("snowdrive: file not found: {path}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -190,13 +190,13 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         match spec {
             CdromSpec::Flat { path } => {
                 if !Path::new(path).is_file() {
-                    eprintln!("snowscsi: file not found: {path}");
+                    eprintln!("snowdrive: file not found: {path}");
                     return ExitCode::FAILURE;
                 }
             }
             CdromSpec::Live { dir } => {
                 if !Path::new(dir).is_dir() {
-                    eprintln!("snowscsi: directory not found: {dir}");
+                    eprintln!("snowdrive: directory not found: {dir}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -215,7 +215,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             let bytes = match usize::try_from(*size) {
                 Ok(n) => n,
                 Err(_) => {
-                    eprintln!("snowscsi: RAM size {size} too large for this platform");
+                    eprintln!("snowdrive: RAM size {size} too large for this platform");
                     return ExitCode::FAILURE;
                 }
             };
@@ -255,7 +255,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                         devices.push(Device::Block(dev));
                     }
                     Err(e) => {
-                        eprintln!("snowscsi: failed to open file block device {path}: {e}");
+                        eprintln!("snowdrive: failed to open file block device {path}: {e}");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -264,7 +264,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                 let dev = match CDBlockDevice::new(path) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("snowscsi: failed to open CD-ROM image {path}: {e}");
+                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
                         return ExitCode::FAILURE;
                     }
                 };
@@ -280,7 +280,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                 let backend = match FileBackend::open(path, false) {
                     Ok(b) => BlockBackend::File(b),
                     Err(e) => {
-                        eprintln!("snowscsi: failed to open CD-ROM image {path}: {e}");
+                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
                         return ExitCode::FAILURE;
                     }
                 };
@@ -306,7 +306,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                         devices.push(Device::CdLiveFs(dev));
                     }
                     Err(e) => {
-                        eprintln!("snowscsi: failed to scan live directory {dir}: {e}");
+                        eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -318,7 +318,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("snowscsi: failed to bind {addr}: {e}");
+            eprintln!("snowdrive: failed to bind {addr}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -336,7 +336,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
                 let _ = std::net::TcpStream::connect(addr);
             }
         }) {
-            eprintln!("snowscsi: failed to install signal handler: {e}");
+            eprintln!("snowdrive: failed to install signal handler: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -351,7 +351,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         &mut devices,
         Some(DEFAULT_READ_TIMEOUT),
     ) {
-        eprintln!("snowscsi: server error: {e}");
+        eprintln!("snowdrive: server error: {e}");
         return ExitCode::FAILURE;
     }
 
@@ -364,14 +364,14 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             Device::CdLiveFs(d) => d.sync().map_err(Into::into),
         };
         if let Err(e) = result {
-            eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+            eprintln!("snowdrive: sync failed for LUN {i}: {e}");
         }
     }
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
 
-/// `snowscsi mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
+/// `snowdrive mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
 /// standalone ISO9660/Joliet image to disk.
 ///
 /// Reuses the live-generation pipeline (`CdLiveFsDevice`: scan → layout →
@@ -383,15 +383,15 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
 
     let dir = Path::new(&args.dir);
     if !dir.is_dir() {
-        eprintln!("snowscsi: directory not found: {}", args.dir);
+        eprintln!("snowdrive: directory not found: {}", args.dir);
         return ExitCode::FAILURE;
     }
     if args.out.is_empty() {
-        eprintln!("snowscsi: empty output path");
+        eprintln!("snowdrive: empty output path");
         return ExitCode::FAILURE;
     }
     if Path::new(&args.out).is_dir() {
-        eprintln!("snowscsi: output path is a directory: {}", args.out);
+        eprintln!("snowdrive: output path is a directory: {}", args.out);
         return ExitCode::FAILURE;
     }
 
@@ -408,7 +408,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     let dev = match CdLiveFsDevice::new(fs, &label) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("snowscsi: failed to scan {}: {e}", args.dir);
+            eprintln!("snowdrive: failed to scan {}: {e}", args.dir);
             return ExitCode::FAILURE;
         }
     };
@@ -418,7 +418,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     let file = match File::create(&args.out) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("snowscsi: failed to create {}: {e}", args.out);
+            eprintln!("snowdrive: failed to create {}: {e}", args.out);
             return ExitCode::FAILURE;
         }
     };
@@ -429,16 +429,16 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
             .read_data(u64::from(lba) * u64::from(ISO_SECTOR_SIZE), &mut sector)
             .is_err()
         {
-            eprintln!("snowscsi: failed to read sector {lba}");
+            eprintln!("snowdrive: failed to read sector {lba}");
             return ExitCode::FAILURE;
         }
         if writer.write_all(&sector).is_err() {
-            eprintln!("snowscsi: failed to write {}", args.out);
+            eprintln!("snowdrive: failed to write {}", args.out);
             return ExitCode::FAILURE;
         }
     }
     if writer.flush().is_err() {
-        eprintln!("snowscsi: failed to flush {}", args.out);
+        eprintln!("snowdrive: failed to flush {}", args.out);
         return ExitCode::FAILURE;
     }
 
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn cli_accepts_multiple_disk_and_cdrom_specs() {
         let cli = Cli::try_parse_from([
-            "snowscsi",
+            "snowdrive",
             "serve",
             "--disk",
             "ram=1M",
@@ -962,13 +962,13 @@ mod tests {
     #[test]
     fn cli_rejects_legacy_flags() {
         // `--block` / `--cdblock` were removed in the dual-plane redesign.
-        assert!(Cli::try_parse_from(["snowscsi", "serve", "--block", "ram=1M"]).is_err());
-        assert!(Cli::try_parse_from(["snowscsi", "serve", "--cdblock", "x.iso"]).is_err());
+        assert!(Cli::try_parse_from(["snowdrive", "serve", "--block", "ram=1M"]).is_err());
+        assert!(Cli::try_parse_from(["snowdrive", "serve", "--cdblock", "x.iso"]).is_err());
     }
 
     #[test]
     fn cli_help_is_displayed() {
-        match Cli::try_parse_from(["snowscsi", "--help"]) {
+        match Cli::try_parse_from(["snowdrive", "--help"]) {
             Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {}
             other => panic!("expected DisplayHelp, got {other:?}"),
         }
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn cli_mkisofs_parses_positional_and_label() {
-        match Cli::try_parse_from(["snowscsi", "mkisofs", "tree", "out.iso", "--label", "DISC"])
+        match Cli::try_parse_from(["snowdrive", "mkisofs", "tree", "out.iso", "--label", "DISC"])
             .unwrap()
         {
             Cli::Mkisofs(a) => {
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn cli_mkisofs_label_optional() {
-        match Cli::try_parse_from(["snowscsi", "mkisofs", "tree", "out.iso"]).unwrap() {
+        match Cli::try_parse_from(["snowdrive", "mkisofs", "tree", "out.iso"]).unwrap() {
             Cli::Mkisofs(a) => assert_eq!(a.label, None),
             other => panic!("unexpected CLI: {other:?}"),
         }
@@ -998,18 +998,19 @@ mod tests {
 
     #[test]
     fn cli_mkisofs_requires_two_positionals() {
-        assert!(Cli::try_parse_from(["snowscsi", "mkisofs", "tree"]).is_err());
-        assert!(Cli::try_parse_from(["snowscsi", "mkisofs"]).is_err());
+        assert!(Cli::try_parse_from(["snowdrive", "mkisofs", "tree"]).is_err());
+        assert!(Cli::try_parse_from(["snowdrive", "mkisofs"]).is_err());
     }
 
     #[test]
     fn run_mkisofs_writes_whole_sectors() {
-        let dir = std::env::temp_dir().join(format!("snowscsi_mkisofs_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("snowdrive_mkisofs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
 
-        let out = std::env::temp_dir().join(format!("snowscsi_mkisofs_{}.iso", std::process::id()));
+        let out =
+            std::env::temp_dir().join(format!("snowdrive_mkisofs_{}.iso", std::process::id()));
         let _ = std::fs::remove_file(&out);
         let args = MkisofsArgs {
             dir: dir.to_string_lossy().to_string(),
@@ -1037,7 +1038,7 @@ mod tests {
     #[test]
     fn run_mkisofs_missing_dir_fails() {
         let args = MkisofsArgs {
-            dir: "/nonexistent/snowscsi-mkisofs".to_string(),
+            dir: "/nonexistent/snowdrive-mkisofs".to_string(),
             out: "/tmp/out.iso".to_string(),
             label: None,
             verbose: false,

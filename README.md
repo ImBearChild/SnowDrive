@@ -16,7 +16,7 @@ and exposes them to a host machine via iSCSI.
 | — storage seams | `snowdrive::common` | Zero-alloc `BlockStorage` / `FsStorage` + unified logging macros |
 | — SCSI + iSCSI | `snowdrive::scsi` / `::iscsi` | Block/CD-ROM devices (SBC/SPC/MMC), iSCSI PDU + target |
 | — ISO9660 | `snowdrive::iso9660` | ISO9660 + Joliet live-generation algorithms |
-| **CLI** | `bins/snowscsi` | `snowscsi serve` starts the iSCSI target; `snowscsi mkisofs` generates an ISO image from a directory |
+| **CLI** | `snowdrive` bin (`src/main.rs`) | `snowdrive serve` starts the iSCSI target; `snowdrive mkisofs` generates an ISO image from a directory |
 | **Tests** | `snowdrive-tests` | Mock + libiscsi whitebox integration tests |
 
 ## Build
@@ -36,32 +36,32 @@ cargo test --workspace
 ### Block device (virtual USB drive)
 
 ```bash
-snowscsi serve --block disk.img --iscsi 0.0.0.0:3260
+snowdrive serve --block disk.img --iscsi 0.0.0.0:3260
 ```
 
 ### Multi-LUN
 
 ```bash
-snowscsi serve --block disk.img --block ram=16M --iscsi 0.0.0.0:3260
+snowdrive serve --block disk.img --block ram=16M --iscsi 0.0.0.0:3260
 ```
 
 ### ISO image generation
 
 ```bash
-snowscsi mkisofs src_dir out.iso --label MYDISC
+snowdrive mkisofs src_dir out.iso --label MYDISC
 ```
 
 ### Connect from host
 
 ```bash
 # Linux (open-iscsi)
-iscsiadm -m node -T iqn.2025-01.local.snowscsi:target -p 127.0.0.1:3260 --login
+iscsiadm -m node -T iqn.2025-01.local.snowdrive:target -p 127.0.0.1:3260 --login
 ```
 
 ## Project Status
 
 - [x] Unified `snowdrive` lib crate: SCSI core + block/CD-ROM devices (SBC/SPC/MMC) + iSCSI target + ISO9660 algorithms
-- [x] `snowscsi serve` CLI: `--block` (ram/path,ro) + `--cdblock` + multi-LUN + graceful shutdown
+- [x] `snowdrive serve` CLI: `--block` (ram/path,ro) + `--cdblock` + multi-LUN + graceful shutdown
 - [ ] C ABI (`snowdrive::capi`, feature-gated) — postponed
 - [ ] Phase 3: Writable optical drive (CD-R) + disc bundle export
 - [ ] Phase 4: Rewritable optical drive (CD-RW)
@@ -72,14 +72,13 @@ iscsiadm -m node -T iqn.2025-01.local.snowscsi:target -p 127.0.0.1:3260 --login
 ```
 snowdrive/
 ├── Cargo.toml            # workspace: lib + bin + tests
-├── snowdrive/            # unified lib crate (feature-gated modules)
+├── snowdrive/            # unified lib crate + CLI (feature-gated modules)
 │   ├── src/
 │   │   ├── lib.rs        # common, scsi, iscsi, iso9660
+│   │   ├── main.rs       # CLI: serve (iSCSI target) + mkisofs (ISO generator)
 │   │   ├── common/       # storage seams + logging macros (always on)
 │   │   ├── scsi/         # SCSI core, block/cdblock/cdrom, spc/sbc, backends
 │   │   └── iscsi/        # PDU codec, Conn, target, transport
-├── bins/
-│   └── snowscsi/         # CLI: serve (iSCSI target) + mkisofs (ISO generator)
 ├── tests/                # integration tests (mock + libiscsi whitebox)
 ├── LICENSE-APACHE        # Apache-2.0
 └── LICENSE-MIT           # MIT

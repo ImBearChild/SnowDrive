@@ -6,29 +6,30 @@ SCSI device emulation toolkit — unified Rust lib crate + one binary.
 
 | Component | Location | Description |
 |-----------|----------|-------------|
-| **snowdrive** | `snowdrive/` | Unified lib crate (`no_std` + `std` feature) |
+| **snowdrive** | `snowdrive/` | Unified lib crate + CLI (`no_std` + `std` feature) |
 | — `common` | `snowdrive/src/common/` | Zero-alloc storage seams (`BlockStorage` / `FsStorage`) + unified logging macros |
 | — `scsi` | `snowdrive/src/scsi/` | SCSI core, block/CDBlock devices (SBC/SPC), file/fs backends |
 | — `cdrom` | `snowdrive/src/cdrom/` | CD-ROM device emulation — flat (`CdromDevice`) / live (`CdLiveFsDevice`), full MMC |
 | — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
-| **snowscsi** | `bins/snowscsi/` | Binary — `snowscsi serve` starts the iSCSI target; `snowscsi mkisofs` generates an ISO image from a directory |
+| **snowdrive bin** | `snowdrive/src/main.rs` | Binary — `snowdrive serve` starts the iSCSI target; `snowdrive mkisofs` generates an ISO image from a directory |
+| **snowdrive smoke** | `snowdrive/tests/smoke.rs` | Process-level CLI smoke tests (`CARGO_BIN_EXE_snowdrive`) |
 | **snowdrive-tests** | `tests/` | Integration tests crate (MockConn folded in + libiscsi whitebox) |
 
 ```
 snowdrive/
 ├── Cargo.toml            # workspace: lib + bin + tests
 ├── Cargo.lock
-├── snowdrive/            # unified lib crate (feature-gated modules)
+├── snowdrive/            # unified lib crate + CLI (feature-gated modules)
 │   ├── src/
 │   │   ├── lib.rs        # common, scsi, cdrom, iscsi, iso9660 (feature-gated)
+│   │   ├── main.rs       # CLI: serve (iSCSI target) + mkisofs (ISO generator)
 │   │   ├── common/       # BlockStorage / FsStorage seams + logging macros
 │   │   ├── scsi/         # SCSI core, block/cdblock devices, spc/sbc, backends
 │   │   ├── cdrom/        # CD-ROM device emulation (flat / live, full MMC)
 │   │   ├── iscsi/        # PDU codec, Conn, target, transport
 │   │   └── iso9660/      # ISO9660/Joliet live-generation algorithms
-├── bins/
-│   └── snowscsi/         # CLI: serve (iSCSI target) + mkisofs (ISO generator)
+│   ├── tests/smoke.rs    # process-level CLI smoke tests
 ├── tests/                # integration tests crate (mock + libiscsi whitebox)
 └── HACKING.md
 ```
@@ -36,15 +37,17 @@ snowdrive/
 Dependency chain:
 
 ```
-bins/snowscsi ──┬── snowdrive
-snowdrive-tests ┘
+snowdrive/src/main.rs ──┬── snowdrive (lib)
+snowdrive-tests         ┘
 ```
 
 Feature map (`snowdrive/Cargo.toml`): `std`, `scsi`, `iscsi` (→ `scsi`),
-`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `capi`,
-`log` / `defmt`. The lib's default is `["std", "scsi", "iscsi", "iso9660"]`;
-the `snowscsi` bin enables `cdrom` + `livefs` on top (the `--cdrom` option
-needs them; `--cdblock` needs only `scsi`).
+`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `cli`
+(→ `std`+all core features+std-only deps), `capi`, `log` / `defmt`. The
+lib's default is `["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs",
+"cli"]`; the `snowdrive` bin (`src/main.rs`) builds only with
+`required-features = ["cli"]`, so `--no-default-features` skips the CLI
+entirely and the lib stays `no_std`-clean.
 
 ## Commit Messages
 
@@ -116,7 +119,7 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov --workspace
 
 # Lib-only coverage (exclude the thin bin shell)
-cargo llvm-cov --workspace --ignore-filename-regex 'bins/'
+cargo llvm-cov --workspace --ignore-filename-regex 'snowdrive/src/main.rs'
 
 # HTML report (writes target/llvm-cov-html/)
 cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html

@@ -3,11 +3,11 @@ name = "snowdrive"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit (lib crate)"
+description = "SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit (lib + CLI)"
 
 [features]
-# Default: desktop PC environment — all commonly used features.
-default = ["std", "scsi", "iscsi", "iso9660"]
+# Default: desktop PC environment — all commonly used features + the CLI.
+default = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "cli"]
 
 # Platform feature.
 std = ["embedded-io/std"]
@@ -21,6 +21,10 @@ iscsi = ["scsi"]
 cdrom = ["scsi"]
 livefs = ["cdrom", "iso9660"]
 
+# CLI feature: the `snowdrive` binary + its std-only deps (clap etc.).
+cli = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "log",
+       "dep:clap", "dep:ctrlc", "dep:env_logger"]
+
 # Optional features.
 capi = ["std"]
 log = ["dep:log"]
@@ -31,3 +35,13 @@ embedded-io = "0.7"
 heapless = "0.8"
 log = { version = "0.4", optional = true, default-features = false }
 defmt = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[[bin]]
+# `src/main.rs` auto-discovers a bin named after the package (`snowdrive`);
+# `required-features` keeps the no_std build (`--no-default-features`) from
+# compiling the CLI at all.
+name = "snowdrive"
+required-features = ["cli"]

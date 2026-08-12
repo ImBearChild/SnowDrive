@@ -1,12 +1,12 @@
-//! Process-level smoke tests for the `snowscsi` CLI (`snowscsi_main.c`).
+//! Process-level smoke tests for the `snowdrive` CLI (`snowdrive_main.c`).
 
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args(args)
         .output()
-        .expect("run snowscsi")
+        .expect("run snowdrive")
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn serve_rejects_missing_file() {
     let out = run(&[
         "serve",
         "--disk",
-        "img=/nonexistent/snowscsi-missing.img",
+        "img=/nonexistent/snowdrive-missing.img",
         "--iscsi",
         "127.0.0.1:3260",
     ]);
@@ -93,13 +93,13 @@ fn serve_exits_cleanly_on_sigint() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args(["serve", "--disk", "ram=1M", "--iscsi", "127.0.0.1:0"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     // Wait until the server announces readiness on stderr (the log line is
     // emitted after the signal handler is installed).
@@ -125,7 +125,7 @@ fn serve_exits_cleanly_on_sigint() {
             .arg(child.id().to_string())
             .status();
         let _ = child.wait();
-        panic!("snowscsi did not announce 'listening'");
+        panic!("snowdrive did not announce 'listening'");
     }
 
     let sent = Command::new("kill")
@@ -136,8 +136,8 @@ fn serve_exits_cleanly_on_sigint() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 }
 
 /// The same file path on two `--disk` LUNs emits a dual-mount warning on
@@ -150,11 +150,11 @@ fn serve_warns_on_dual_mount() {
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let img = dir.join(format!("snowscsi_dual_{}.img", std::process::id()));
+    let img = dir.join(format!("snowdrive_dual_{}.img", std::process::id()));
     std::fs::write(&img, [0u8; 512]).unwrap();
     let path = img.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--disk",
@@ -168,7 +168,7 @@ fn serve_warns_on_dual_mount() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     // Collect dual-mount warnings until the server is ready (the warning is
     // emitted before bind, the "listening" line after the signal handler).
@@ -201,7 +201,7 @@ fn serve_warns_on_dual_mount() {
                 .arg(child.id().to_string())
                 .status();
             let _ = child.wait();
-            panic!("snowscsi did not announce 'listening'");
+            panic!("snowdrive did not announce 'listening'");
         });
     assert!(
         warnings.iter().any(|w| w.contains(&path)),
@@ -216,8 +216,8 @@ fn serve_warns_on_dual_mount() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&img);
 }
@@ -233,14 +233,14 @@ fn serve_starts_with_cdblock() {
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let iso = dir.join(format!("snowscsi_cdblock_{}.iso", std::process::id()));
+    let iso = dir.join(format!("snowdrive_cdblock_{}.iso", std::process::id()));
     // 2048 * 64 bytes = 64 sectors; sparse is fine (only capacity is read).
     let f = std::fs::File::create(&iso).unwrap();
     f.set_len(2048 * 64).unwrap();
     drop(f);
     let path = iso.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--disk",
@@ -252,7 +252,7 @@ fn serve_starts_with_cdblock() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     {
@@ -276,7 +276,7 @@ fn serve_starts_with_cdblock() {
             .arg(child.id().to_string())
             .status();
         let _ = child.wait();
-        panic!("snowscsi did not announce 'listening'");
+        panic!("snowdrive did not announce 'listening'");
     }
 
     let sent = Command::new("kill")
@@ -287,8 +287,8 @@ fn serve_starts_with_cdblock() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&iso);
 }
@@ -303,19 +303,19 @@ fn serve_starts_with_cdrom_flat() {
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let iso = dir.join(format!("snowscsi_cdrom_{}.iso", std::process::id()));
+    let iso = dir.join(format!("snowdrive_cdrom_{}.iso", std::process::id()));
     let f = std::fs::File::create(&iso).unwrap();
     f.set_len(2048 * 64).unwrap();
     drop(f);
     let path = iso.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args(["serve", "--cdrom", &path, "--iscsi", "127.0.0.1:0"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     {
@@ -339,7 +339,7 @@ fn serve_starts_with_cdrom_flat() {
             .arg(child.id().to_string())
             .status();
         let _ = child.wait();
-        panic!("snowscsi did not announce 'listening'");
+        panic!("snowdrive did not announce 'listening'");
     }
 
     let sent = Command::new("kill")
@@ -350,8 +350,8 @@ fn serve_starts_with_cdrom_flat() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&iso);
 }
@@ -365,13 +365,13 @@ fn serve_starts_with_cdrom_live() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dir = std::env::temp_dir().join(format!("snowscsi_live_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("snowdrive_live_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
     let path = dir.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--cdrom",
@@ -383,7 +383,7 @@ fn serve_starts_with_cdrom_live() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     {
@@ -407,7 +407,7 @@ fn serve_starts_with_cdrom_live() {
             .arg(child.id().to_string())
             .status();
         let _ = child.wait();
-        panic!("snowscsi did not announce 'listening'");
+        panic!("snowdrive did not announce 'listening'");
     }
 
     let sent = Command::new("kill")
@@ -418,8 +418,8 @@ fn serve_starts_with_cdrom_live() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -444,12 +444,12 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let img = dir.join(format!("snowscsi_dualcdrom_{}.iso", std::process::id()));
+    let img = dir.join(format!("snowdrive_dualcdrom_{}.iso", std::process::id()));
     // Not a valid ISO, but existence is all the CLI checks up front.
     std::fs::write(&img, [0u8; 2048]).unwrap();
     let path = img.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--disk",
@@ -463,7 +463,7 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     {
@@ -494,7 +494,7 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
                 .arg(child.id().to_string())
                 .status();
             let _ = child.wait();
-            panic!("snowscsi did not announce 'listening'");
+            panic!("snowdrive did not announce 'listening'");
         });
     assert!(
         warnings.iter().any(|w| w.contains(&path)),
@@ -509,8 +509,8 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&img);
 }
@@ -525,11 +525,11 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let img = dir.join(format!("snowscsi_dualcd_{}.img", std::process::id()));
+    let img = dir.join(format!("snowdrive_dualcd_{}.img", std::process::id()));
     std::fs::write(&img, [0u8; 512]).unwrap();
     let path = img.to_string_lossy().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--disk",
@@ -543,7 +543,7 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn snowscsi");
+        .expect("spawn snowdrive");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     {
@@ -574,7 +574,7 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
                 .arg(child.id().to_string())
                 .status();
             let _ = child.wait();
-            panic!("snowscsi did not announce 'listening'");
+            panic!("snowdrive did not announce 'listening'");
         });
     assert!(
         warnings.iter().any(|w| w.contains(&path)),
@@ -589,8 +589,8 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
         .unwrap_or(false);
     assert!(sent, "kill -INT failed");
 
-    let status = child.wait().expect("wait for snowscsi");
-    assert!(status.success(), "snowscsi should exit 0 after SIGINT");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&img);
 }

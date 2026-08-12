@@ -45,18 +45,18 @@ tracked by git.
 ```
 snowdrive/
 ├── Cargo.toml            # workspace: snowdrive lib + bin + tests
-├── snowdrive/            # unified lib crate (feature-gated modules)
+├── snowdrive/            # unified lib crate + CLI (feature-gated modules)
 │   ├── src/
 │   │   ├── lib.rs        # #![no_std] (unless std feature); deny(unsafe_code)
+│   │   ├── main.rs       # CLI: serve + mkisofs subcommands (std; required-features=["cli"])
 │   │   ├── common/       # always on: BlockStorage/FsStorage seams + logging macros
 │   │   ├── scsi/         # feature "scsi": SCSI core, block/cdblock, spc/sbc
 │   │   ├── cdrom/        # feature "cdrom": CD-ROM device emulation (flat/live, full MMC)
 │   │   ├── iscsi/        # feature "iscsi": PDU codec, Conn, target, transport
 │   │   └── iso9660/      # feature "iso9660": ISO9660/Joliet live-generation
+│   ├── tests/smoke.rs    # process-level CLI smoke tests (CARGO_BIN_EXE_snowdrive)
 │   ├── build.rs          # cbindgen (feature "capi")
 │   └── cbindgen.toml
-├── bins/
-│   └── snowscsi/         # binary: serve + mkisofs subcommands (std)
 ├── tests/                # integration tests crate (snowdrive-tests; MockConn folded in)
 └── ...
 ```
@@ -70,8 +70,8 @@ snowdrive/
 | `snowdrive::iscsi` | Done — PDU codec, Conn trait, Session state machine, BSD transport |
 | `snowdrive::iso9660` | Done — live ISO9660/Joliet generation algorithms (`live.rs`) |
 | `snowdrive::capi` | Postponed — C ABI (`feature = "capi"` declared, no exports yet) |
-| `bins/snowscsi` | Done — `serve` subcommand (--block / --cdblock / --iscsi) + `mkisofs` subcommand (directory → ISO image) |
-| `bins/snow9660` | Removed — folded into `snowscsi` as `mkisofs` (the lib generates ISOs, it does not parse them) |
+| `snowdrive` bin | Done — `src/main.rs` (lib + CLI in one crate); `serve` subcommand (--block / --cdblock / --iscsi) + `mkisofs` subcommand (directory → ISO image) |
+| `snow9660` | Removed — folded into the `snowdrive` CLI as `mkisofs` (the lib generates ISOs, it does not parse them) |
 
 ## Legacy C Code
 
@@ -92,7 +92,7 @@ git checkout legacy
   BSD transport (`TcpStream`) behind `std` feature in `snowdrive::iscsi`.
 - **C ABI**: postponed. When resumed, `snowdrive::capi` (`feature = "capi"`)
   wraps the borrow-based core with `OpaqueHandle` + C-style mirror API;
-  `cbindgen` generates `snowscsi.h` via build.rs.
+  `cbindgen` generates `snowdrive.h` via build.rs.
 - **Red lines**: `#![deny(unsafe_code)]` on the snowdrive lib (forbid would
   block the future `capi` module, which opts back in via `#[allow(unsafe_code)]`).
   `snowdrive-tests` allows unsafe (libiscsi FFI). RFC 3720 only, no RFC 7143.
