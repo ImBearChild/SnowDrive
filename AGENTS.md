@@ -44,7 +44,7 @@ tracked by git.
 
 ```
 snowdrive/
-├── Cargo.toml            # workspace: snowdrive lib + 2 bins + tests
+├── Cargo.toml            # workspace: snowdrive lib + bin + tests
 ├── snowdrive/            # unified lib crate (feature-gated modules)
 │   ├── src/
 │   │   ├── lib.rs        # #![no_std] (unless std feature); deny(unsafe_code)
@@ -56,8 +56,7 @@ snowdrive/
 │   ├── build.rs          # cbindgen (feature "capi")
 │   └── cbindgen.toml
 ├── bins/
-│   ├── snowscsi/         # binary: serve command (std)
-│   └── snow9660/         # binary: list command (stub)
+│   └── snowscsi/         # binary: serve + mkisofs subcommands (std)
 ├── tests/                # integration tests crate (snowdrive-tests; MockConn folded in)
 └── ...
 ```
@@ -71,8 +70,8 @@ snowdrive/
 | `snowdrive::iscsi` | Done — PDU codec, Conn trait, Session state machine, BSD transport |
 | `snowdrive::iso9660` | Done — live ISO9660/Joliet generation algorithms (`live.rs`) |
 | `snowdrive::capi` | Postponed — C ABI (`feature = "capi"` declared, no exports yet) |
-| `bins/snowscsi` | Done — `serve` subcommand (--block / --cdblock / --iscsi) |
-| `bins/snow9660` | Stub — `list` subcommand (help text only) |
+| `bins/snowscsi` | Done — `serve` subcommand (--block / --cdblock / --iscsi) + `mkisofs` subcommand (directory → ISO image) |
+| `bins/snow9660` | Removed — folded into `snowscsi` as `mkisofs` (the lib generates ISOs, it does not parse them) |
 
 ## Legacy C Code
 

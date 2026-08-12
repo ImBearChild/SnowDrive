@@ -3,6 +3,5 @@ resolver = "2"
 members = [
     "snowdrive",
     "bins/snowscsi",
-    "bins/snow9660",
     "tests",
 ]

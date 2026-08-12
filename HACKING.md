@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-SCSI device emulation toolkit — unified Rust lib crate + two binaries.
+SCSI device emulation toolkit — unified Rust lib crate + one binary.
 
 | Component | Location | Description |
 |-----------|----------|-------------|
@@ -12,13 +12,12 @@ SCSI device emulation toolkit — unified Rust lib crate + two binaries.
 | — `cdrom` | `snowdrive/src/cdrom/` | CD-ROM device emulation — flat (`CdromDevice`) / live (`CdLiveFsDevice`), full MMC |
 | — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
-| **snowscsi** | `bins/snowscsi/` | Binary — `snowscsi serve` starts iSCSI target |
-| **snow9660** | `bins/snow9660/` | Binary — `snow9660 list` prints ISO directory tree (stub) |
+| **snowscsi** | `bins/snowscsi/` | Binary — `snowscsi serve` starts the iSCSI target; `snowscsi mkisofs` generates an ISO image from a directory |
 | **snowdrive-tests** | `tests/` | Integration tests crate (MockConn folded in + libiscsi whitebox) |
 
 ```
 snowdrive/
-├── Cargo.toml            # workspace: lib + 2 bins + tests
+├── Cargo.toml            # workspace: lib + bin + tests
 ├── Cargo.lock
 ├── snowdrive/            # unified lib crate (feature-gated modules)
 │   ├── src/
@@ -29,8 +28,7 @@ snowdrive/
 │   │   ├── iscsi/        # PDU codec, Conn, target, transport
 │   │   └── iso9660/      # ISO9660/Joliet live-generation algorithms
 ├── bins/
-│   ├── snowscsi/         # iSCSI target CLI (binary)
-│   └── snow9660/         # ISO9660 CLI (binary, stub)
+│   └── snowscsi/         # CLI: serve (iSCSI target) + mkisofs (ISO generator)
 ├── tests/                # integration tests crate (mock + libiscsi whitebox)
 └── HACKING.md
 ```
@@ -38,8 +36,7 @@ snowdrive/
 Dependency chain:
 
 ```
-bins/snowscsi ──┐
-bins/snow9660 ──┤── snowdrive
+bins/snowscsi ──┬── snowdrive
 snowdrive-tests ┘
 ```
 

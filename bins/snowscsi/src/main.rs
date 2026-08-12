@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
-//! `snowscsi` CLI — starts the SnowDrive iSCSI target (`snowscsi_main.c`).
+//! `snowscsi` CLI — SnowDrive SCSI target and ISO9660 image tools
+//! (`snowscsi_main.c`).
 //!
 //! Subcommands:
 //! - `serve`: run the iSCSI target (serial accept loop)
+//! - `mkisofs`: generate an ISO9660/Joliet image from a host directory
+//!   (the live-generation algorithm, dumped sector-by-sector to a file)
 //!
 //! Device flags come in two planes (QEMU-style `[key=]value[,option...]`
 //! specs). `--disk` is the block plane; `--cdrom` is the CD plane.
@@ -23,6 +26,8 @@
 //! connection, `serve()` returns, and every backend is `sync()`ed before
 //! exit.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::ExitCode;
@@ -44,12 +49,20 @@ use snowdrive::MIN_DATA_LEN;
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
+/// CD-ROM logical sector size (Mode 1 data).
+const ISO_SECTOR_SIZE: u32 = 2048;
 
 #[derive(Debug, Parser)]
-#[command(name = "snowscsi", about = "SnowDrive iSCSI target", version)]
+#[command(
+    name = "snowscsi",
+    about = "SnowDrive SCSI target and ISO9660 tools",
+    version
+)]
 enum Cli {
     /// Start the iSCSI target server
     Serve(ServeArgs),
+    /// Generate an ISO9660/Joliet image from a directory
+    Mkisofs(MkisofsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -80,9 +93,28 @@ struct ServeArgs {
     work_buf_size: Option<String>,
 }
 
+/// Arguments for `snowscsi mkisofs`: build an ISO9660/Joliet image from a
+/// host directory (the live-generation algorithm dumped to a file).
+#[derive(Args, Debug)]
+struct MkisofsArgs {
+    /// Source directory to scan into the image.
+    #[arg(value_name = "DIR")]
+    dir: String,
+    /// Output ISO image file path.
+    #[arg(value_name = "OUT.iso")]
+    out: String,
+    /// Volume label (default: the source directory name, max 16 chars).
+    #[arg(long, value_name = "NAME")]
+    label: Option<String>,
+    /// Verbose logging (debug level).
+    #[arg(long, short)]
+    verbose: bool,
+}
+
 fn main() -> ExitCode {
     match Cli::parse() {
         Cli::Serve(args) => run_serve(args),
+        Cli::Mkisofs(args) => run_mkisofs(args),
     }
 }
 
@@ -339,6 +371,86 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `snowscsi mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
+/// standalone ISO9660/Joliet image to disk.
+///
+/// Reuses the live-generation pipeline (`CdLiveFsDevice`: scan → layout →
+/// sector synthesis) and dumps every sector through `read_data`, so the
+/// on-disk image is byte-identical to what `serve --cdrom live=<dir>`
+/// would expose. The image is padded to whole 2048-byte sectors.
+fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
+    init_logging(args.verbose);
+
+    let dir = Path::new(&args.dir);
+    if !dir.is_dir() {
+        eprintln!("snowscsi: directory not found: {}", args.dir);
+        return ExitCode::FAILURE;
+    }
+    if args.out.is_empty() {
+        eprintln!("snowscsi: empty output path");
+        return ExitCode::FAILURE;
+    }
+    if Path::new(&args.out).is_dir() {
+        eprintln!("snowscsi: output path is a directory: {}", args.out);
+        return ExitCode::FAILURE;
+    }
+
+    let label = match &args.label {
+        Some(l) => l.clone(),
+        None => dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("SNOWDRIVE")
+            .to_string(),
+    };
+
+    let fs = FsBackend::Std(StdFsBackend::new(&args.dir));
+    let dev = match CdLiveFsDevice::new(fs, &label) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("snowscsi: failed to scan {}: {e}", args.dir);
+            return ExitCode::FAILURE;
+        }
+    };
+    let total_sectors = dev.layout().total;
+    let mut dev = dev;
+
+    let file = match File::create(&args.out) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("snowscsi: failed to create {}: {e}", args.out);
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let mut sector = [0u8; ISO_SECTOR_SIZE as usize];
+    for lba in 0..total_sectors {
+        if dev
+            .read_data(u64::from(lba) * u64::from(ISO_SECTOR_SIZE), &mut sector)
+            .is_err()
+        {
+            eprintln!("snowscsi: failed to read sector {lba}");
+            return ExitCode::FAILURE;
+        }
+        if writer.write_all(&sector).is_err() {
+            eprintln!("snowscsi: failed to write {}", args.out);
+            return ExitCode::FAILURE;
+        }
+    }
+    if writer.flush().is_err() {
+        eprintln!("snowscsi: failed to flush {}", args.out);
+        return ExitCode::FAILURE;
+    }
+
+    log::info!(
+        "wrote {} sectors ({} bytes) to {}",
+        total_sectors,
+        u64::from(total_sectors) * u64::from(ISO_SECTOR_SIZE),
+        args.out
+    );
+    ExitCode::SUCCESS
+}
+
 /// Install the CLI log output: a plain `log` backend (env_logger) writing
 /// to stderr. `--verbose` selects the debug level; `RUST_LOG` overrides it.
 fn init_logging(verbose: bool) {
@@ -350,7 +462,9 @@ fn init_logging(verbose: bool) {
     let mut builder = env_logger::Builder::new();
     builder.filter_level(level);
     builder.parse_default_env();
-    builder.init();
+    // try_init: a logger may already be set when tests drive the handlers
+    // in-process (parallel test threads share the process logger).
+    let _ = builder.try_init();
 }
 
 /// A parsed `--disk` spec (block plane).
@@ -841,6 +955,7 @@ mod tests {
                 assert_eq!(a.work_buf_size.as_deref(), Some("256K"));
                 assert!(a.verbose);
             }
+            Cli::Mkisofs(_) => panic!("expected Serve, got Mkisofs"),
         }
     }
 
@@ -857,5 +972,76 @@ mod tests {
             Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {}
             other => panic!("expected DisplayHelp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_mkisofs_parses_positional_and_label() {
+        match Cli::try_parse_from(["snowscsi", "mkisofs", "tree", "out.iso", "--label", "DISC"])
+            .unwrap()
+        {
+            Cli::Mkisofs(a) => {
+                assert_eq!(a.dir, "tree");
+                assert_eq!(a.out, "out.iso");
+                assert_eq!(a.label.as_deref(), Some("DISC"));
+            }
+            other => panic!("unexpected CLI: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_mkisofs_label_optional() {
+        match Cli::try_parse_from(["snowscsi", "mkisofs", "tree", "out.iso"]).unwrap() {
+            Cli::Mkisofs(a) => assert_eq!(a.label, None),
+            other => panic!("unexpected CLI: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_mkisofs_requires_two_positionals() {
+        assert!(Cli::try_parse_from(["snowscsi", "mkisofs", "tree"]).is_err());
+        assert!(Cli::try_parse_from(["snowscsi", "mkisofs"]).is_err());
+    }
+
+    #[test]
+    fn run_mkisofs_writes_whole_sectors() {
+        let dir = std::env::temp_dir().join(format!("snowscsi_mkisofs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
+
+        let out = std::env::temp_dir().join(format!("snowscsi_mkisofs_{}.iso", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let args = MkisofsArgs {
+            dir: dir.to_string_lossy().to_string(),
+            out: out.to_string_lossy().to_string(),
+            label: Some("TEST".to_string()),
+            verbose: false,
+        };
+        assert_eq!(run_mkisofs(args), ExitCode::SUCCESS);
+
+        let meta = std::fs::metadata(&out).unwrap();
+        assert_eq!(meta.len() % u64::from(ISO_SECTOR_SIZE), 0);
+        assert!(meta.len() >= u64::from(ISO_SECTOR_SIZE) * 16);
+
+        let bytes = std::fs::read(&out).unwrap();
+        // PVD at sector 16: "CD001" at bytes 1..6 (ISO9660 signature).
+        assert_eq!(&bytes[16 * 2048 + 1..16 * 2048 + 6], b"CD001");
+
+        // The file data extent must carry the source content.
+        assert!(bytes.windows(4).any(|w| w == [0x42, 0x42, 0x42, 0x42]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn run_mkisofs_missing_dir_fails() {
+        let args = MkisofsArgs {
+            dir: "/nonexistent/snowscsi-mkisofs".to_string(),
+            out: "/tmp/out.iso".to_string(),
+            label: None,
+            verbose: false,
+        };
+        assert_eq!(run_mkisofs(args), ExitCode::FAILURE);
     }
 }

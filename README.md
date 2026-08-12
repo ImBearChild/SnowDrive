@@ -16,8 +16,7 @@ and exposes them to a host machine via iSCSI.
 | — storage seams | `snowdrive::common` | Zero-alloc `BlockStorage` / `FsStorage` + unified logging macros |
 | — SCSI + iSCSI | `snowdrive::scsi` / `::iscsi` | Block/CD-ROM devices (SBC/SPC/MMC), iSCSI PDU + target |
 | — ISO9660 | `snowdrive::iso9660` | ISO9660 + Joliet live-generation algorithms |
-| **CLI — serve** | `bins/snowscsi` | `snowscsi serve` starts iSCSI target |
-| **CLI — list** | `bins/snow9660` | `snow9660 list` prints ISO directory tree (stub) |
+| **CLI** | `bins/snowscsi` | `snowscsi serve` starts the iSCSI target; `snowscsi mkisofs` generates an ISO image from a directory |
 | **Tests** | `snowdrive-tests` | Mock + libiscsi whitebox integration tests |
 
 ## Build
@@ -46,10 +45,10 @@ snowscsi serve --block disk.img --iscsi 0.0.0.0:3260
 snowscsi serve --block disk.img --block ram=16M --iscsi 0.0.0.0:3260
 ```
 
-### ISO file tree listing
+### ISO image generation
 
 ```bash
-snow9660 list disc.iso
+snowscsi mkisofs src_dir out.iso --label MYDISC
 ```
 
 ### Connect from host
@@ -72,7 +71,7 @@ iscsiadm -m node -T iqn.2025-01.local.snowscsi:target -p 127.0.0.1:3260 --login
 
 ```
 snowdrive/
-├── Cargo.toml            # workspace: lib + 2 bins + tests
+├── Cargo.toml            # workspace: lib + bin + tests
 ├── snowdrive/            # unified lib crate (feature-gated modules)
 │   ├── src/
 │   │   ├── lib.rs        # common, scsi, iscsi, iso9660
@@ -80,8 +79,7 @@ snowdrive/
 │   │   ├── scsi/         # SCSI core, block/cdblock/cdrom, spc/sbc, backends
 │   │   └── iscsi/        # PDU codec, Conn, target, transport
 ├── bins/
-│   ├── snowscsi/         # iSCSI target CLI (binary)
-│   └── snow9660/         # ISO9660 CLI (binary, stub)
+│   └── snowscsi/         # CLI: serve (iSCSI target) + mkisofs (ISO generator)
 ├── tests/                # integration tests (mock + libiscsi whitebox)
 ├── LICENSE-APACHE        # Apache-2.0
 └── LICENSE-MIT           # MIT
