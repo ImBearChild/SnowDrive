@@ -27,7 +27,10 @@
 //! [`iso9660::live::MAX_PATH_LEN`] bytes. Both are public constants you
 //! can raise when wider names are required.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+// The no_std contract applies to production code (embedded consumers).
+// The test harness runs on the host, so the crate is allowed to use std
+// under `cfg(test)` — test modules keep full std access (Vec, format!, ...).
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]
 
 pub mod common;
