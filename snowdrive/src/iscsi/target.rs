@@ -25,6 +25,9 @@ use crate::scsi::scsi::{asc, opcode_name, Sense, SenseKey};
 const LOGIN_MAX: usize = 4096;
 /// Target Transfer Tag for R2T — single outstanding transfer (Phase 1).
 const TTT: u32 = 1;
+/// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
+/// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
+const HARD_CAP: usize = 0xFF_FFFF;
 /// RFC 3720 §12.14 suggested defaults (clamped when the initiator sends more).
 const DEFAULT_FIRST_BURST: u32 = 65536;
 const DEFAULT_MAX_BURST: u32 = 262144;
@@ -83,7 +86,7 @@ const LOGIN_TABLE: &[LoginParam] = &[
     },
     LoginParam {
         key: "MaxRecvDataSegmentLength",
-        value: Some("8192"),
+        value: None, // advertised dynamically (buffer-derived, §6.4.1)
         always: false,
     },
     LoginParam {
@@ -284,6 +287,13 @@ impl Session {
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
 
+        // §6.4.1: the receive data-segment capability scales with the
+        // caller's scratch buffer (data area = work minus BHS, 4-aligned,
+        // bounded by the 24-bit DataSegmentLength field). Negotiation then
+        // clamps the initiator's declared value to this cap.
+        self.max_recv_data_segment =
+            crate::scsi::device::data_capacity(work.len() - BHS_SIZE).min(HARD_CAP) as u32;
+
         // Negotiate: build the response text (updated `self.neg` alongside).
         let resp_len = if pdu.dsl <= LOGIN_MAX {
             let (head, tail) = work.split_at_mut(BHS_SIZE + pdu.dsl);
@@ -372,12 +382,20 @@ impl Session {
             if let Some(idx) = find_key(key) {
                 sent[idx] = true;
                 self.apply_neg(LOGIN_TABLE[idx].key, val);
-                let out_val: &[u8] = match LOGIN_TABLE[idx].value {
-                    Some(v) => v.as_bytes(),
-                    None => val,
-                };
-                if !append_kv(dst, &mut w, key, out_val) {
-                    break;
+                if key == b"MaxRecvDataSegmentLength" {
+                    // Advertise the negotiated (buffer-derived) value
+                    // (§6.4.1), not the raw initiator figure.
+                    if !append_kv_u32(dst, &mut w, key, self.max_recv_data_segment) {
+                        break;
+                    }
+                } else {
+                    let out_val: &[u8] = match LOGIN_TABLE[idx].value {
+                        Some(v) => v.as_bytes(),
+                        None => val,
+                    };
+                    if !append_kv(dst, &mut w, key, out_val) {
+                        break;
+                    }
                 }
             } else if !is_skip_key(key) && !append_kv(dst, &mut w, key, b"Reject") {
                 break;
@@ -404,7 +422,9 @@ impl Session {
         match key {
             "MaxRecvDataSegmentLength" => {
                 if let Some(v) = parse_u32(val) {
-                    self.max_recv_data_segment = v.min(MAX_DATA_SEGMENT);
+                    // Clamp the initiator's declaration to the target's
+                    // buffer-derived capability (§6.4.1).
+                    self.max_recv_data_segment = v.min(self.max_recv_data_segment);
                 }
             }
             "MaxBurstLength" => {
@@ -467,7 +487,7 @@ impl Session {
             let sense = Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
             return self.send_scsi_response(conn, work, itt, status::CHECK_CONDITION, Some(&sense));
         }
-        if pdu.dsl > MAX_DATA_SEGMENT as usize {
+        if pdu.dsl > self.max_recv_data_segment as usize {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
         }
         // RFC 3720 §10.3.1: W bit is byte 1 bit 2. Per the §2.3.3 "Byte Rule",
@@ -632,7 +652,7 @@ impl Session {
         transfer_len: u64,
         byte_offset: u64,
     ) -> StepResult {
-        let chunk_max = (self.max_recv_data_segment as usize).min(MAX_DATA_SEGMENT as usize);
+        let chunk_max = self.max_recv_data_segment as usize;
         let mut offset = 0u64;
         let mut data_sn = 0u32;
         loop {
@@ -748,7 +768,7 @@ impl Session {
                 if obhs.data_sn() != data_sn {
                     return self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs);
                 }
-                if pdu.dsl > MAX_DATA_SEGMENT as usize {
+                if pdu.dsl > self.max_recv_data_segment as usize {
                     return self.reject(conn, work, reject::PROTOCOL_ERROR, obhs);
                 }
                 if pdu.dsl as u64 > burst - burst_received {
@@ -1120,6 +1140,29 @@ fn append_kv(dst: &mut [u8], w: &mut usize, k: &[u8], v: &[u8]) -> bool {
     true
 }
 
+/// Append `key=<decimal u32>\0` to `dst` (no_std, no alloc).
+fn append_kv_u32(dst: &mut [u8], w: &mut usize, key: &[u8], v: u32) -> bool {
+    let mut buf = [0u8; 10];
+    let digits = fmt_u32(v, &mut buf);
+    append_kv(dst, w, key, digits)
+}
+
+/// Write the decimal ASCII representation of `v` into `buf` and return the
+/// filled slice (no trailing NUL).
+fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
+    let mut n = v;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    &buf[i..]
+}
+
 fn parse_u32(v: &[u8]) -> Option<u32> {
     if v.is_empty() {
         return None;
@@ -1221,6 +1264,40 @@ mod tests {
         /* always keys appended even though the initiator didn't send them */
         assert_eq!(value(&resp, "TargetAlias"), Some(b"SnowSCSI".as_slice()));
         assert_eq!(value(&resp, "TargetPortalGroupTag"), Some(b"1".as_slice()));
+    }
+
+    #[test]
+    fn negotiate_advertises_buffer_derived_max_recv() {
+        // Simulate `handle_login` deriving a 256K-buffer cap (data area =
+        // 256K - BHS, 4-aligned), then negotiating against an initiator that
+        // declares a larger segment (§6.4.1). The response must advertise
+        // the clamped, buffer-derived value, not the raw initiator figure.
+        let mut s = Session::default();
+        s.max_recv_data_segment =
+            crate::scsi::device::data_capacity(256 * 1024 - BHS_SIZE).min(HARD_CAP) as u32;
+        let text = req_text(&[("MaxRecvDataSegmentLength", "1048576")]);
+        let resp = negotiate_text(&mut s, &text);
+        assert_eq!(
+            value(&resp, "MaxRecvDataSegmentLength"),
+            Some(b"262096".as_slice())
+        );
+        assert_eq!(s.max_recv_data_segment, 262096);
+    }
+
+    #[test]
+    fn negotiate_advertises_own_cap_when_initiator_declares_less() {
+        // An initiator declaring a smaller receive segment than the target's
+        // buffer can hold wins: the negotiated value is the minimum.
+        let mut s = Session::default();
+        s.max_recv_data_segment =
+            crate::scsi::device::data_capacity(256 * 1024 - BHS_SIZE).min(HARD_CAP) as u32;
+        let text = req_text(&[("MaxRecvDataSegmentLength", "4096")]);
+        let resp = negotiate_text(&mut s, &text);
+        assert_eq!(
+            value(&resp, "MaxRecvDataSegmentLength"),
+            Some(b"4096".as_slice())
+        );
+        assert_eq!(s.max_recv_data_segment, 4096);
     }
 
     #[test]

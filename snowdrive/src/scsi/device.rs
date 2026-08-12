@@ -77,6 +77,19 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// Data-area capacity of a transport scratch buffer, rounded down to a
+/// 4-byte multiple.
+///
+/// Each transport derives its usable data region from its own framing:
+/// - iSCSI: `data_capacity(work.len() - BHS_SIZE)` — the PDU data segment
+///   must keep `48 + dsl` 4-byte aligned so padding stays zero and
+///   `send_pdu`'s `total + pad <= work.len()` invariant holds.
+/// - USB MSC: the whole buffer is the data area (`data_capacity(work.len())`),
+///   the alignment is a harmless chunk-granularity nicety.
+pub fn data_capacity(work_len: usize) -> usize {
+    work_len & !3
+}
+
 /// The SCSI device seam: the minimal command set the iSCSI target needs from
 /// any device. The target is generic over `D: ScsiDevice`, so it can serve a
 /// homogeneous `&mut [BlockDevice<B>]` or a heterogeneous `&mut [Device<'_>]`
@@ -204,6 +217,15 @@ mod tests {
     use crate::scsi::scsi::op;
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
+    }
+
+    #[test]
+    fn data_capacity_aligns_down_to_4_bytes() {
+        assert_eq!(data_capacity(8192), 8192);
+        assert_eq!(data_capacity(8190), 8188);
+        assert_eq!(data_capacity(8240), 8240);
+        assert_eq!(data_capacity(262144 - 48), 262096);
+        assert_eq!(data_capacity(0), 0);
     }
 
     fn inquiry_pdt(dev: &mut Device<'_>, w: &mut [u8]) -> u8 {
