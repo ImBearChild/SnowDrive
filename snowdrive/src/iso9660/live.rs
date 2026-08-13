@@ -8,21 +8,27 @@
 //!
 //! # ISO 9660 Layout
 //!
+//! The image carries **two directory trees** (ECMA-119 §6.8.1 / Joliet):
+//! the PVD tree uses ISO-9660 Level 1 identifiers (8.3 uppercase, with the
+//! `;1` file version), the SVD (Joliet) tree uses UCS-2BE names. Each tree
+//! has its own Path Table and directory extents; both reference the same
+//! file-data extents.
+//!
 //! ```text
 //! LBA 0-15        System Area (zeros)
 //! LBA 16          PVD (Primary Volume Descriptor)
 //! LBA 17          SVD (Supplementary Volume Descriptor, Joliet UCS-2BE)
 //! LBA 18          Volume Descriptor Set Terminator
-//! LBA 19..        Path Table L, then Path Table M (one sector each +
-//!                 spillover), sized by the number of directories
-//! then            Root directory, sub-directories (breadth-first,
-//!                 ECMA-119 §6.9.1 order)
+//! LBA 19..        PVD Path Table L, then PVD Path Table M
+//! then            PVD root directory, sub-directories (8.3 identifiers)
+//! then            Joliet Path Table L, then Joliet Path Table M
+//! then            Joliet root directory, sub-directories (UCS-2BE names)
 //! then            File data (padded to 2048-byte sectors)
 //! ```
 //!
 //! Every sub-directory becomes its own extent with ".", "..", child
-//! directory and file records; the Path Table holds one record per
-//! directory (both-endian numeric fields per table type).
+//! directory and file records; each Path Table holds one record per
+//! directory of its tree (both-endian numeric fields per table type).
 //!
 //! # Name limits
 //!
@@ -118,14 +124,15 @@ pub struct FileEntry {
 
 // ── Output types ────────────────────────────────────────────────────
 
-/// A directory in the ISO9660 tree (one Path Table record).
+/// A directory in one of the two ISO9660 trees (one Path Table record).
 #[derive(Debug, Clone)]
 pub struct DirNode {
     /// Path table number (1-based; root = 1).
     pub number: u16,
     /// Parent directory's path table number (root's parent = itself, 1).
     pub parent: u16,
-    /// Joliet UCS-2BE directory identifier ("" for root).
+    /// Identifier bytes for this tree (ISO-9660 8.3 ASCII for the PVD
+    /// tree, Joliet UCS-2BE for the SVD tree; "" for root).
     pub name: Vec<u8, MAX_JOLIET_NAME_BYTES>,
     /// LBA of this directory's extent.
     pub lba: u32,
@@ -144,17 +151,20 @@ pub struct FileExtent {
     pub sectors: u32,
     /// File size in bytes (may be less than `sectors * SECTOR_SIZE`).
     pub size: u64,
-    /// Joliet UCS-2BE encoded file name (without version ";1").
+    /// PVD-tree identifier: ISO-9660 8.3 ASCII name **with** the ";1"
+    /// file version (e.g. `README.TXT;1`), as recorded in the PVD tree.
+    pub pvd_name: Vec<u8, MAX_JOLIET_NAME_BYTES>,
+    /// PVD-tree parent directory's path table number.
+    pub pvd_parent: u16,
+    /// Joliet-tree identifier: UCS-2BE encoded file name (without ";1").
     pub name: Vec<u8, MAX_JOLIET_NAME_BYTES>,
-    /// Parent directory's path table number.
+    /// Joliet-tree parent directory's path table number.
     pub parent: u16,
 }
 
-/// Complete LBA layout for a live ISO9660 image.
+/// One directory tree: its Path Table metadata and directory records.
 #[derive(Debug)]
-pub struct Layout {
-    /// Volume label (ASCII, up to 16 chars).
-    pub label: String<MAX_LABEL_LEN>,
+pub struct DirTree {
     /// LBA of the Type L path table.
     pub path_table_lba: u32,
     /// Sectors occupied by each path table (L and M have the same size).
@@ -167,6 +177,17 @@ pub struct Layout {
     pub root_dir_sectors: u32,
     /// Directories in path-table order (root first, breadth-first).
     pub dirs: Vec<DirNode, MAX_DIRS>,
+}
+
+/// Complete LBA layout for a live ISO9660 image.
+#[derive(Debug)]
+pub struct Layout {
+    /// Volume label (ASCII, up to 16 chars).
+    pub label: String<MAX_LABEL_LEN>,
+    /// PVD directory tree (ISO-9660 8.3 identifiers).
+    pub pvd: DirTree,
+    /// SVD / Joliet directory tree (UCS-2BE identifiers).
+    pub joliet: DirTree,
     /// File extents (one per non-directory FileEntry).
     pub extents: Vec<FileExtent, MAX_FILES>,
     /// LBA where the file data area begins (after all directories).
@@ -178,13 +199,82 @@ pub struct Layout {
 // ── Public API ──────────────────────────────────────────────────────
 
 /// Internal directory node during layout construction.
+#[derive(Debug)]
 struct DirReg {
     /// Registry index of the parent directory (0 = root's self reference).
     parent: u16,
+    /// ISO-9660 Level 1 (8.3) identifier, ASCII ("" for root).
+    pvd_name: Vec<u8, MAX_JOLIET_NAME_BYTES>,
     /// Joliet UCS-2BE identifier ("" for root).
     name: Vec<u8, MAX_JOLIET_NAME_BYTES>,
     /// Depth in the tree (root = 0).
     depth: u16,
+}
+
+/// ISO-9660 Level 1 allowed char → byte: `A-Z 0-9 _` kept (uppercased),
+/// everything else mapped to `_` (ECMA-119 §7.4.3.1 d-characters).
+fn map_pvd_char(ch: char) -> u8 {
+    if ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' {
+        ch as u8
+    } else if ch.is_ascii_lowercase() {
+        ch.to_ascii_uppercase() as u8
+    } else {
+        b'_'
+    }
+}
+
+/// Split an 8.3 identifier into `(base, ext, has_dot)` per ECMA-119 Level 1:
+/// base ≤ 8 bytes, extension ≤ 3 bytes (from the last '.'). Dots inside the
+/// base map to `_` (so "multi.dot.name" → "MULTI_DO.NAM").
+fn pvd_83_parts(name: &str) -> (Vec<u8, 8>, Vec<u8, 3>, bool) {
+    let (base, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], Some(&name[i + 1..])),
+        None => (name, None),
+    };
+    let mut b = Vec::new();
+    for ch in base.chars() {
+        if b.len() >= 8 {
+            break;
+        }
+        let _ = b.push(map_pvd_char(ch));
+    }
+    let mut e = Vec::new();
+    let mut has_dot = false;
+    if let Some(ext) = ext {
+        has_dot = true;
+        for ch in ext.chars() {
+            if e.len() >= 3 {
+                break;
+            }
+            let _ = e.push(map_pvd_char(ch));
+        }
+    }
+    (b, e, has_dot)
+}
+
+/// ISO-9660 Level 1 file identifier with the `;1` version: `BASE.EXT;1`.
+/// Files without an extension still carry the separator (`NOEXT.;1`, the
+/// genisoimage convention), so the '.' is always present.
+fn to_pvd_file_name(name: &str) -> Vec<u8, MAX_JOLIET_NAME_BYTES> {
+    let (base, ext, _) = pvd_83_parts(name);
+    let mut out = Vec::new();
+    let _ = out.extend_from_slice(&base);
+    let _ = out.push(b'.');
+    let _ = out.extend_from_slice(&ext);
+    let _ = out.extend_from_slice(b";1");
+    out
+}
+
+/// ISO-9660 Level 1 directory identifier: `BASE` or `BASE.EXT` (no version).
+fn to_pvd_dir_name(name: &str) -> Vec<u8, MAX_JOLIET_NAME_BYTES> {
+    let (base, ext, has_dot) = pvd_83_parts(name);
+    let mut out = Vec::new();
+    let _ = out.extend_from_slice(&base);
+    if has_dot {
+        let _ = out.push(b'.');
+        let _ = out.extend_from_slice(&ext);
+    }
+    out
 }
 
 /// Number of path components in a relative path ("" → 0, "A/B" → 2).
@@ -197,11 +287,15 @@ fn last_component(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or("")
 }
 
-/// Length of a directory record for a name of `name_len` bytes
-/// (33 + identifier + pad-to-even, ECMA-119 §9.1.1).
+/// Length of a directory record for a name of `name_len` bytes.
+///
+/// 33-byte header + identifier; a (00) padding byte is added **only when
+/// the identifier length is even** so the record length stays even
+/// (ECMA-119 §9.1.12: "present only if the number in the Length of the
+/// File Identifier field is an even number").
 fn record_len(name_len: usize) -> u64 {
     let l = name_len as u64;
-    33 + l + (l % 2)
+    33 + l + if l.is_multiple_of(2) { 1 } else { 0 }
 }
 
 /// Compute the LBA layout for a set of files.
@@ -210,6 +304,138 @@ fn record_len(name_len: usize) -> u64 {
 /// children, children before the next sibling.  The label is truncated to
 /// 16 ASCII characters.  The directory hierarchy is preserved: every
 /// sub-directory gets its own extent and a Path Table record.
+/// Path table order (ECMA-119 §6.9.1): ascending level, then parent
+/// directory number, then identifier.  `use_pvd` selects the PVD 8.3
+/// identifiers vs the Joliet UCS-2BE ones (each tree sorts independently).
+/// Returns `(order, number_of)` — `order` is registry indices in path
+/// table order, `number_of` maps registry index → path table number.
+fn tree_order(
+    regs: &[DirReg],
+    use_pvd: bool,
+) -> Result<(Vec<u16, MAX_DIRS>, [u16; MAX_DIRS]), IsoError> {
+    let max_depth = regs.iter().map(|r| r.depth).max().unwrap_or(0);
+    let mut order = Vec::<u16, MAX_DIRS>::new(); // registry indices
+    let mut number_of = [0u16; MAX_DIRS]; // registry index → path table number
+    for level in 0..=max_depth {
+        let mut level_regs = Vec::<u16, MAX_DIRS>::new();
+        for (i, r) in regs.iter().enumerate() {
+            if r.depth == level {
+                level_regs
+                    .push(i as u16)
+                    .map_err(|_| IsoError::TooManyFiles)?;
+            }
+        }
+        // Insertion sort by (parent number, identifier).
+        for i in 1..level_regs.len() {
+            let mut j = i;
+            while j > 0 {
+                let a = level_regs[j - 1] as usize;
+                let b = level_regs[j] as usize;
+                let pa = number_of[regs[a].parent as usize];
+                let pb = number_of[regs[b].parent as usize];
+                let cmp = match pa.cmp(&pb) {
+                    Ordering::Equal => {
+                        let (na, nb) = if use_pvd {
+                            (regs[a].pvd_name.as_slice(), regs[b].pvd_name.as_slice())
+                        } else {
+                            (regs[a].name.as_slice(), regs[b].name.as_slice())
+                        };
+                        na.cmp(nb)
+                    }
+                    other => other,
+                };
+                if cmp == Ordering::Greater {
+                    level_regs.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        for &r in &level_regs {
+            number_of[r as usize] = order.len() as u16 + 1;
+            order.push(r).map_err(|_| IsoError::TooManyFiles)?;
+        }
+    }
+    Ok((order, number_of))
+}
+
+/// PVD 8.3 collision disambiguation within one parent directory.
+///
+/// ISO-9660 identifiers are case-insensitive 8.3, so two host names like
+/// `readme.txt` / `README.TXT` map to the same `README.TXT;1`.  Keep the
+/// first natural name; for each later duplicate, truncate the base to 5
+/// chars and append a 3-digit counter (genisoimage's `READM000` scheme).
+fn disambiguate_pvd_83(regs: &mut [DirReg], extents: &mut [FileExtent], ext_parent_reg: &[u16]) {
+    // Indexed iteration because children are looked up by parent index and
+    // mutated in place.
+    #[allow(clippy::needless_range_loop)]
+    for p in 0..regs.len() {
+        // Used identifiers among this parent's children (dirs + files
+        // share the namespace of the containing directory record set).
+        let mut used: Vec<Vec<u8, MAX_JOLIET_NAME_BYTES>, MAX_FILES> = Vec::new();
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..regs.len() {
+            if i != p && regs[i].parent == p as u16 {
+                let name = regs[i].pvd_name.clone();
+                let unique = unique_83(name.as_slice(), &mut used);
+                regs[i].pvd_name = unique;
+            }
+        }
+        for (i, &pp) in ext_parent_reg.iter().enumerate() {
+            if pp == p as u16 {
+                extents[i].pvd_name = unique_83(extents[i].pvd_name.as_slice(), &mut used);
+            }
+        }
+    }
+}
+
+/// Unique 8.3 identifier within `used`; mangle duplicates with a truncated
+/// base + 3-digit counter (genisoimage style).
+fn unique_83(
+    name: &[u8],
+    used: &mut Vec<Vec<u8, MAX_JOLIET_NAME_BYTES>, MAX_FILES>,
+) -> Vec<u8, MAX_JOLIET_NAME_BYTES> {
+    let own = Vec::from_slice(name).unwrap_or_default();
+    if !used.iter().any(|u| u.as_slice() == name) {
+        let _ = used.push(own.clone());
+        return own;
+    }
+    // Split at the last '.': `BASE[.EXT;1]` → base + (".EXT;1" | ".;1" | "").
+    let dot = name.iter().rposition(|&b| b == b'.');
+    let (base, suffix) = match dot {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, &[][..]),
+    };
+    let keep = base.len().min(5);
+    for counter in 0..1000u16 {
+        let d0 = b'0' + (counter / 100) as u8;
+        let d1 = b'0' + ((counter / 10) % 10) as u8;
+        let d2 = b'0' + (counter % 10) as u8;
+        let mut cand = Vec::new();
+        let _ = cand.extend_from_slice(&base[..keep]);
+        let _ = cand.push(d0);
+        let _ = cand.push(d1);
+        let _ = cand.push(d2);
+        let _ = cand.extend_from_slice(suffix);
+        if !used.iter().any(|u| u.as_slice() == cand.as_slice()) {
+            let _ = used.push(cand.clone());
+            return cand;
+        }
+    }
+    // Unreachable for MAX_FILES ≤ 128 children; keep the raw name.
+    own
+}
+
+/// Compute the LBA layout for a set of files.
+///
+/// Files must be provided in DFS pre-order: a directory entry before its
+/// children, children before the next sibling.  The label is truncated to
+/// 16 ASCII characters.  The directory hierarchy is preserved: every
+/// sub-directory gets its own extent and a Path Table record.  Two
+/// independent directory trees are produced (PVD 8.3 + Joliet UCS-2BE),
+/// each with its own Path Table and directory extents; both share the
+/// file-data extents.
 pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoError> {
     if files.len() > MAX_FILES {
         return Err(IsoError::TooManyFiles);
@@ -233,6 +459,7 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
     let mut regs = Vec::<DirReg, MAX_DIRS>::new();
     regs.push(DirReg {
         parent: 0,
+        pvd_name: Vec::new(),
         name: Vec::new(),
         depth: 0,
     })
@@ -252,29 +479,31 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
             stack.pop();
         }
         let parent_reg = *stack.last().unwrap();
+        let component = last_component(entry.path.as_str());
 
         if entry.is_dir {
             if regs.len() >= MAX_DIRS {
                 return Err(IsoError::TooManyFiles);
             }
             let n = regs.len() as u16;
-            let name = to_joliet_name(last_component(entry.path.as_str()));
             regs.push(DirReg {
                 parent: parent_reg,
-                name,
+                pvd_name: to_pvd_dir_name(component),
+                name: to_joliet_name(component),
                 depth: depth as u16,
             })
             .map_err(|_| IsoError::TooManyFiles)?;
             stack.push(n).map_err(|_| IsoError::TooManyFiles)?;
         } else {
-            let name = to_joliet_name(last_component(entry.path.as_str()));
             extents
                 .push(FileExtent {
                     file_index: idx,
                     lba: 0, // assigned below
                     sectors: entry.size.div_ceil(u64::from(SECTOR_SIZE)) as u32,
                     size: entry.size,
-                    name,
+                    pvd_name: to_pvd_file_name(component),
+                    pvd_parent: 0, // resolved below
+                    name: to_joliet_name(component),
                     parent: 0, // resolved below
                 })
                 .map_err(|_| IsoError::TooManyFiles)?;
@@ -284,134 +513,150 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
         }
     }
 
-    // ── 2. Path table order (ECMA-119 §6.9.1) ────────────────────────
-    // Ascending level, then parent directory number, then identifier.
-    let max_depth = regs.iter().map(|r| r.depth).max().unwrap_or(0);
-    let mut order = Vec::<u16, MAX_DIRS>::new(); // registry indices
-    let mut number_of = [0u16; MAX_DIRS]; // registry index → path table number
-    for level in 0..=max_depth {
-        let mut level_regs = Vec::<u16, MAX_DIRS>::new();
-        for (i, r) in regs.iter().enumerate() {
-            if r.depth == level {
-                level_regs
-                    .push(i as u16)
-                    .map_err(|_| IsoError::TooManyFiles)?;
-            }
-        }
-        // Insertion sort by (parent number, identifier).
-        for i in 1..level_regs.len() {
-            let mut j = i;
-            while j > 0 {
-                let a = level_regs[j - 1] as usize;
-                let b = level_regs[j] as usize;
-                let pa = number_of[regs[a].parent as usize];
-                let pb = number_of[regs[b].parent as usize];
-                let cmp = match pa.cmp(&pb) {
-                    Ordering::Equal => regs[a].name.cmp(&regs[b].name),
-                    other => other,
-                };
-                if cmp == Ordering::Greater {
-                    level_regs.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        for &r in &level_regs {
-            number_of[r as usize] = order.len() as u16 + 1;
-            order.push(r).map_err(|_| IsoError::TooManyFiles)?;
-        }
-    }
+    // PVD 8.3 collisions within a parent must be disambiguated before
+    // ordering (the identifiers drive the sort).
+    disambiguate_pvd_83(&mut regs, &mut extents, &ext_parent_reg);
 
-    // ── 3. Path table size and fixed metadata LBAs ───────────────────
+    // ── 2. Independent orderings for the two trees ────────────────────
+    let (pvd_order, pvd_number_of) = tree_order(&regs, true)?;
+    let (jol_order, jol_number_of) = tree_order(&regs, false)?;
+
+    // ── 3. Path table sizes ───────────────────────────────────────────
     // Each record: 8 + identifier + pad-to-even (root identifier = 1 byte).
-    let mut pt_size: u64 = 0;
-    for &r in &order {
-        let name_len = if r == 0 {
-            1
-        } else {
-            regs[r as usize].name.len() as u64
-        };
-        pt_size += 8 + name_len + (name_len % 2);
-    }
-    let path_table_lba = SYSTEM_AREA_SECTORS + 3; // 19
-    let path_table_sectors = pt_size.div_ceil(u64::from(SECTOR_SIZE)) as u32;
-    let path_table_m_lba = path_table_lba + path_table_sectors;
+    let pt_size = |order: &[u16], use_pvd: bool| -> u64 {
+        let mut s: u64 = 0;
+        for &r in order {
+            let name_len = if r == 0 {
+                1
+            } else if use_pvd {
+                regs[r as usize].pvd_name.len() as u64
+            } else {
+                regs[r as usize].name.len() as u64
+            };
+            s += 8 + name_len + (name_len % 2);
+        }
+        s
+    };
+    let pvd_pt_size = pt_size(&pvd_order, true);
+    let jol_pt_size = pt_size(&jol_order, false);
 
-    // ── 4. Size each directory, assign directory LBAs ────────────────
-    let mut next_lba = path_table_m_lba + path_table_sectors;
-    let mut dir_lbas = Vec::<u32, MAX_DIRS>::new();
-    let mut dir_sectors = Vec::<u32, MAX_DIRS>::new();
-    for (oi, &r) in order.iter().enumerate() {
+    // ── 4. Directory extents per tree, then file LBAs ─────────────────
+    // Layout: PVD path tables, PVD directories, Joliet path tables,
+    // Joliet directories, file data.
+    let pvd_pt_lba = SYSTEM_AREA_SECTORS + 3; // 19
+    let pvd_pt_sectors = pvd_pt_size.div_ceil(u64::from(SECTOR_SIZE)) as u32;
+    let mut next_lba = pvd_pt_lba + pvd_pt_sectors * 2;
+
+    let mut pvd_dirs = Vec::<DirNode, MAX_DIRS>::new();
+    for (oi, &r) in pvd_order.iter().enumerate() {
         let num = oi as u16 + 1;
         let mut bytes: u64 = 70; // "." and ".."
-        for &c in &order {
+        for &c in &pvd_order {
             if c == r {
                 continue;
             }
-            if number_of[regs[c as usize].parent as usize] == num {
-                bytes += record_len(regs[c as usize].name.len());
+            if pvd_number_of[regs[c as usize].parent as usize] == num {
+                bytes += record_len(regs[c as usize].pvd_name.len());
             }
         }
         for (i, ext) in extents.iter().enumerate() {
-            if number_of[ext_parent_reg[i] as usize] == num {
-                bytes += record_len(ext.name.len());
+            if pvd_number_of[ext_parent_reg[i] as usize] == num {
+                bytes += record_len(ext.pvd_name.len());
             }
         }
         let sectors = bytes.div_ceil(u64::from(SECTOR_SIZE)) as u32;
-        dir_lbas
-            .push(next_lba)
-            .map_err(|_| IsoError::TooManyFiles)?;
-        dir_sectors
-            .push(sectors)
+        let is_root = r == 0;
+        pvd_dirs
+            .push(DirNode {
+                number: num,
+                parent: if is_root {
+                    1
+                } else {
+                    pvd_number_of[regs[r as usize].parent as usize]
+                },
+                name: if is_root {
+                    Vec::new()
+                } else {
+                    regs[r as usize].pvd_name.clone()
+                },
+                lba: next_lba,
+                sectors,
+            })
             .map_err(|_| IsoError::TooManyFiles)?;
         next_lba += sectors;
     }
 
-    // ── 5. File LBAs ─────────────────────────────────────────────────
+    let jol_pt_lba = next_lba;
+    let jol_pt_sectors = jol_pt_size.div_ceil(u64::from(SECTOR_SIZE)) as u32;
+    next_lba += jol_pt_sectors * 2;
+
+    let mut jol_dirs = Vec::<DirNode, MAX_DIRS>::new();
+    for (oi, &r) in jol_order.iter().enumerate() {
+        let num = oi as u16 + 1;
+        let mut bytes: u64 = 70; // "." and ".."
+        for &c in &jol_order {
+            if c == r {
+                continue;
+            }
+            if jol_number_of[regs[c as usize].parent as usize] == num {
+                bytes += record_len(regs[c as usize].name.len());
+            }
+        }
+        for (i, ext) in extents.iter().enumerate() {
+            if jol_number_of[ext_parent_reg[i] as usize] == num {
+                bytes += record_len(ext.name.len());
+            }
+        }
+        let sectors = bytes.div_ceil(u64::from(SECTOR_SIZE)) as u32;
+        let is_root = r == 0;
+        jol_dirs
+            .push(DirNode {
+                number: num,
+                parent: if is_root {
+                    1
+                } else {
+                    jol_number_of[regs[r as usize].parent as usize]
+                },
+                name: if is_root {
+                    Vec::new()
+                } else {
+                    regs[r as usize].name.clone()
+                },
+                lba: next_lba,
+                sectors,
+            })
+            .map_err(|_| IsoError::TooManyFiles)?;
+        next_lba += sectors;
+    }
+
+    // ── 5. File LBAs (shared by both trees) ──────────────────────────
     for (i, ext) in extents.iter_mut().enumerate() {
         ext.lba = next_lba;
-        ext.parent = number_of[ext_parent_reg[i] as usize];
+        ext.pvd_parent = pvd_number_of[ext_parent_reg[i] as usize];
+        ext.parent = jol_number_of[ext_parent_reg[i] as usize];
         next_lba += ext.sectors;
     }
     let total = next_lba;
     let first_file_lba = extents.first().map_or(total, |e| e.lba);
 
-    // ── 6. Build the public DirNode list ─────────────────────────────
-    let mut dirs = Vec::<DirNode, MAX_DIRS>::new();
-    for (oi, &r) in order.iter().enumerate() {
-        let is_root = r == 0;
-        let name = if is_root {
-            Vec::new()
-        } else {
-            regs[r as usize].name.clone()
-        };
-        dirs.push(DirNode {
-            number: oi as u16 + 1,
-            parent: if is_root {
-                1
-            } else {
-                number_of[regs[r as usize].parent as usize]
-            },
-            name,
-            lba: dir_lbas[oi],
-            sectors: dir_sectors[oi],
-        })
-        .map_err(|_| IsoError::TooManyFiles)?;
-    }
-
-    let root_dir_lba = dirs[0].lba;
-    let root_dir_sectors = dirs[0].sectors;
-
     Ok(Layout {
         label: lbl,
-        path_table_lba,
-        path_table_sectors,
-        path_table_size: pt_size as u32,
-        root_dir_lba,
-        root_dir_sectors,
-        dirs,
+        pvd: DirTree {
+            path_table_lba: pvd_pt_lba,
+            path_table_sectors: pvd_pt_sectors,
+            path_table_size: pvd_pt_size as u32,
+            root_dir_lba: pvd_dirs[0].lba,
+            root_dir_sectors: pvd_dirs[0].sectors,
+            dirs: pvd_dirs,
+        },
+        joliet: DirTree {
+            path_table_lba: jol_pt_lba,
+            path_table_sectors: jol_pt_sectors,
+            path_table_size: jol_pt_size as u32,
+            root_dir_lba: jol_dirs[0].lba,
+            root_dir_sectors: jol_dirs[0].sectors,
+            dirs: jol_dirs,
+        },
         extents,
         first_file_lba,
         total,
@@ -428,7 +673,6 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
     assert!(out.len() >= SECTOR_SIZE as usize);
     out.fill(0);
 
-    let m_lba = layout.path_table_lba + layout.path_table_sectors;
     match lba {
         PVD_LBA => {
             write_pvd(layout, out);
@@ -442,18 +686,42 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
             write_terminator(out);
             true
         }
-        l if l >= layout.path_table_lba && l < m_lba => {
-            write_path_table(layout, l, out, false);
+        // PVD path tables (L then M).
+        l if l >= layout.pvd.path_table_lba
+            && l < layout.pvd.path_table_lba + layout.pvd.path_table_sectors =>
+        {
+            write_path_table(&layout.pvd, l, out, false);
             true
         }
-        l if l >= m_lba && l < m_lba + layout.path_table_sectors => {
-            write_path_table(layout, l, out, true);
+        l if l >= layout.pvd.path_table_lba + layout.pvd.path_table_sectors
+            && l < layout.pvd.path_table_lba + 2 * layout.pvd.path_table_sectors =>
+        {
+            write_path_table(&layout.pvd, l, out, true);
+            true
+        }
+        // Joliet path tables (L then M).
+        l if l >= layout.joliet.path_table_lba
+            && l < layout.joliet.path_table_lba + layout.joliet.path_table_sectors =>
+        {
+            write_path_table(&layout.joliet, l, out, false);
+            true
+        }
+        l if l >= layout.joliet.path_table_lba + layout.joliet.path_table_sectors
+            && l < layout.joliet.path_table_lba + 2 * layout.joliet.path_table_sectors =>
+        {
+            write_path_table(&layout.joliet, l, out, true);
             true
         }
         l => {
-            for dir in &layout.dirs {
+            for dir in &layout.pvd.dirs {
                 if l >= dir.lba && l < dir.lba + dir.sectors {
-                    write_dir_directory(layout, dir, l, out);
+                    write_dir_directory(layout, &layout.pvd, dir, l, out, true);
+                    return true;
+                }
+            }
+            for dir in &layout.joliet.dirs {
+                if l >= dir.lba && l < dir.lba + dir.sectors {
+                    write_dir_directory(layout, &layout.joliet, dir, l, out, false);
                     return true;
                 }
             }
@@ -524,18 +792,24 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     out[130..132].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
 
     // Path Table Size (LE 132..136, BE 136..140)
-    out[132..136].copy_from_slice(&layout.path_table_size.to_le_bytes());
-    out[136..140].copy_from_slice(&layout.path_table_size.to_be_bytes());
+    out[132..136].copy_from_slice(&layout.pvd.path_table_size.to_le_bytes());
+    out[136..140].copy_from_slice(&layout.pvd.path_table_size.to_be_bytes());
 
     // Location of LE Path Table (140..144)
-    out[140..144].copy_from_slice(&layout.path_table_lba.to_le_bytes());
+    out[140..144].copy_from_slice(&layout.pvd.path_table_lba.to_le_bytes());
 
     // Location of BE (Type M) Path Table (148..152)
-    out[148..152]
-        .copy_from_slice(&(layout.path_table_lba + layout.path_table_sectors).to_be_bytes());
+    out[148..152].copy_from_slice(
+        &(layout.pvd.path_table_lba + layout.pvd.path_table_sectors).to_be_bytes(),
+    );
 
     // Root Directory Record (34 bytes at 156)
-    write_dir_record_root_pvd(out, 156, layout.root_dir_lba, layout.root_dir_sectors);
+    write_dir_record_root_pvd(
+        out,
+        156,
+        layout.pvd.root_dir_lba,
+        layout.pvd.root_dir_sectors,
+    );
 
     // System Identifier (BP 9-40 → bytes 8-39): space-filled.
     for i in 0..32 {
@@ -619,18 +893,24 @@ fn write_svd(layout: &Layout, out: &mut [u8]) {
     out[130..132].copy_from_slice(&(SECTOR_SIZE as u16).to_be_bytes());
 
     // Path Table Size (LE 132..136, BE 136..140)
-    out[132..136].copy_from_slice(&layout.path_table_size.to_le_bytes());
-    out[136..140].copy_from_slice(&layout.path_table_size.to_be_bytes());
+    out[132..136].copy_from_slice(&layout.joliet.path_table_size.to_le_bytes());
+    out[136..140].copy_from_slice(&layout.joliet.path_table_size.to_be_bytes());
 
     // Location of LE Path Table (140..144)
-    out[140..144].copy_from_slice(&layout.path_table_lba.to_le_bytes());
+    out[140..144].copy_from_slice(&layout.joliet.path_table_lba.to_le_bytes());
 
     // Location of BE (Type M) Path Table (148..152)
-    out[148..152]
-        .copy_from_slice(&(layout.path_table_lba + layout.path_table_sectors).to_be_bytes());
+    out[148..152].copy_from_slice(
+        &(layout.joliet.path_table_lba + layout.joliet.path_table_sectors).to_be_bytes(),
+    );
 
     // Root Directory Record
-    write_dir_record_root_pvd(out, 156, layout.root_dir_lba, layout.root_dir_sectors);
+    write_dir_record_root_pvd(
+        out,
+        156,
+        layout.joliet.root_dir_lba,
+        layout.joliet.root_dir_sectors,
+    );
 
     // Volume Identifier (BP 41-72 → bytes 40-71): UCS-2BE label (16 chars).
     for i in 0..32 {
@@ -657,13 +937,13 @@ fn write_terminator(out: &mut [u8]) {
 /// Write one Path Table sector at `lba` (Type L when `is_m` is false,
 /// Type M when true).  Only the records overlapping this sector are
 /// written; the rest of `out` is zeroed.
-fn write_path_table(layout: &Layout, lba: u32, out: &mut [u8], is_m: bool) {
+fn write_path_table(tree: &DirTree, lba: u32, out: &mut [u8], is_m: bool) {
     out.fill(0);
-    let table_start = layout.path_table_lba + if is_m { layout.path_table_sectors } else { 0 };
+    let table_start = tree.path_table_lba + if is_m { tree.path_table_sectors } else { 0 };
     let sector_start = (lba - table_start) as usize * SECTOR_SIZE as usize;
 
     let mut offset = 0usize;
-    for (i, dir) in layout.dirs.iter().enumerate() {
+    for (i, dir) in tree.dirs.iter().enumerate() {
         let is_root = i == 0;
         // Root identifier is a single 0x00 byte; others use the UCS-2BE name.
         let name: &[u8] = if is_root { &[0x00] } else { &dir.name };
@@ -702,10 +982,19 @@ fn write_path_table(layout: &Layout, lba: u32, out: &mut [u8], is_m: bool) {
 /// Write one directory sector at `lba` (which must lie within `dir`'s
 /// extent).
 ///
-/// Contains ".", "..", one record per child directory and one per file
-/// (Joliet UCS-2BE names).  Only the records overlapping this sector are
-/// written; the rest of `out` is zeroed.
-fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8]) {
+/// Contains ".", "..", one record per child directory and one per file.
+/// When `is_pvd` the tree's 8.3 identifiers are used (`dir.name` /
+/// `extent.pvd_name`), otherwise the Joliet UCS-2BE names.  Only the
+/// records overlapping this sector are written; the rest of `out` is
+/// zeroed.
+fn write_dir_directory(
+    layout: &Layout,
+    tree: &DirTree,
+    dir: &DirNode,
+    lba: u32,
+    out: &mut [u8],
+    is_pvd: bool,
+) {
     out.fill(0);
     let sector_start = (lba - dir.lba) as usize * SECTOR_SIZE as usize;
 
@@ -713,7 +1002,7 @@ fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8])
     // extent and copying only the part that overlaps `out`'s sector.
     let mut offset = 0usize;
     let mut emit = |offset: &mut usize, extent_lba: u32, data_len: u32, flags: u8, name: &[u8]| {
-        let rec_len = 33 + name.len() + if !name.len().is_multiple_of(2) { 1 } else { 0 };
+        let rec_len = 33 + name.len() + if name.len().is_multiple_of(2) { 1 } else { 0 };
         let rec_start = *offset;
         *offset += rec_len;
 
@@ -746,7 +1035,7 @@ fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8])
     let (p_lba, p_sectors) = if dir.number == 1 {
         (dir.lba, dir.sectors)
     } else {
-        let parent = layout
+        let parent = tree
             .dirs
             .iter()
             .find(|d| d.number == dir.parent)
@@ -756,7 +1045,7 @@ fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8])
     emit(&mut offset, p_lba, p_sectors * SECTOR_SIZE, 0x02, &[0x01]);
 
     // Child directories.
-    for child in &layout.dirs {
+    for child in &tree.dirs {
         if child.number != dir.number && child.parent == dir.number {
             emit(
                 &mut offset,
@@ -770,14 +1059,13 @@ fn write_dir_directory(layout: &Layout, dir: &DirNode, lba: u32, out: &mut [u8])
 
     // File entries: data length = actual file size (ECMA-119 §9.1.5).
     for extent in &layout.extents {
-        if extent.parent == dir.number {
-            emit(
-                &mut offset,
-                extent.lba,
-                extent.size as u32,
-                0x00,
-                &extent.name,
-            );
+        let (parent, name) = if is_pvd {
+            (extent.pvd_parent, extent.pvd_name.as_slice())
+        } else {
+            (extent.parent, extent.name.as_slice())
+        };
+        if parent == dir.number {
+            emit(&mut offset, extent.lba, extent.size as u32, 0x00, name);
         }
     }
 }
@@ -797,7 +1085,9 @@ fn write_dir_record(
     name: &[u8],
 ) -> usize {
     let name_len = name.len();
-    let rec_len = 33 + name_len + if !name_len.is_multiple_of(2) { 1 } else { 0 };
+    // Padding is added only when the identifier length is even (ECMA-119
+    // §9.1.12), keeping the record length even.
+    let rec_len = 33 + name_len + if name_len.is_multiple_of(2) { 1 } else { 0 };
     let o = offset;
 
     out[o] = rec_len as u8; // Length of Directory Record
@@ -823,8 +1113,8 @@ fn write_dir_record(
     out[o + 32] = name_len as u8;
     // File Identifier
     out[o + 33..o + 33 + name_len].copy_from_slice(name);
-    // Padding (if name_len is odd)
-    if !name_len.is_multiple_of(2) {
+    // Padding (only when name_len is even, ECMA-119 §9.1.12)
+    if name_len.is_multiple_of(2) {
         out[o + 33 + name_len] = 0x00;
     }
 
@@ -914,18 +1204,24 @@ mod tests {
         let files = make_entries();
         let layout = compute_layout(&files, "TEST").unwrap();
         assert_eq!(layout.label.as_str(), "TEST");
-        assert_eq!(layout.path_table_lba, 19);
-        assert_eq!(layout.root_dir_lba, 21); // 16-18 desc, 19 PT-L, 20 PT-M
-        assert_eq!(layout.dirs.len(), 1); // root only
+        // PVD tree: path table L at 19 (1 sector, only the root dir), root
+        // dir at 21; Joliet tree: path table at 22, root dir at 24.
+        assert_eq!(layout.pvd.path_table_lba, 19);
+        assert_eq!(layout.pvd.root_dir_lba, 21);
+        assert_eq!(layout.pvd.dirs.len(), 1); // root only
+        assert_eq!(layout.joliet.path_table_lba, 22);
+        assert_eq!(layout.joliet.root_dir_lba, 24);
+        assert_eq!(layout.joliet.dirs.len(), 1); // root only
+                                                 // Files follow both trees' directories: 25, 26-27.
         assert_eq!(layout.extents.len(), 2);
-        assert_eq!(layout.extents[0].lba, 22);
+        assert_eq!(layout.extents[0].lba, 25);
         assert_eq!(layout.extents[0].sectors, 1); // 1000 bytes = 1 sector
         assert_eq!(layout.extents[0].size, 1000);
-        assert_eq!(layout.extents[1].lba, 23);
+        assert_eq!(layout.extents[1].lba, 26);
         assert_eq!(layout.extents[1].sectors, 2); // 4096 bytes = 2 sectors
         assert_eq!(layout.extents[1].size, 4096);
-        assert_eq!(layout.total, 25); // 21 + 1 + 2
-        assert_eq!(layout.first_file_lba, 22);
+        assert_eq!(layout.total, 28);
+        assert_eq!(layout.first_file_lba, 25);
     }
 
     #[test]
@@ -933,8 +1229,11 @@ mod tests {
         let files: Vec<FileEntry, MAX_FILES> = Vec::new();
         let layout = compute_layout(&files, "EMPTY").unwrap();
         assert_eq!(layout.extents.len(), 0);
-        assert_eq!(layout.dirs.len(), 1);
-        assert_eq!(layout.total, 22); // 16-18 desc, 19 PT-L, 20 PT-M, 21 root
+        assert_eq!(layout.pvd.dirs.len(), 1);
+        assert_eq!(layout.joliet.dirs.len(), 1);
+        // 16-18 desc, 19 PVD PT-L, 20 PVD PT-M, 21 PVD root,
+        // 22 Joliet PT-L, 23 Joliet PT-M, 24 Joliet root.
+        assert_eq!(layout.total, 25);
     }
 
     #[test]
@@ -993,32 +1292,37 @@ mod tests {
                 .unwrap();
         }
         let layout = compute_layout(&files, "BIG").unwrap();
-        // 128 records × 33 + UCS-2BE name + pad ≫ 2048.
+        // 128 Joliet records × (33 + 16-byte UCS-2BE name + pad) ≫ 2048.
         assert!(
-            layout.root_dir_sectors > 1,
+            layout.joliet.root_dir_sectors > 1,
             "root dir should span {} sectors",
-            layout.root_dir_sectors
+            layout.joliet.root_dir_sectors
         );
-        // File data starts right after the root directory extent.
+        // File data starts right after the Joliet root directory extent.
         assert_eq!(
             layout.extents[0].lba,
-            layout.root_dir_lba + layout.root_dir_sectors
+            layout.joliet.root_dir_lba + layout.joliet.root_dir_sectors
         );
 
-        // Every root directory sector must generate without panicking and
-        // the first sector must begin with the "." record.
-        for i in 0..layout.root_dir_sectors {
+        // Every Joliet root directory sector must generate without panicking
+        // and the first sector must begin with the "." record.
+        for i in 0..layout.joliet.root_dir_sectors {
             let mut sector = [0u8; 2048];
-            assert!(gen_sector(&layout, layout.root_dir_lba + i, &mut sector));
+            assert!(gen_sector(
+                &layout,
+                layout.joliet.root_dir_lba + i,
+                &mut sector
+            ));
         }
         let mut sector = [0u8; 2048];
-        gen_sector(&layout, layout.root_dir_lba, &mut sector);
-        assert_eq!(sector[0], 35); // "." record length (33 + 1 name + 1 pad)
+        gen_sector(&layout, layout.joliet.root_dir_lba, &mut sector);
+        assert_eq!(sector[0], 34); // "." record length (33 + 1 name, odd → no pad)
         assert_eq!(sector[32], 1); // "." name length
                                    // Sector 0 holds "." and ".." records.
-        assert_eq!(sector[35], 35); // ".." record length
-                                    // The last root dir sector still carries (parts of) file records.
-        let last = layout.root_dir_lba + layout.root_dir_sectors - 1;
+        assert_eq!(sector[34], 34); // ".." record length
+                                    // The last Joliet root dir sector still carries
+                                    // (parts of) file records.
+        let last = layout.joliet.root_dir_lba + layout.joliet.root_dir_sectors - 1;
         let mut sector = [0u8; 2048];
         gen_sector(&layout, last, &mut sector);
         // A record crosses the sector boundary, so the sector is not empty
@@ -1057,48 +1361,127 @@ mod tests {
         assert_eq!(n.len(), 8); // 'A','B','C','D'
     }
 
+    // ── PVD 8.3 identifiers ──────────────────────────────────────────
+
+    #[test]
+    fn pvd_file_name_83_with_version() {
+        // Ordinary: base + "." + ext + ";1".
+        assert_eq!(to_pvd_file_name("readme.txt").as_slice(), b"README.TXT;1");
+        // No extension: still carries the separator and version (NOEXT.;1).
+        assert_eq!(to_pvd_file_name("noext").as_slice(), b"NOEXT.;1");
+        // Long base truncated to 8, long ext to 3, last dot splits.
+        assert_eq!(
+            to_pvd_file_name("averylongfilename.with.ext").as_slice(),
+            b"AVERYLON.EXT;1"
+        );
+        // Dots inside the base map to '_'.
+        assert_eq!(
+            to_pvd_file_name("multi.dot.name").as_slice(),
+            b"MULTI_DO.NAM;1"
+        );
+        // Lowercase / mixed case are uppercased.
+        assert_eq!(to_pvd_file_name("Data.Bin").as_slice(), b"DATA.BIN;1");
+    }
+
+    #[test]
+    fn pvd_dir_name_83_no_version() {
+        // Directory identifier: no version.
+        assert_eq!(to_pvd_dir_name("docs").as_slice(), b"DOCS");
+        // Extension kept when present.
+        assert_eq!(to_pvd_dir_name("sub.dir").as_slice(), b"SUB.DIR");
+        // No extension → base only (no trailing dot).
+        assert_eq!(to_pvd_dir_name("with space").as_slice(), b"WITH_SPA");
+    }
+
+    #[test]
+    fn pvd_83_collision_disambiguation() {
+        // Two host names mapping to the same 8.3 identifier: the first
+        // keeps the natural name, the second gets base[:5] + 3-digit counter.
+        let mut regs = Vec::<DirReg, MAX_DIRS>::new();
+        regs.push(DirReg {
+            parent: 0,
+            pvd_name: Vec::new(),
+            name: Vec::new(),
+            depth: 0,
+        })
+        .unwrap();
+        let mut extents = Vec::<FileExtent, MAX_FILES>::new();
+        let mk = |n: &str| FileExtent {
+            file_index: 0,
+            lba: 0,
+            sectors: 1,
+            size: 1,
+            pvd_name: to_pvd_file_name(n),
+            pvd_parent: 0,
+            name: to_joliet_name(n),
+            parent: 0,
+        };
+        extents.push(mk("readme.txt")).unwrap();
+        extents.push(mk("README.TXT")).unwrap();
+        extents.push(mk("abcdefgh1.dat")).unwrap();
+        extents.push(mk("abcdefgh2.dat")).unwrap();
+        extents.push(mk("abcdefgh3.dat")).unwrap();
+        let parents = [0u16, 0, 0, 0, 0];
+        disambiguate_pvd_83(&mut regs, &mut extents, &parents);
+        let names: std::vec::Vec<&[u8]> = extents.iter().map(|e| e.pvd_name.as_slice()).collect();
+        // Natural name kept once; the duplicate is mangled.
+        assert_eq!(names[0], b"README.TXT;1");
+        assert_ne!(names[1], names[0]);
+        assert!(names[1].ends_with(b";1"));
+        // Three-way collision on ABCDEFGH.DAT: one keeps the natural name,
+        // the other two get ABCDE000/ABCDE001.
+        assert_eq!(names[2], b"ABCDEFGH.DAT;1");
+        assert_eq!(names[3], b"ABCDE000.DAT;1");
+        assert_eq!(names[4], b"ABCDE001.DAT;1");
+        assert!(names.contains(&b"README.TXT;1".as_slice()));
+        assert!(names.contains(&b"ABCDEFGH.DAT;1".as_slice()));
+        assert!(names.contains(&b"ABCDE000.DAT;1".as_slice()));
+        assert!(names.contains(&b"ABCDE001.DAT;1".as_slice()));
+    }
+
     // ── sub-directory hierarchy ──────────────────────────────────────
 
     #[test]
     fn layout_preserves_subdirectories() {
         let files = make_tree();
         let layout = compute_layout(&files, "T").unwrap();
-        // root + DOCS + TOOLS + SUB = 4 directories.
-        assert_eq!(layout.dirs.len(), 4);
-        assert_eq!(layout.dirs[0].number, 1); // root
-        assert_eq!(layout.dirs[0].parent, 1); // root points to itself
-        assert_eq!(layout.dirs[0].lba, 21);
-        // Level 1 sorted by name: DOCS (2) before TOOLS (3).
-        assert_eq!(layout.dirs[1].number, 2);
-        assert_eq!(
-            layout.dirs[1].name.as_slice(),
-            [0, b'D', 0, b'O', 0, b'C', 0, b'S']
-        );
-        assert_eq!(layout.dirs[2].number, 3);
-        assert_eq!(
-            layout.dirs[2].name.as_slice(),
-            [0, b'T', 0, b'O', 0, b'O', 0, b'L', 0, b'S']
-        );
-        // SUB is a level-2 directory whose parent is TOOLS (3).
-        assert_eq!(layout.dirs[3].number, 4);
-        assert_eq!(layout.dirs[3].parent, 3);
-        // Directory LBAs: root 21, DOCS 22, TOOLS 23, SUB 24.
-        assert_eq!(layout.dirs[1].lba, 22);
-        assert_eq!(layout.dirs[2].lba, 23);
-        assert_eq!(layout.dirs[3].lba, 24);
-        // Files are assigned after all directories, each under its parent.
-        assert_eq!(layout.first_file_lba, 25);
+        // Both trees carry root + DOCS + TOOLS + SUB = 4 directories.
+        assert_eq!(layout.pvd.dirs.len(), 4);
+        assert_eq!(layout.joliet.dirs.len(), 4);
+        // PVD tree: root, then level-1 DOCS/TOOLS (sorted by 8.3 name), SUB.
+        assert_eq!(layout.pvd.dirs[0].number, 1); // root
+        assert_eq!(layout.pvd.dirs[0].parent, 1); // root points to itself
+        assert_eq!(layout.pvd.dirs[0].lba, 21);
+        assert_eq!(layout.pvd.dirs[1].number, 2);
+        assert_eq!(layout.pvd.dirs[1].name.as_slice(), b"DOCS");
+        assert_eq!(layout.pvd.dirs[2].number, 3);
+        assert_eq!(layout.pvd.dirs[2].name.as_slice(), b"TOOLS");
+        assert_eq!(layout.pvd.dirs[3].number, 4);
+        assert_eq!(layout.pvd.dirs[3].parent, 3);
+        // PVD directory LBAs: root 21, DOCS 22, TOOLS 23, SUB 24.
+        assert_eq!(layout.pvd.dirs[1].lba, 22);
+        assert_eq!(layout.pvd.dirs[2].lba, 23);
+        assert_eq!(layout.pvd.dirs[3].lba, 24);
+        // Joliet tree has its own extents after the PVD tree.
+        assert_eq!(layout.joliet.dirs[0].lba, 27);
+        assert_eq!(layout.joliet.dirs[1].lba, 28);
+        assert_eq!(layout.joliet.dirs[2].lba, 29);
+        assert_eq!(layout.joliet.dirs[3].lba, 30);
+        // Files are assigned after both trees, each under its parent.
+        assert_eq!(layout.first_file_lba, 31);
         assert_eq!(layout.extents.len(), 4);
         assert_eq!(layout.extents[0].parent, 1); // README.TXT
         assert_eq!(layout.extents[1].parent, 2); // DOCS/MANUAL.PDF
         assert_eq!(layout.extents[2].parent, 3); // TOOLS/SETUP.EXE
         assert_eq!(layout.extents[3].parent, 4); // TOOLS/SUB/X.BIN
-        assert_eq!(layout.extents[0].lba, 25);
-        assert_eq!(layout.extents[1].lba, 26);
-        assert_eq!(layout.extents[2].lba, 27);
+        assert_eq!(layout.extents[0].pvd_parent, 1); // same numbering here
+        assert_eq!(layout.extents[3].pvd_parent, 4);
+        assert_eq!(layout.extents[0].lba, 31);
+        assert_eq!(layout.extents[1].lba, 32);
+        assert_eq!(layout.extents[2].lba, 33);
         assert_eq!(layout.extents[2].sectors, 2); // 3000 bytes = 2 sectors
-        assert_eq!(layout.extents[3].lba, 29);
-        assert_eq!(layout.total, 30);
+        assert_eq!(layout.extents[3].lba, 35);
+        assert_eq!(layout.total, 36);
     }
 
     #[test]
@@ -1107,10 +1490,13 @@ mod tests {
         let layout = compute_layout(&files, "T").unwrap();
         let mut l = [0u8; 2048];
         let mut m = [0u8; 2048];
-        assert!(gen_sector(&layout, layout.path_table_lba, &mut l));
+        // PVD path table L at 19, M at 20 (both 1 sector: root+DOCS+TOOLS+SUB
+        // = 10 + 12 + 14 + 12 = 48 bytes).
+        assert_eq!(layout.pvd.path_table_sectors, 1);
+        assert!(gen_sector(&layout, layout.pvd.path_table_lba, &mut l));
         assert!(gen_sector(
             &layout,
-            layout.path_table_lba + layout.path_table_sectors,
+            layout.pvd.path_table_lba + layout.pvd.path_table_sectors,
             &mut m
         ));
 
@@ -1119,26 +1505,26 @@ mod tests {
         assert_eq!(l[o0], 1);
         assert_eq!(
             u32::from_le_bytes(l[o0 + 2..o0 + 6].try_into().unwrap()),
-            layout.root_dir_lba
+            layout.pvd.root_dir_lba
         );
         assert_eq!(u16::from_le_bytes(l[o0 + 6..o0 + 8].try_into().unwrap()), 1);
         assert_eq!(l[o0 + 8], 0x00);
 
-        // Type L record 2 (DOCS): name "DOCS" (8 bytes), lba 22, parent 1.
+        // Type L record 2 (DOCS): 8.3 name "DOCS" (4 bytes), lba 22, parent 1.
         let o1 = 10usize;
-        assert_eq!(l[o1], 8);
+        assert_eq!(l[o1], 4);
         assert_eq!(
             u32::from_le_bytes(l[o1 + 2..o1 + 6].try_into().unwrap()),
             22
         );
         assert_eq!(u16::from_le_bytes(l[o1 + 6..o1 + 8].try_into().unwrap()), 1);
-        assert_eq!(&l[o1 + 8..o1 + 16], &[0, b'D', 0, b'O', 0, b'C', 0, b'S']);
+        assert_eq!(&l[o1 + 8..o1 + 12], b"DOCS");
 
         // Type M table holds the same records with big-endian fields.
         assert_eq!(m[0], 1);
         assert_eq!(
             u32::from_be_bytes(m[0 + 2..0 + 6].try_into().unwrap()),
-            layout.root_dir_lba
+            layout.pvd.root_dir_lba
         );
         assert_eq!(u16::from_be_bytes(m[0 + 6..0 + 8].try_into().unwrap()), 1);
         let o1 = 10usize;
@@ -1147,37 +1533,45 @@ mod tests {
             22
         );
         assert_eq!(u16::from_be_bytes(m[o1 + 6..o1 + 8].try_into().unwrap()), 1);
-        assert_eq!(&m[o1 + 8..o1 + 16], &[0, b'D', 0, b'O', 0, b'C', 0, b'S']);
+        assert_eq!(&m[o1 + 8..o1 + 12], b"DOCS");
 
-        // SUB record (4th; offsets 10 + 16 + 18 = 44): name "SUB", parent 3.
-        let o3 = 44usize;
-        assert_eq!(l[o3], 6);
+        // SUB record (4th; offsets 10 + 12 + 14 = 36): name "SUB", parent 3.
+        let o3 = 36usize;
+        assert_eq!(l[o3], 3);
         assert_eq!(u16::from_le_bytes(l[o3 + 6..o3 + 8].try_into().unwrap()), 3);
-        assert_eq!(&l[o3 + 8..o3 + 14], &[0, b'S', 0, b'U', 0, b'B']);
+        assert_eq!(&l[o3 + 8..o3 + 11], b"SUB");
+
+        // The Joliet path table (at 25) uses UCS-2BE names instead.
+        assert_eq!(layout.joliet.path_table_lba, 25);
+        let mut j = [0u8; 2048];
+        assert!(gen_sector(&layout, layout.joliet.path_table_lba, &mut j));
+        let o1 = 10usize;
+        assert_eq!(j[o1], 8); // UCS-2 "DOCS" is 8 bytes
+        assert_eq!(&j[o1 + 8..o1 + 16], &[0, b'D', 0, b'O', 0, b'C', 0, b'S']);
     }
 
     #[test]
     fn gen_subdir_directory_records() {
         let files = make_tree();
         let layout = compute_layout(&files, "T").unwrap();
-        // SUB (number 4, lba 24): ".", ".." (→ TOOLS), X.BIN.
-        let sub = layout.dirs[3].clone();
-        let tools = layout.dirs[2].clone();
+        // SUB (number 4, Joliet lba 30): ".", ".." (→ TOOLS at 29), X.BIN.
+        let sub = layout.joliet.dirs[3].clone();
+        let tools = layout.joliet.dirs[2].clone();
         let mut sector = [0u8; 2048];
         assert!(gen_sector(&layout, sub.lba, &mut sector));
         // "." record: lba = SUB's own lba.
-        assert_eq!(sector[0], 35);
+        assert_eq!(sector[0], 34);
         assert_eq!(
             u32::from_le_bytes(sector[2..6].try_into().unwrap()),
             sub.lba
         );
         // ".." points to SUB's parent, TOOLS.
         assert_eq!(
-            u32::from_le_bytes(sector[37..41].try_into().unwrap()),
+            u32::from_le_bytes(sector[36..40].try_into().unwrap()),
             tools.lba
         );
         // X.BIN is a file (flag 0x00) and the only non-dot record.
-        let mut off = 70usize;
+        let mut off = 68usize;
         let mut saw_file = false;
         while off < 2048 && sector[off] != 0 {
             let flags = sector[off + 25];
@@ -1188,7 +1582,7 @@ mod tests {
         }
         assert!(saw_file, "expected the X.BIN file record");
         // No child directory records in a leaf directory.
-        let mut off = 70usize;
+        let mut off = 68usize;
         while off < 2048 && sector[off] != 0 {
             assert_ne!(sector[off + 25], 0x02, "leaf dir must not list a child dir");
             off += sector[off] as usize;
@@ -1222,7 +1616,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([sector[128], sector[129]]), 2048);
         assert_eq!(
             u32::from_le_bytes([sector[158], sector[159], sector[160], sector[161]]),
-            layout.root_dir_lba
+            layout.pvd.root_dir_lba
         );
         // Volume identifier (BP 41-72 → byte 40) = "TEST", space-padded.
         assert_eq!(&sector[40..44], b"TEST");
@@ -1268,12 +1662,12 @@ mod tests {
         let files = make_entries();
         let layout = compute_layout(&files, "T").unwrap();
         let mut sector = [0u8; 2048];
-        assert!(gen_sector(&layout, layout.path_table_lba, &mut sector));
+        assert!(gen_sector(&layout, layout.pvd.path_table_lba, &mut sector));
         assert_eq!(sector[0], 0x01); // name length
         assert_eq!(sector[1], 0x00); // ext attr
         assert_eq!(
             u32::from_le_bytes([sector[2], sector[3], sector[4], sector[5]]),
-            layout.root_dir_lba
+            layout.pvd.root_dir_lba
         );
         assert_eq!(u16::from_le_bytes([sector[6], sector[7]]), 1);
         assert_eq!(sector[8], 0x00);
@@ -1284,19 +1678,19 @@ mod tests {
         let files = make_entries();
         let layout = compute_layout(&files, "T").unwrap();
         let mut sector = [0u8; 2048];
-        assert!(gen_sector(&layout, layout.root_dir_lba, &mut sector));
-        // "." entry: name [0x00] is 1 byte (odd) → padding → rec_len = 35
-        assert_eq!(sector[0], 35); // 33 + 1 + 1 padding
+        gen_sector(&layout, layout.joliet.root_dir_lba, &mut sector);
+        // "." entry: name [0x00] is 1 byte (odd) → no padding → rec_len = 34
+        assert_eq!(sector[0], 34); // 33 + 1 name (odd, unpadded)
         assert_eq!(sector[25], 0x02); // directory flag
         assert_eq!(sector[32], 0x01); // name length
         assert_eq!(sector[33], 0x00); // root name
                                       // Fixed sentinel recording date (1980-01-01 +0), not zeros.
         assert_eq!(&sector[18..25], &FIXED_RECORDING_DATE);
-        // ".." entry starts at offset 35
-        assert_eq!(sector[35], 35);
-        assert_eq!(sector[35 + 25], 0x02);
-        assert_eq!(sector[35 + 33], 0x01); // parent name
-        assert_eq!(&sector[35 + 18..35 + 25], &FIXED_RECORDING_DATE);
+        // ".." entry starts at offset 34
+        assert_eq!(sector[34], 34);
+        assert_eq!(sector[34 + 25], 0x02);
+        assert_eq!(sector[34 + 33], 0x01); // parent name
+        assert_eq!(&sector[34 + 18..34 + 25], &FIXED_RECORDING_DATE);
     }
 
     #[test]
@@ -1304,9 +1698,9 @@ mod tests {
         let files = make_entries();
         let layout = compute_layout(&files, "T").unwrap();
         let mut sector = [0u8; 2048];
-        assert!(gen_sector(&layout, layout.root_dir_lba, &mut sector));
-        // "." (35) + ".." (35) = 70 → first file entry at offset 70
-        let o = 70;
+        assert!(gen_sector(&layout, layout.joliet.root_dir_lba, &mut sector));
+        // "." (34) + ".." (34) = 68 → first file entry at offset 68
+        let o = 68;
         assert_eq!(sector[o + 25], 0x00); // file flag
                                           // Extent LBA = first file (README.TXT)
         assert_eq!(
@@ -1329,8 +1723,8 @@ mod tests {
         let files = make_entries();
         let layout = compute_layout(&files, "T").unwrap();
         let mut sector = [0u8; 2048];
-        gen_sector(&layout, layout.root_dir_lba, &mut sector);
-        let o = 70; // first file record ("README.TXT", 1000 B)
+        gen_sector(&layout, layout.joliet.root_dir_lba, &mut sector);
+        let o = 68; // first file record ("README.TXT", 1000 B) after "." (34) + ".." (34)
                     // LBA: LE at 2..6, BE at 6..10.
         assert_eq!(
             u32::from_le_bytes(sector[o + 2..o + 6].try_into().unwrap()),
@@ -1474,7 +1868,6 @@ mod tests {
         let err = IsoError::TooManyFiles;
         let mut buf = [0u8; 64];
         let mut writer = BufWriter(&mut buf);
-        use core::fmt::Write;
         core::fmt::Write::write_fmt(&mut writer, format_args!("{err}")).ok();
         // At least check it wrote something.
         assert!(writer.0.iter().any(|&b| b != 0));

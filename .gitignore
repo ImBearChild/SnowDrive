@@ -19,3 +19,7 @@ __*
 
 # Test disk image
 test.img
+test.iso
+
+# Python bytecode (tools/ext-test)
+__pycache__/

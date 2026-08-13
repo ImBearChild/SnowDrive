@@ -105,6 +105,47 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+### External Tool Tests
+
+Beyond the cargo suites, `tools/ext-test/` cross-validates the `snowdrive`
+binary as a **black box** with independent external tools, driven by pure
+standard-library Python (no pytest dependency):
+
+- `tools/ext-test/test_iso.py` — `snowdrive mkisofs` output is read by
+  `file`, `isoinfo` (PVD **and** Joliet trees), `7z` and `bsdtar`
+  (libarchive); names, sizes and file content must match the source tree.
+  Tests skip when a tool is absent.
+- `tools/ext-test/test_iscsi_loopback.py` — a real kernel initiator
+  (`iscsiadm` + `iscsi_tcp`) logs into `snowdrive serve`, formats the RAM
+  disk with ext4, mounts it, writes/reads through the real block layer and
+  fsck-checks it. Skipped unless root and the module/daemon are available.
+
+```bash
+# Fast, no privileges needed (ISO cross-validation)
+python3 tools/ext-test/run.py
+
+# A single file / test
+python3 tools/ext-test/test_iso.py
+
+# Kernel loopback test (needs root + open-iscsi)
+sudo -E env PATH=$PATH python3 tools/ext-test/test_iscsi_loopback.py
+
+# Point at a specific binary (default: target/release or target/debug)
+SNOWDRIVE_BIN=./target/debug/snowdrive python3 tools/ext-test/run.py
+```
+
+Design notes:
+
+- These tests are **not** compiled into cargo tests: they spawn the binary
+  as a subprocess and use tools that may not exist in a Rust toolchain, so
+  a missing tool skips (never fails) its test.
+- The oracle is the host directory tree, never another ISO generator: we
+  assert that independent readers reproduce the same names/sizes/content,
+  not that our layout is byte-identical to `mkisofs`.
+- The PVD-tree assertions (`isoinfo -l`) are the regression net for the
+  dual-tree (PVD 8.3 + Joliet UCS-2) layout — the Rust cross-reader
+  prefers the Joliet SVD, so only external tools exercise the PVD tree.
+
 ## Code Coverage
 
 Coverage is measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)

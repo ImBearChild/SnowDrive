@@ -84,9 +84,9 @@ struct ServeArgs {
     #[arg(long = "iscsi", value_name = "ADDR:PORT")]
     iscsi: Option<String>,
 
-    /// Verbose logging (debug level).
-    #[arg(long, short)]
-    verbose: bool,
+    /// Verbose logging: -v = debug, -vv = trace.
+    #[arg(long, short, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Work buffer size in bytes (accepts K/M/G suffixes; default 256K).
     #[arg(long = "work-buf-size", value_name = "BYTES")]
@@ -106,9 +106,9 @@ struct MkisofsArgs {
     /// Volume label (default: the source directory name, max 16 chars).
     #[arg(long, value_name = "NAME")]
     label: Option<String>,
-    /// Verbose logging (debug level).
-    #[arg(long, short)]
-    verbose: bool,
+    /// Verbose logging: -v = debug, -vv = trace.
+    #[arg(long, short, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 fn main() -> ExitCode {
@@ -342,7 +342,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     let mut work = vec![0u8; work_size];
-    log::info!("listening on {addr} with {} LUN(s)", devices.len());
+    // Report the actual bound address: `--iscsi 127.0.0.1:0` picks an
+    // ephemeral port, so callers (tests) must learn it from this line.
+    let bound = listener.local_addr().unwrap_or(addr);
+    log::info!("listening on {bound} with {} LUN(s)", devices.len());
 
     if let Err(e) = serve(
         listener,
@@ -452,12 +455,13 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
 }
 
 /// Install the CLI log output: a plain `log` backend (env_logger) writing
-/// to stderr. `--verbose` selects the debug level; `RUST_LOG` overrides it.
-fn init_logging(verbose: bool) {
-    let level = if verbose {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
+/// to stderr. `-v` selects the debug level, `-vv` (or more) the trace
+/// level; `RUST_LOG` overrides both.
+fn init_logging(verbose: u8) {
+    let level = match verbose {
+        0 => log::LevelFilter::Info,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
     };
     let mut builder = env_logger::Builder::new();
     builder.filter_level(level);
@@ -953,7 +957,7 @@ mod tests {
                 );
                 assert_eq!(a.iscsi.as_deref(), Some("127.0.0.1:3260"));
                 assert_eq!(a.work_buf_size.as_deref(), Some("256K"));
-                assert!(a.verbose);
+                assert_eq!(a.verbose, 1);
             }
             Cli::Mkisofs(_) => panic!("expected Serve, got Mkisofs"),
         }
@@ -1016,7 +1020,7 @@ mod tests {
             dir: dir.to_string_lossy().to_string(),
             out: out.to_string_lossy().to_string(),
             label: Some("TEST".to_string()),
-            verbose: false,
+            verbose: 0,
         };
         assert_eq!(run_mkisofs(args), ExitCode::SUCCESS);
 
@@ -1041,7 +1045,7 @@ mod tests {
             dir: "/nonexistent/snowdrive-mkisofs".to_string(),
             out: "/tmp/out.iso".to_string(),
             label: None,
-            verbose: false,
+            verbose: 0,
         };
         assert_eq!(run_mkisofs(args), ExitCode::FAILURE);
     }

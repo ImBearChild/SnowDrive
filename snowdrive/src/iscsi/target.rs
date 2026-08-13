@@ -1072,18 +1072,53 @@ struct Pdu {
 /// Never leaves bytes behind — keeps TCP synchronized (fix #1).
 fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<Pdu, ()> {
     let mut raw = [0u8; BHS_SIZE];
-    read_exact(conn, &mut raw)?;
+    let mut got = 0usize;
+    while got < BHS_SIZE {
+        match conn.read(&mut raw[got..]) {
+            Ok(0) => {
+                crate::warn!("recv: BHS EOF after {got}/{BHS_SIZE} bytes (peer closed)");
+                return Err(());
+            }
+            Ok(n) => got += n,
+            Err(_) => {
+                crate::warn!("recv: BHS I/O error after {got}/{BHS_SIZE} bytes");
+                return Err(());
+            }
+        }
+    }
     let bhs = Bhs::from_bytes(raw);
     let dsl = bhs.data_segment_len() as usize;
     let ahs = usize::from(bhs.total_ahs_length());
-    skip(conn, ahs * 4)?;
+    // Raw-header trace: everything that arrives is visible here, even if
+    // the frame turns out to be garbage or the connection stalls later.
+    let mut hexbuf = [0u8; BHS_SIZE * 2];
+    let hlen = fmt_hex(&raw, &mut hexbuf);
+    crate::trace!(
+        "recv BHS: hex={} op_raw=0x{:02X} op=0x{:02X} dsl={} ahs={}",
+        core::str::from_utf8(&hexbuf[..hlen]).unwrap_or("<invalid>"),
+        raw[0],
+        bhs.opcode(),
+        dsl,
+        ahs
+    );
+    if ahs > 0 && skip(conn, ahs * 4).is_err() {
+        crate::warn!("recv: connection closed while reading AHS ({ahs}*4 bytes)");
+        return Err(());
+    }
     if dsl <= work.len() - BHS_SIZE {
-        read_exact(conn, &mut work[BHS_SIZE..BHS_SIZE + dsl])?;
-    } else {
-        skip(conn, dsl)?;
+        if read_exact(conn, &mut work[BHS_SIZE..BHS_SIZE + dsl]).is_err() {
+            crate::warn!("recv: connection closed while reading data segment (dsl={dsl})");
+            return Err(());
+        }
+    } else if skip(conn, dsl).is_err() {
+        crate::warn!("recv: connection closed while discarding oversized data segment (dsl={dsl})");
+        return Err(());
     }
     let pad = pdu_pad_len(dsl as u32) as usize;
-    skip(conn, pad)?;
+    if pad > 0 && skip(conn, pad).is_err() {
+        crate::warn!("recv: connection closed while reading padding (pad={pad})");
+        return Err(());
+    }
     Ok(Pdu { bhs, dsl })
 }
 
@@ -1161,6 +1196,22 @@ fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
         }
     }
     &buf[i..]
+}
+
+/// Compact lowercase hex dump of `bytes` into `out`; returns the number of
+/// characters written (2 per byte; stops early if `out` is too small).
+fn fmt_hex(bytes: &[u8], out: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0;
+    for &b in bytes {
+        if i + 2 > out.len() {
+            break;
+        }
+        out[i] = HEX[(b >> 4) as usize];
+        out[i + 1] = HEX[(b & 0x0F) as usize];
+        i += 2;
+    }
+    i
 }
 
 fn parse_u32(v: &[u8]) -> Option<u32> {

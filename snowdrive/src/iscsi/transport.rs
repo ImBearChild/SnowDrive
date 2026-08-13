@@ -50,7 +50,13 @@ impl embedded_io::ErrorType for TcpConn {
 
 impl embedded_io::Read for TcpConn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        std::io::Read::read(&mut self.stream, buf)
+        match std::io::Read::read(&mut self.stream, buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                crate::debug!("tcp read error: {e}");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -88,7 +94,7 @@ pub fn serve<D: ScsiDevice>(
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let (stream, _peer) = match listener.accept() {
+        let (stream, peer) = match listener.accept() {
             Ok(x) => x,
             Err(e) => {
                 if stop.load(Ordering::Relaxed) {
@@ -99,6 +105,7 @@ pub fn serve<D: ScsiDevice>(
                 continue;
             }
         };
+        crate::info!("accepted connection from {peer}");
         let mut conn = match TcpConn::new(stream, read_timeout) {
             Ok(c) => c,
             Err(e) => {
@@ -107,7 +114,10 @@ pub fn serve<D: ScsiDevice>(
             }
         };
         let mut session = Session::new();
-        serve_conn(&mut conn, work, &mut session, devs)?;
+        match serve_conn(&mut conn, work, &mut session, devs) {
+            Ok(()) => crate::info!("connection from {peer} ended"),
+            Err(e) => return Err(e),
+        }
     }
 }
 

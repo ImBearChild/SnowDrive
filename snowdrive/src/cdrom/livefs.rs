@@ -623,17 +623,20 @@ mod tests {
         assert_eq!(layout.label.as_str(), "TEST");
         // 3 files + 1 dir (SUB) = 4 entries; extents only for files.
         assert_eq!(layout.extents.len(), 3);
-        // Descriptors (16-18) + PT-L (19) + PT-M (20) + root (21) + SUB (22).
-        assert_eq!(layout.root_dir_lba, 21);
-        assert_eq!(layout.dirs.len(), 2); // root + SUB
-        assert_eq!(layout.dirs[1].number, 2);
-        assert_eq!(layout.dirs[1].parent, 1);
+        // PVD tree: root + SUB, its root at 21 (desc 16-18, PT-L 19, PT-M 20).
+        assert_eq!(layout.pvd.root_dir_lba, 21);
+        assert_eq!(layout.pvd.dirs.len(), 2); // root + SUB
+                                              // Joliet tree: its own root at 25 (PT-L 23, PT-M 24, root 25).
+        assert_eq!(layout.joliet.root_dir_lba, 25);
+        assert_eq!(layout.joliet.dirs.len(), 2); // root + SUB
+        assert_eq!(layout.joliet.dirs[1].number, 2);
+        assert_eq!(layout.joliet.dirs[1].parent, 1);
         // Files: 2 in root (parent 1), 1 in SUB (parent 2) — read_dir
         // order is filesystem-dependent, so count, don't index.
         assert_eq!(layout.extents.iter().filter(|e| e.parent == 1).count(), 2);
         assert_eq!(layout.extents.iter().filter(|e| e.parent == 2).count(), 1);
-        assert_eq!(layout.total, 27); // 21 root + 22 SUB + files 23..27
-        assert_eq!(layout.first_file_lba, 23);
+        assert_eq!(layout.total, 31); // PVD tree 21-22, Joliet tree 25-26, files 27..30
+        assert_eq!(layout.first_file_lba, 27);
     }
 
     #[test]
@@ -704,9 +707,9 @@ mod tests {
     fn read_spanning_metadata_and_file_boundary() {
         let (_dir, fs) = sample_tree();
         let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
-        // READ 8 sectors from LBA 16 → descriptors, both path tables, the
-        // two directories, and the first file sectors.
-        let mut buf = vec![0u8; 8 * 2048];
+        // READ 12 sectors from LBA 16 → descriptors, both path tables and
+        // directory trees (PVD + Joliet), and the first file sectors.
+        let mut buf = vec![0u8; 12 * 2048];
         dev.read_data(16 * 2048, &mut buf).unwrap();
         assert_eq!(buf[0], 0x01); // PVD type 1
         assert_eq!(&buf[1..6], b"CD001");
@@ -808,10 +811,11 @@ mod tests {
         let dir = temp_dir("empty");
         let fs = StdFsBackend::new(&dir.to_string_lossy());
         let mut dev = CdLiveFsDevice::new(fs, "EMPTY").unwrap();
+        // Empty tree → metadata only (no file area).
         assert_eq!(dev.layout().extents.len(), 0);
-        // READ CAPACITY → max_lba = 21 (metadata only: descriptors + both
-        // path tables + root directory).
-        assert_eq!(dev.max_lba(), 21);
+        // READ CAPACITY → max_lba = 24 (descriptors 16-18, PVD PT-L/M 19-20,
+        // PVD root 21, Joliet PT-L/M 22-23, Joliet root 24).
+        assert_eq!(dev.max_lba(), 24);
     }
 
     #[test]
