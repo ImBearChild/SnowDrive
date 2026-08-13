@@ -334,7 +334,8 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
     assert_eq!(sent.len(), 28 + CSW_LEN);
     assert_eq!(csw_fields(&sent), (7, 192 - 28, 0x00));
 
-    // Out-of-range READ(10) → CHECK CONDITION → Failed CSW.
+    // Out-of-range READ(10) → CHECK CONDITION → ZLP-terminated phase, then
+    // Failed CSW with residue = declared (512 - 0 = 512).
     let cdb = [0x28, 0, 0, 0x1F, 0x40, 0, 0, 0, 1, 0]; // LBA beyond 64 KiB
     let r = run_command(
         &mut s,
@@ -347,7 +348,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
-    assert_eq!(csw_fields(&sent), (8, 0, 0x01)); // Failed
+    assert_eq!(csw_fields(&sent), (8, 512, 0x01)); // Failed
 
     // REQUEST SENSE → LBA OUT OF RANGE; the device clears its sense.
     let cdb = [0x03, 0, 0, 0, 18, 0];
@@ -426,16 +427,19 @@ fn phase_error_on_direction_mismatch() {
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
-    // READ(10) declared with Data-Out direction → Phase Error CSW.
+    // READ(10) declared with Data-Out direction → the host's 512 data-out
+    // bytes are drained, then a Phase Error CSW (residue = declared).
     let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-    let r = run_command(
+    let cbw = raw_cbw(1, 512, 0x00, 0, &cdb);
+    io.feed_out(&cbw);
+    io.feed_out(&vec![0x00; 512]);
+    let r = drive_until_done(
         &mut s,
         &mut io,
         &mut work,
         &mut recv,
         &mut devs,
         &mut stalled,
-        &raw_cbw(1, 512, 0x00, 0, &cdb),
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();

@@ -34,6 +34,12 @@ use crate::usb::{CBW_LEN, CSW_LEN};
 /// Data-Out overrun drain wait (mirrors the PC driver's 50ms ctrl poll).
 const STEP_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// USB bulk endpoint max packet size (high-speed, 512 B). A Data-In phase
+/// that ends on a full-MPS packet is not a short packet, so a shortfall
+/// whose length is a multiple of the MPS — including zero bytes — must be
+/// closed with a zero-length packet before the CSW (BOT §6.7 Case (4)/(5)).
+const BOT_BULK_MPS: u64 = 512;
+
 /// One bulk I/O completion fed from the driver to the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotEvent<'a> {
@@ -135,7 +141,7 @@ enum BotState {
         written: u64,
         tag: u32,
         lun: usize,
-        failed: bool,
+        status: CswStatus,
         chunk: usize,
     },
     /// Data-Out host overrun: read-and-discard until a short packet.
@@ -147,6 +153,10 @@ enum BotState {
     },
     /// CSW pending in the internal buffer.
     Csw,
+    /// CSW pending, but a zero-length packet must terminate the data phase
+    /// first (a shortfall whose length is a multiple of the bulk MPS,
+    /// including zero bytes — see [`finish_data_in`]).
+    CswZlp,
     /// Frozen after an invalid CBW; only `reset()` unfreezes.
     Stalled,
 }
@@ -207,6 +217,7 @@ impl BotSession {
                 probe: true,
             },
             BotState::Csw => BotNeed::NeedIn { len: CSW_LEN },
+            BotState::CswZlp => BotNeed::NeedIn { len: 0 },
             BotState::Stalled => BotNeed::Done(BotStepResult::Stalled),
         }
     }
@@ -254,6 +265,7 @@ impl BotSession {
             BotState::DataOut { .. } => self.poll_data_out(ev, data, devs),
             BotState::DataOutOverrun { .. } => self.poll_overrun(ev),
             BotState::Csw => self.poll_csw(ev),
+            BotState::CswZlp => self.poll_csw_zlp(ev),
         }
     }
 
@@ -384,7 +396,7 @@ impl BotSession {
                 asc::LOGICAL_UNIT_NOT_SUPPORTED,
                 0,
             ));
-            return self.finish_csw_bot(cbw.tag, 0, CswStatus::Failed);
+            return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
         }
 
         // Valid LUN: unit-attention injection (§5.2). The UA is delivered
@@ -392,7 +404,7 @@ impl BotSession {
         if self.pending_ua.is_some() {
             match cdb.first() {
                 Some(&scsi_op::TEST_UNIT_READY) => {
-                    return self.finish_csw_bot(cbw.tag, 0, CswStatus::Failed);
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
                 }
                 Some(&scsi_op::REQUEST_SENSE) => {
                     let sense = self.pending_ua.take().expect("checked above");
@@ -411,18 +423,22 @@ impl BotSession {
             }
         };
         match outcome {
-            CommandOutcome::Status => self.finish_csw_bot(cbw.tag, declared, CswStatus::Passed),
-            CommandOutcome::CheckCondition(_) => self.finish_csw_bot(cbw.tag, 0, CswStatus::Failed),
+            CommandOutcome::Status => self.finish_cmd(cbw, 0, CswStatus::Passed, data.len()),
+            CommandOutcome::CheckCondition(_) => {
+                self.finish_cmd(cbw, 0, CswStatus::Failed, data.len())
+            }
             CommandOutcome::DataIn {
                 transfer_len,
                 byte_offset,
                 immediate,
             } => {
                 if declared == 0 {
-                    return self.finish_csw_bot(cbw.tag, 0, CswStatus::Passed);
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataIn {
-                    return self.finish_csw_bot(cbw.tag, declared, CswStatus::PhaseError);
+                    // The host expects to send `declared` bytes: drain them,
+                    // then a Phase Error CSW (§6.7 Case (10)).
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
                 }
                 // Copy `immediate`'s length out so the reference (and its
                 // borrow of `data`) dies before `data` is reborrowed
@@ -435,7 +451,7 @@ impl BotSession {
                 };
                 let actual = available.min(declared);
                 if actual == 0 {
-                    return self.finish_csw_bot(cbw.tag, declared, CswStatus::Passed);
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 let chunk = (actual as usize).min(data.len());
                 if immediate_len == 0
@@ -443,7 +459,7 @@ impl BotSession {
                         .read_data(byte_offset, &mut data[..chunk])
                         .is_err()
                 {
-                    return self.finish_csw_bot(cbw.tag, declared, CswStatus::Failed);
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
                 }
                 self.state = BotState::DataIn {
                     expected: declared,
@@ -462,21 +478,23 @@ impl BotSession {
                 immediate,
             } => {
                 if declared == 0 {
-                    return self.finish_csw_bot(cbw.tag, 0, CswStatus::Passed);
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataOut {
-                    return self.finish_csw_bot(cbw.tag, declared, CswStatus::PhaseError);
+                    // The host expects Data-In; nothing is sent, so the phase
+                    // ends in a ZLP-terminated short packet (§6.7 Case (7)).
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
                 }
                 // Never write past the command's range: only `transfer_len`
                 // bytes (bounded by the declared phase) are written; the
                 // remainder is received and discarded (§3.8).
                 let to_write = transfer_len.min(declared);
                 let mut written = 0u64;
-                let mut failed = false;
+                let mut status = CswStatus::Passed;
                 if !immediate.is_empty() {
                     let w = (immediate.len() as u64).min(to_write) as usize;
                     if devs[lun].write_data(byte_offset, &immediate[..w]).is_err() {
-                        failed = true;
+                        status = CswStatus::Failed;
                     } else {
                         written = w as u64;
                     }
@@ -490,7 +508,7 @@ impl BotSession {
                     written,
                     tag: cbw.tag,
                     lun,
-                    failed,
+                    status,
                     chunk,
                 };
                 BotStep::NeedOut {
@@ -512,7 +530,7 @@ impl BotSession {
         let declared = u64::from(cbw.data_len);
         let actual = available.min(declared);
         if actual == 0 {
-            return self.finish_csw_bot(cbw.tag, declared, CswStatus::Passed);
+            return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
         }
         let chunk = (actual as usize).min(data.len());
         self.state = BotState::DataIn {
@@ -537,6 +555,82 @@ impl BotSession {
         csw.write(&mut self.csw);
         self.state = BotState::Csw;
         BotStep::NeedIn(&self.csw[..])
+    }
+
+    /// End a Data-In (or no-data) phase with the CSW. If fewer than
+    /// `declared` bytes were produced, the phase must be terminated with a
+    /// short packet before the CSW (BOT §6.7 Case (4)/(5)); a shortfall
+    /// whose length is a multiple of the bulk MPS — including zero bytes —
+    /// cannot close on its own (a full-MPS packet is not a short packet),
+    /// so a zero-length packet is sent first via the [`BotState::CswZlp`]
+    /// state.
+    fn finish_data_in<'a>(
+        &'a mut self,
+        tag: u32,
+        declared: u64,
+        actual: u64,
+        status: CswStatus,
+    ) -> BotStep<'a> {
+        let actual = actual.min(declared);
+        let csw = Csw {
+            tag,
+            residue: (declared - actual) as u32,
+            status,
+        };
+        csw.write(&mut self.csw);
+        if actual < declared && actual.is_multiple_of(BOT_BULK_MPS) {
+            self.state = BotState::CswZlp;
+            BotStep::NeedIn(&[])
+        } else {
+            self.state = BotState::Csw;
+            BotStep::NeedIn(&self.csw[..])
+        }
+    }
+
+    /// End a transaction, first resolving the data phase the CBW declared
+    /// (§6.7). `actual` is the number of Data-In bytes produced. A declared
+    /// Data-Out phase is drained instead of left in the bulk-OUT fifo (the
+    /// host will send `declared` bytes regardless of the outcome).
+    fn finish_cmd<'a>(
+        &'a mut self,
+        cbw: &Cbw,
+        actual: u64,
+        status: CswStatus,
+        data_len: usize,
+    ) -> BotStep<'a> {
+        let declared = u64::from(cbw.data_len);
+        if declared > 0 && cbw.dir == BotDir::DataOut {
+            return self.start_data_out_drain(cbw, status, data_len);
+        }
+        self.finish_data_in(cbw.tag, declared, actual, status)
+    }
+
+    /// Enter a Data-Out phase that writes nothing: receive and discard the
+    /// host's `declared` bytes so the next CBW is not corrupted (§3.8),
+    /// then send the CSW with `status`.
+    fn start_data_out_drain<'a>(
+        &'a mut self,
+        cbw: &Cbw,
+        status: CswStatus,
+        data_len: usize,
+    ) -> BotStep<'a> {
+        let declared = u64::from(cbw.data_len);
+        let chunk = (declared as usize).min(data_len);
+        self.state = BotState::DataOut {
+            declared,
+            to_write: 0,
+            byte_offset: 0,
+            received: 0,
+            written: 0,
+            tag: cbw.tag,
+            lun: cbw.lun as usize,
+            status,
+            chunk,
+        };
+        BotStep::NeedOut {
+            len: chunk,
+            probe: false,
+        }
     }
 
     // ── Data-In phase ───────────────────────────────────────────────
@@ -564,16 +658,14 @@ impl BotSession {
             BotEvent::InSent => {
                 if sent >= transfer_len {
                     // Whole transfer sent: short/full packet + residue.
-                    let residue = expected - transfer_len;
-                    return self.finish_csw_bot(tag, residue, CswStatus::Passed);
+                    return self.finish_data_in(tag, expected, transfer_len, CswStatus::Passed);
                 }
                 let next = ((transfer_len - sent) as usize).min(data.len());
                 if devs[lun]
                     .read_data(byte_offset + sent, &mut data[..next])
                     .is_err()
                 {
-                    let residue = expected - sent;
-                    return self.finish_csw_bot(tag, residue, CswStatus::Failed);
+                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed);
                 }
                 self.state = BotState::DataIn {
                     expected,
@@ -610,7 +702,7 @@ impl BotSession {
             written,
             tag,
             lun,
-            failed,
+            status,
             chunk,
         } = st
         else {
@@ -619,8 +711,8 @@ impl BotSession {
         match ev {
             BotEvent::OutRecv { data: recv } => {
                 let mut written = written;
-                let mut failed = failed;
-                if !failed && written < to_write {
+                let mut status = status;
+                if status == CswStatus::Passed && written < to_write {
                     let w = (recv.len() as u64).min(to_write - written) as usize;
                     if w > 0 {
                         if devs[lun]
@@ -629,18 +721,13 @@ impl BotSession {
                         {
                             written += w as u64;
                         } else {
-                            failed = true;
+                            status = CswStatus::Failed;
                         }
                     }
                 }
                 let received = received + recv.len() as u64;
                 if received >= declared {
                     let residue = declared - written;
-                    let status = if failed {
-                        CswStatus::Failed
-                    } else {
-                        CswStatus::Passed
-                    };
                     if received > declared {
                         // Overshoot already consumed the excess: straight to CSW.
                         return self.finish_csw_bot(tag, residue, status);
@@ -667,7 +754,7 @@ impl BotSession {
                     written,
                     tag,
                     lun,
-                    failed,
+                    status,
                     chunk: next,
                 };
                 BotStep::NeedOut {
@@ -731,6 +818,18 @@ impl BotSession {
                 BotStep::Done(BotStepResult::Processed)
             }
             BotEvent::OutRecv { .. } | BotEvent::OutIdle => BotStep::NeedIn(&self.csw[..]),
+        }
+    }
+
+    /// The zero-length packet that terminates a short Data-In phase has been
+    /// sent; the CSW follows.
+    fn poll_csw_zlp<'a>(&'a mut self, ev: BotEvent<'_>) -> BotStep<'a> {
+        match ev {
+            BotEvent::InSent => {
+                self.state = BotState::Csw;
+                BotStep::NeedIn(&self.csw[..])
+            }
+            BotEvent::OutRecv { .. } | BotEvent::OutIdle => BotStep::NeedIn(&[]),
         }
     }
 }
@@ -1062,10 +1161,25 @@ mod tests {
         let mut s = BotSession::new();
         let mut data = work();
 
-        // READ(10) declared with Data-Out direction → Phase Error CSW.
+        // READ(10) declared with Data-Out direction → the host will send
+        // the declared bytes, so they are drained, then a Phase Error CSW.
         let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x4444, 512, 0x00, 0, &cdb);
         let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+        let payload = vec![0u8; 512];
+        let step = s.poll(BotEvent::OutRecv { data: &payload }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedOut { probe: true, .. } => {}
+            other => panic!("expected overrun probe, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::OutIdle, &mut data, &mut devs);
         match step {
             BotStep::NeedIn(_) => {}
             other => panic!("expected CSW, got {other:?}"),
@@ -1073,6 +1187,125 @@ mod tests {
         let (_, residue, status) = read_csw(&mut s, &mut data);
         assert_eq!(residue, 512);
         assert_eq!(status, 0x02); // Phase Error
+    }
+
+    #[test]
+    fn zero_data_data_in_sends_zlp_then_csw() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // READ(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
+        // declared a 512-byte Data-In phase. The zero-byte phase must be
+        // closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)).
+        let cdb = [0x28, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x20, 512, 0x80, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert!(bytes.is_empty());
+                assert_eq!(s.need(), BotNeed::NeedIn { len: 0 });
+            }
+            other => panic!("expected empty ZLP need, got {other:?}"),
+        }
+        // ZLP sent → CSW pending (Failed, residue = declared = 512).
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 0x20);
+        assert_eq!(residue, 512);
+        assert_eq!(status, 0x01); // Failed
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+    }
+
+    #[test]
+    fn mps_multiple_shortfall_sends_zlp_then_csw() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // READ(10) count 1 → 512 data bytes (one full-MPS packet), while
+        // the CBW declared 1024. The total ends on a full-MPS packet, which
+        // is not a short packet, so a ZLP must terminate the phase.
+        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x21, 1024, 0x80, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+            other => panic!("expected 512-byte chunk, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert!(bytes.is_empty());
+                assert_eq!(s.need(), BotNeed::NeedIn { len: 0 });
+            }
+            other => panic!("expected empty ZLP need, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 0x21);
+        assert_eq!(residue, 1024 - 512);
+        assert_eq!(status, 0x00); // Passed
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+    }
+
+    #[test]
+    fn failed_data_out_drains_declared_then_csw() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // WRITE(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
+        // declared a 512-byte Data-Out phase the host will still send. The
+        // bytes must be drained so they cannot corrupt the next CBW.
+        let cdb = [0x2A, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x22, 512, 0x00, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+
+        // The host's data-out arrives and is discarded (nothing written).
+        let payload = vec![0xAA; 512];
+        let step = s.poll(BotEvent::OutRecv { data: &payload }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedOut { probe: true, .. } => {}
+            other => panic!("expected overrun probe, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::OutIdle, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 0x22);
+        assert_eq!(residue, 512); // nothing written
+        assert_eq!(status, 0x01); // Failed
+                                  // The backend was not written.
+        let mut check = [0u8; 512];
+        devs[0].read_data(0, &mut check).unwrap();
+        assert!(check.iter().all(|&b| b == 0));
     }
 
     #[test]
