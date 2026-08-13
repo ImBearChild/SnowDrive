@@ -53,7 +53,8 @@ snowdrive/
 │   │   ├── scsi/         # feature "scsi": SCSI core, block/cdblock, spc/sbc
 │   │   ├── cdrom/        # feature "cdrom": CD-ROM device emulation (flat/live, full MMC)
 │   │   ├── iscsi/        # feature "iscsi": PDU codec, Conn, target, transport
-│   │   └── iso9660/      # feature "iso9660": ISO9660/Joliet live-generation
+│   │   ├── iso9660/      # feature "iso9660": ISO9660/Joliet live-generation
+│   │   └── usb/          # feature "usb": USB MSC Bulk-Only Transport core (CBW/CSW, BotSession)
 │   ├── tests/smoke.rs    # process-level CLI smoke tests (CARGO_BIN_EXE_snowdrive)
 │   ├── build.rs          # cbindgen (feature "capi")
 │   └── cbindgen.toml
@@ -69,8 +70,9 @@ snowdrive/
 | `snowdrive::cdrom` | Done — flat (`CdromDevice`) + live (`CdLiveFsDevice`) CD-ROM, full MMC surface (README TOC, GET CONFIGURATION, READ BUFFER CAPACITY, …) |
 | `snowdrive::iscsi` | Done — PDU codec, Conn trait, Session state machine, BSD transport |
 | `snowdrive::iso9660` | Done — live ISO9660/Joliet generation algorithms (`live.rs`) |
+| `snowdrive::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW codec), `io.rs` (`BotIo` + `recv_exact`), `gadget.rs` (`Gadget` + `CtrlReq`), `target.rs` (non-blocking `BotSession::poll` state machine) |
 | `snowdrive::capi` | Postponed — C ABI (`feature = "capi"` declared, no exports yet) |
-| `snowdrive` bin | Done — `src/main.rs` (lib + CLI in one crate); `serve` subcommand (--block / --cdblock / --iscsi) + `mkisofs` subcommand (directory → ISO image) |
+| `snowdrive` bin | Done — `src/main.rs` (lib + CLI in one crate); `serve` subcommand (`--disk`/`--cdrom` device planes + `--iscsi` / `--usb` transports, mutually exclusive) + `mkisofs` subcommand (directory → ISO image) |
 | `snow9660` | Removed — folded into the `snowdrive` CLI as `mkisofs` (the lib generates ISOs, it does not parse them) |
 
 ## Legacy C Code
@@ -90,6 +92,10 @@ git checkout legacy
 - **no_std verification**: `cargo build -p snowdrive --no-default-features`
 - **Transport layer**: `Conn` trait = blanket impl of `embedded_io::Read + Write`.
   BSD transport (`TcpStream`) behind `std` feature in `snowdrive::iscsi`.
+  USB MSC transport: `BotIo`/`Gadget` seams in `snowdrive::usb` — the
+  non-blocking `BotSession` core never does platform I/O; the Linux FunctionFS
+  bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives only in the bin under
+  `cfg(target_os = "linux")`.
 - **C ABI**: postponed. When resumed, `snowdrive::capi` (`feature = "capi"`)
   wraps the borrow-based core with `OpaqueHandle` + C-style mirror API;
   `cbindgen` generates `snowdrive.h` via build.rs.

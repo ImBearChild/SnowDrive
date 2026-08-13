@@ -12,7 +12,8 @@ SCSI device emulation toolkit — unified Rust lib crate + one binary.
 | — `cdrom` | `snowdrive/src/cdrom/` | CD-ROM device emulation — flat (`CdromDevice`) / live (`CdLiveFsDevice`), full MMC |
 | — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
-| **snowdrive bin** | `snowdrive/src/main.rs` | Binary — `snowdrive serve` starts the iSCSI target; `snowdrive mkisofs` generates an ISO image from a directory |
+| — `usb` | `snowdrive/src/usb/` | USB Mass Storage Bulk-Only Transport core — CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
+| **snowdrive bin** | `snowdrive/src/main.rs` | Binary — `snowdrive serve` starts the iSCSI target or the USB MSC (BOT) gadget; `snowdrive mkisofs` generates an ISO image from a directory |
 | **snowdrive smoke** | `snowdrive/tests/smoke.rs` | Process-level CLI smoke tests (`CARGO_BIN_EXE_snowdrive`) |
 | **snowdrive-tests** | `tests/` | Integration tests crate (MockConn folded in + libiscsi whitebox) |
 
@@ -22,13 +23,14 @@ snowdrive/
 ├── Cargo.lock
 ├── snowdrive/            # unified lib crate + CLI (feature-gated modules)
 │   ├── src/
-│   │   ├── lib.rs        # common, scsi, cdrom, iscsi, iso9660 (feature-gated)
-│   │   ├── main.rs       # CLI: serve (iSCSI target) + mkisofs (ISO generator)
+│   │   ├── lib.rs        # common, scsi, cdrom, iscsi, iso9660, usb (feature-gated)
+│   │   ├── main.rs       # CLI: serve (iSCSI target / USB gadget) + mkisofs (ISO generator)
 │   │   ├── common/       # BlockStorage / FsStorage seams + logging macros
 │   │   ├── scsi/         # SCSI core, block/cdblock devices, spc/sbc, backends
 │   │   ├── cdrom/        # CD-ROM device emulation (flat / live, full MMC)
 │   │   ├── iscsi/        # PDU codec, Conn, target, transport
-│   │   └── iso9660/      # ISO9660/Joliet live-generation algorithms
+│   │   ├── iso9660/      # ISO9660/Joliet live-generation algorithms
+│   │   └── usb/          # USB MSC Bulk-Only Transport core (CBW/CSW, BotSession)
 │   ├── tests/smoke.rs    # process-level CLI smoke tests
 ├── tests/                # integration tests crate (mock + libiscsi whitebox)
 └── HACKING.md
@@ -42,12 +44,16 @@ snowdrive-tests         ┘
 ```
 
 Feature map (`snowdrive/Cargo.toml`): `std`, `scsi`, `iscsi` (→ `scsi`),
-`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `cli`
-(→ `std`+all core features+std-only deps), `capi`, `log` / `defmt`. The
-lib's default is `["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs",
-"cli"]`; the `snowdrive` bin (`src/main.rs`) builds only with
-`required-features = ["cli"]`, so `--no-default-features` skips the CLI
-entirely and the lib stays `no_std`-clean.
+`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `usb`
+(→ `scsi`), `cli` (→ `std`+all core features+std-only deps), `capi`,
+`log` / `defmt`. The lib's default is `["std", "scsi", "iscsi",
+"iso9660", "cdrom", "livefs", "cli"]`; the `snowdrive` bin
+(`src/main.rs`) builds only with `required-features = ["cli"]`, so
+`--no-default-features` skips the CLI entirely and the lib stays
+`no_std`-clean. The `serve --usb` FunctionFS bridge pulls in the
+Linux-only `usb-gadget` (`>= 1.1`) and `bytes` crates via
+`[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on
+other targets.
 
 ## Commit Messages
 
@@ -119,6 +125,15 @@ standard-library Python (no pytest dependency):
   (`iscsiadm` + `iscsi_tcp`) logs into `snowdrive serve`, formats the RAM
   disk with ext4, mounts it, writes/reads through the real block layer and
   fsck-checks it. Skipped unless root and the module/daemon are available.
+- `tools/ext-test/test_usb_loopback.py` — a real kernel `usb-storage`
+  initiator attaches to `snowdrive serve --usb` through a `dummy_hcd`
+  UDC (FunctionFS gadget) and exercises the same §8.3 checklist
+  (capacity, `dd`/`badblocks` roundtrip, ext4 format/mount/write/fsck,
+  read-only backend write protection) via `/dev/sdX`. Skipped unless root,
+  a `dummy_udc.0` UDC and writable configfs are present; auto-loads
+  `dummy_hcd` + `libcomposite` and auto-mounts configfs. The runtime must
+  allow Linux native aio (a seccomp/container ban surfaces as a failed
+  first bulk transfer).
 
 ```bash
 # Fast, no privileges needed (ISO cross-validation)
@@ -127,8 +142,9 @@ python3 tools/ext-test/run.py
 # A single file / test
 python3 tools/ext-test/test_iso.py
 
-# Kernel loopback test (needs root + open-iscsi)
+# Kernel loopback tests (need root)
 sudo -E env PATH=$PATH python3 tools/ext-test/test_iscsi_loopback.py
+sudo -E env PATH=$PATH python3 tools/ext-test/test_usb_loopback.py
 
 # Point at a specific binary (default: target/release or target/debug)
 SNOWDRIVE_BIN=./target/debug/snowdrive python3 tools/ext-test/run.py
