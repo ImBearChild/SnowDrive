@@ -6,10 +6,12 @@
 //! INQUIRY / MODE SENSE / REQUEST SENSE / GET CONFIGURATION common
 //! features to a single code path via field embedding (composition).
 //!
-//! MMC-specific commands (READ TOC, GET CONFIGURATION, READ DISC
-//! INFORMATION, …) are **not** handled here — each device type has its
-//! own `execute_mmc_*` function for those.  Only the SPC fall-through
-//! commands live in this module.
+//! Per plan §5.3, only the *synthesis* of MMC responses is shared here:
+//! [`build_get_config_response`] and [`build_read_disc_info`] lay out the
+//! bytes for the MMC field structure, taking the device's state as
+//! parameters.  The per-device command dispatch (which state it feeds,
+//! whether a command is supported) stays in each device's own
+//! `execute_mmc_*` — device state never enters this module.
 
 use crate::scsi::device::{CommandOutcome, DeviceType};
 use crate::scsi::scsi::Sense;
@@ -306,6 +308,65 @@ pub fn build_get_config_response<'a>(
     }
 }
 
+/// Disc state parameters for the Standard Disc Information response
+/// (MMC-6 §6.21.3.1). Each device feeds its own state — this struct only
+/// transports values, it never reads device state (plan §5.3).
+pub struct DiscInfo {
+    /// Disc Status (MMC-6 Table 367): 0=empty, 1=incomplete, 2=finalized.
+    pub disc_status: u8,
+    /// State of Last Session (MMC-6 Table 366): 0=empty, 1=incomplete,
+    /// 3=complete. Valid for `disc_status` = 2/3.
+    pub state_of_last_session: u8,
+    /// Erasable bit (byte 2 bit 3): set for CD-RW media.
+    pub erasable: bool,
+    /// Number of sessions (byte 4/9).
+    pub sessions: u8,
+    /// First / last track number in the last session (bytes 5-6/10-11).
+    pub first_track: u8,
+    pub last_track: u8,
+    /// Disc Type (MMC-6 Table 369): 0x00=CD-DA/CD-ROM, 0x20=CD-ROM XA.
+    pub disc_type: u8,
+    /// Last Possible Lead-out Start Address (bytes 20-23, LBA).
+    pub lead_out_lba: u32,
+}
+
+/// Build the Standard Disc Information response (MMC-6 §6.21.3.1) into
+/// `data`, bounded by `alloc`. Returns a Data-In outcome carrying the
+/// synthesized bytes (`immediate`). An `alloc` of zero is not an error and
+/// yields an empty data phase (MMC-6 §6.21.2.2).
+pub fn build_read_disc_info<'a>(
+    data: &'a mut [u8],
+    alloc: u16,
+    info: &DiscInfo,
+) -> CommandOutcome<'a> {
+    // Standard block: Disc Information Length = 0x32 (+8×OPC tables, none).
+    let mut buf = [0u8; 52];
+    buf[0] = 0x32;
+    // Byte 2: Data Type 000b | State of last Session | Erasable | Disc
+    // Status (bits 7:6 | 5:4 | 3 | 1:0).
+    let state = (info.state_of_last_session & 0b11) << 4;
+    let erasable = u8::from(info.erasable) << 3;
+    buf[2] = state | erasable | (info.disc_status & 0b11);
+    buf[3] = info.first_track;
+    buf[4] = info.sessions;
+    buf[5] = info.first_track;
+    buf[6] = info.last_track;
+    // Byte 7: DID_V/DBC_V/URU/DAC_V reserved, BG Format Status 00b.
+    buf[8] = info.disc_type;
+    // Bytes 9-11: MSB halves of sessions / first / last track (all 0).
+    // Bytes 12-19: Disc Identification, Last Session Lead-in Start (0).
+    buf[20..24].copy_from_slice(&info.lead_out_lba.to_be_bytes());
+    // Bytes 24-51: Disc Bar Code, Disc Application Code, OPC tables (0).
+
+    let n = buf.len().min(alloc as usize).min(data.len());
+    data[..n].copy_from_slice(&buf[..n]);
+    CommandOutcome::DataIn {
+        transfer_len: n as u64,
+        byte_offset: 0,
+        immediate: &data[0..n],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +575,75 @@ mod tests {
         let n = data_in(outcome, &mut buf);
         assert_eq!(n, 8); // only header fits
         assert_eq!(buf[7], 0x08); // CD-ROM profile still set
+    }
+
+    // ── READ DISC INFORMATION ───────────────────────────────────────
+
+    fn finalized_disc_info(lead_out_lba: u32) -> DiscInfo {
+        DiscInfo {
+            disc_status: 2,           // finalized
+            state_of_last_session: 3, // complete
+            erasable: false,
+            sessions: 1,
+            first_track: 1,
+            last_track: 1,
+            disc_type: 0x20, // CD-ROM XA
+            lead_out_lba,
+        }
+    }
+
+    #[test]
+    fn disc_info_finalized_cd_rom_layout() {
+        let mut w = work();
+        let info = finalized_disc_info(0x10EA);
+        let mut buf = [0u8; 52];
+        let n = data_in(build_read_disc_info(&mut w, 52, &info), &mut buf);
+        assert_eq!(n, 52);
+        assert_eq!(buf[0], 0x32); // Disc Information Length (excludes itself)
+        assert_eq!(buf[1], 0x00);
+        // Byte 2: Data Type 00b | State of last Session 11b | Erasable 0 |
+        // Disc Status 10b = 0b00110010.
+        assert_eq!(buf[2], 0x32);
+        assert_eq!(buf[3], 1); // first track
+        assert_eq!(buf[4], 1); // sessions LSB
+        assert_eq!(buf[5], 1); // first track in last session
+        assert_eq!(buf[6], 1); // last track in last session
+        assert_eq!(buf[8], 0x20); // disc type: CD-ROM XA
+        assert_eq!(&buf[20..24], &0x10EAu32.to_be_bytes()); // lead-out
+                                                            // All other fields (bar code, application code, OPC) are zero.
+        assert!(buf[24..52].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn disc_info_alloc_clamps_response() {
+        let mut w = work();
+        let info = finalized_disc_info(100);
+        // Small alloc (sr probe reads 2 bytes first).
+        let mut buf = [0u8; 2];
+        let n = data_in(build_read_disc_info(&mut w, 2, &info), &mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf, [0x32, 0x00]);
+        // Zero alloc is not an error → empty data phase.
+        let outcome = build_read_disc_info(&mut w, 0, &info);
+        match outcome {
+            CommandOutcome::DataIn { transfer_len, .. } => assert_eq!(transfer_len, 0),
+            other => panic!("expected DataIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disc_info_cdrw_sets_erasable() {
+        let mut w = work();
+        let mut info = finalized_disc_info(0);
+        info.erasable = true;
+        info.disc_status = 1; // appendable
+        info.state_of_last_session = 1; // incomplete
+        let mut buf = [0u8; 52];
+        let n = data_in(build_read_disc_info(&mut w, 52, &info), &mut buf);
+        assert_eq!(n, 52);
+        // Byte 2: 00 (type) | 01 (incomplete session) | 1 (erasable) |
+        // 01 (incomplete disc) = 0b00011001.
+        assert_eq!(buf[2], 0x19);
     }
 
     // ── Profile selection ───────────────────────────────────────────

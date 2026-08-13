@@ -8,8 +8,8 @@
 //! Write commands return DATA PROTECT (read-only device).
 
 use crate::cdrom::common::{
-    build_get_config_response, cdrom_mode_page, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY,
-    SECTOR_SIZE,
+    build_get_config_response, build_read_disc_info, cdrom_mode_page, CdromDeviceCommon,
+    CurrentProfile, DiscInfo, CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::scsi::backend::{BlockStorage, BlockStorageError};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
@@ -158,6 +158,9 @@ impl<B: BlockStorage> CdromDevice<B> {
 
                 // GET CONFIGURATION (0x46)
                 op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
+
+                // READ DISC INFORMATION (0x51)
+                op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
 
                 // WRITE commands → DATA PROTECT (read-only)
                 op::WRITE_6
@@ -316,6 +319,27 @@ impl<B: BlockStorage> CdromDevice<B> {
             byte_offset: 0,
             immediate: &data[0..n],
         }
+    }
+
+    /// READ DISC INFORMATION (0x51) — a finalized, single-session data
+    /// disc. Only Standard Disc Information (Data Type 000b) is supported;
+    /// the bytes are laid out by the shared [`build_read_disc_info`].
+    fn read_disc_info_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+        if cdb[1] & 0x07 != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+        let info = DiscInfo {
+            disc_status: 2,           // finalized
+            state_of_last_session: 3, // complete
+            erasable: false,
+            sessions: 1,
+            first_track: 1,
+            last_track: 1,
+            disc_type: 0x20, // CD-ROM XA
+            lead_out_lba: self.lead_out_lba(),
+        };
+        build_read_disc_info(data, alloc, &info)
     }
 
     fn toc_address(&self, lba: u32, msf: bool) -> [u8; 4] {
@@ -650,6 +674,58 @@ mod tests {
         cdb[6] = 0x01;
         cdb[7] = 0x00;
         cdb[8] = 0x40;
+        assert_eq!(
+            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD)
+        );
+    }
+
+    // ── READ DISC INFORMATION ───────────────────────────────────────
+
+    #[test]
+    fn read_disc_information_finalized_cdrom() {
+        let mut img = ram_image(2048 * 100, 0);
+        let b = RamBackend::new(&mut img);
+        let mut dev = CdromDevice::new(b);
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[7] = 0x00;
+        cdb[8] = 52;
+        let mut buf = [0u8; 52];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 52);
+        assert_eq!(buf[0], 0x32); // length
+        assert_eq!(buf[2], 0x32); // finalized, complete session, data CD
+        assert_eq!(buf[3], 1); // first track
+        assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
+                                  // 100 sectors → lead-out LBA 100 (0x00000064).
+        assert_eq!(&buf[20..24], &100u32.to_be_bytes());
+    }
+
+    #[test]
+    fn read_disc_information_small_alloc_and_unsupported_data_type() {
+        let mut img = ram_image(2048 * 100, 0);
+        let b = RamBackend::new(&mut img);
+        let mut dev = CdromDevice::new(b);
+        let mut w = work();
+
+        // sr-style 2-byte probe: only the length field is returned.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[7] = 0x00;
+        cdb[8] = 2;
+        let mut buf = [0u8; 2];
+        let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf, [0x32, 0x00]);
+
+        // Track Resources / POW / reserved Data Types → INVALID FIELD.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[1] = 0x01; // Data Type 001b (Track Resources)
+        cdb[7] = 0x00;
+        cdb[8] = 16;
         assert_eq!(
             check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
             (SenseKey::IllegalRequest, asc::INVALID_FIELD)

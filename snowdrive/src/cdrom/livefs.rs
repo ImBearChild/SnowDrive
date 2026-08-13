@@ -12,7 +12,8 @@
 use heapless::Vec;
 
 use crate::cdrom::common::{
-    build_get_config_response, cdrom_mode_page, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY,
+    build_get_config_response, build_read_disc_info, cdrom_mode_page, CdromDeviceCommon,
+    CurrentProfile, DiscInfo, CDROM_IDENTITY,
 };
 use crate::common::fs_storage::{DirEntry, FileHandle, FsError, FsStorage, OpenOptions};
 use crate::iso9660::live::{
@@ -316,6 +317,9 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
                 // GET CONFIGURATION (0x46)
                 op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
 
+                // READ DISC INFORMATION (0x51)
+                op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
+
                 // WRITE commands → DATA PROTECT (read-only)
                 op::WRITE_6
                 | op::WRITE_10
@@ -463,6 +467,27 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             byte_offset: 0,
             immediate: &data[0..n],
         }
+    }
+
+    /// READ DISC INFORMATION (0x51) — a finalized, single-session data
+    /// disc. Only Standard Disc Information (Data Type 000b) is supported;
+    /// the bytes are laid out by the shared [`build_read_disc_info`].
+    fn read_disc_info_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+        if cdb[1] & 0x07 != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+        let info = DiscInfo {
+            disc_status: 2,           // finalized
+            state_of_last_session: 3, // complete
+            erasable: false,
+            sessions: 1,
+            first_track: 1,
+            last_track: 1,
+            disc_type: 0x20, // CD-ROM XA
+            lead_out_lba: self.lead_out_lba(),
+        };
+        build_read_disc_info(data, alloc, &info)
     }
 
     fn toc_address(&self, lba: u32, msf: bool) -> [u8; 4] {
@@ -804,6 +829,38 @@ mod tests {
         assert_eq!(out[5], 0x14); // track 1 descriptor
         assert_eq!(out[6], 0x01);
         assert_eq!(&out[8..12], &[0u8; 4]); // track 1 start = LBA 0
+    }
+
+    #[test]
+    fn read_disc_information_finalized_livefs() {
+        let (_dir, fs) = sample_tree();
+        let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[8] = 52;
+        let mut buf = [0u8; 52];
+        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
+        assert_eq!(n, 52);
+        assert_eq!(buf[0], 0x32); // length
+        assert_eq!(buf[2], 0x32); // finalized, complete session, data CD
+        assert_eq!(buf[3], 1); // first track
+        assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
+                                  // Lead-out = layout total (31 sectors for the sample tree).
+        assert_eq!(&buf[20..24], &31u32.to_be_bytes());
+
+        // Unsupported Data Type → INVALID FIELD.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[1] = 0x02; // Data Type 010b (POW Resources)
+        cdb[8] = 16;
+        match dev.do_cmd(&cdb, &mut w, 0).unwrap() {
+            CommandOutcome::CheckCondition(s) => {
+                assert_eq!(s.key, SenseKey::IllegalRequest);
+                assert_eq!(s.asc, asc::INVALID_FIELD);
+            }
+            other => panic!("expected CheckCondition, got {other:?}"),
+        }
     }
 
     #[test]
