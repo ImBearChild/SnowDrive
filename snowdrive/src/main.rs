@@ -72,6 +72,17 @@ const ISO_SECTOR_SIZE: u32 = 2048;
 #[cfg(target_os = "linux")]
 const BOT_POLL_GRANULARITY: Duration = Duration::from_millis(50);
 
+/// USB bulk endpoint maximum packet size (high-speed). FunctionFS aio reads
+/// require an MPS-multiple buffer (§6.2 / §1.4).
+#[cfg(target_os = "linux")]
+const USB_MPS: usize = 512;
+
+/// Round `n` up to the next multiple of the USB bulk MPS (minimum one MPS).
+#[cfg(target_os = "linux")]
+fn round_up_mps(n: usize) -> usize {
+    (n + USB_MPS - 1) & !(USB_MPS - 1)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "snowdrive",
@@ -510,7 +521,7 @@ fn run_serve_usb(args: &ServeArgs, devices: &mut [Device<'_>], work_size: usize)
     let mut ffs_gadget = FfsGadget { custom };
     let mut session = BotSession::with_luns(devices.len());
     let mut work = vec![0u8; work_size];
-    let mut recv = vec![0u8; work_size];
+    let mut recv = vec![0u8; round_up_mps(work_size)];
 
     log::info!("serving {} LUN(s) over USB", devices.len());
     if let Err(e) = serve_bot(
@@ -557,43 +568,80 @@ fn select_udc(name: Option<&str>) -> Result<Udc, String> {
 struct FfsBot {
     out: EndpointReceiver,
     in_: EndpointSender,
+    /// Marker for the single read currently in flight on the aio receive
+    /// queue. FunctionFS fills reads in queue order, so a mix of stale /
+    /// leftover buffers of different sizes (accumulated by enqueue-on-timeout
+    /// polling) corrupts the chunked data phase: reads complete out of sync
+    /// with the core's byte accounting and the transfer stalls. Keeping at
+    /// most one read in flight and re-enqueuing only after a completion
+    /// avoids that entirely.
+    pending: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl FfsBot {
     fn new(out: EndpointReceiver, in_: EndpointSender) -> Self {
-        Self { out, in_ }
+        Self {
+            out,
+            in_,
+            pending: false,
+        }
+    }
+
+    /// Enqueue one read of `size` bytes (rounded up to the USB MPS) unless a
+    /// read is already in flight.
+    fn ensure_read(&mut self, size: usize) -> Result<(), BotIoErr> {
+        if self.pending {
+            return Ok(());
+        }
+        let size = round_up_mps(size.max(1));
+        self.out
+            .try_recv(bytes::BytesMut::zeroed(size))
+            .map_err(|e| {
+                log::error!("aio read enqueue failed: {e} (buf.len={size})");
+                BotIoErr::Io
+            })?;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// Receive into `buf`: wait for the in-flight read (`None` timeout blocks,
+    /// `Some(t)` waits up to `t`), then copy the received bytes out.
+    fn recv_impl(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, BotIoErr> {
+        self.ensure_read(buf.len())?;
+        let d = match timeout {
+            Some(t) => match self.out.fetch_timeout(t) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Err(BotIoErr::WouldBlock),
+                Err(e) => {
+                    log::error!("aio fetch failed: {e} (buf.len={})", buf.len());
+                    return Err(BotIoErr::Io);
+                }
+            },
+            None => match self.out.fetch() {
+                Ok(Some(d)) => d,
+                Ok(None) => return Err(BotIoErr::WouldBlock),
+                Err(e) => {
+                    log::error!("aio fetch failed: {e} (buf.len={})", buf.len());
+                    return Err(BotIoErr::Io);
+                }
+            },
+        };
+        self.pending = false;
+        let n = d.len().min(buf.len());
+        buf[..n].copy_from_slice(&d[..n]);
+        Ok(n)
     }
 }
 
 #[cfg(target_os = "linux")]
 impl BotIo for FfsBot {
     fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
-        let d = self
-            .out
-            .recv_timeout(bytes::BytesMut::zeroed(buf.len()), Duration::ZERO)
-            .map_err(|_| BotIoErr::Io)?
-            .ok_or(BotIoErr::WouldBlock)?;
-        let n = d.len();
-        buf[..n].copy_from_slice(&d);
-        Ok(n)
+        self.recv_impl(buf, Some(Duration::ZERO))
     }
 
     fn recv_out(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, BotIoErr> {
-        let d = match timeout {
-            Some(t) => self
-                .out
-                .recv_timeout(bytes::BytesMut::zeroed(buf.len()), t)
-                .map_err(|_| BotIoErr::Io)?
-                .ok_or(BotIoErr::WouldBlock)?,
-            None => self
-                .out
-                .recv_and_fetch(bytes::BytesMut::zeroed(buf.len()))
-                .map_err(|_| BotIoErr::Io)?,
-        };
-        let n = d.len();
-        buf[..n].copy_from_slice(&d);
-        Ok(n)
+        self.recv_impl(buf, timeout)
     }
 
     fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
@@ -742,7 +790,11 @@ fn serve_bot(
                 } else {
                     BOT_POLL_GRANULARITY
                 };
-                match ffs_bot.recv_out(&mut recv[..len], Some(timeout)) {
+                // FunctionFS aio reads need an MPS-multiple buffer: a smaller
+                // one (e.g. the 31-byte CBW request) overflows when the host
+                // sends a full MPS packet (-EOVERFLOW).
+                let aio_len = round_up_mps(len);
+                match ffs_bot.recv_out(&mut recv[..aio_len], Some(timeout)) {
                     Ok(n) => {
                         let step = session.poll(BotEvent::OutRecv { data: &recv[..n] }, work, devs);
                         if let BotStep::Done(r) = step {
