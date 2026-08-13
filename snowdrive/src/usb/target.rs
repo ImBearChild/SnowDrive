@@ -759,3 +759,663 @@ fn write_report_luns(data: &mut [u8], num_luns: usize) -> usize {
     }
     n
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scsi::backend::{BlockBackend, RamBackend};
+    use crate::scsi::block::BlockDevice;
+    use crate::usb::{BotIoErr, CBW_SIGNATURE};
+    use core::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// A 64 KiB block device over stack-owned RAM.
+    fn test_dev(ram: &mut [u8]) -> BlockDevice<BlockBackend<'_>> {
+        BlockDevice::new(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap()
+    }
+
+    fn work() -> [u8; crate::MIN_DATA_LEN] {
+        [0u8; crate::MIN_DATA_LEN]
+    }
+
+    /// Build a raw 31-byte CBW from its logical fields (little endian).
+    fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
+        let mut raw = [0u8; CBW_LEN];
+        raw[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
+        raw[4..8].copy_from_slice(&tag.to_le_bytes());
+        raw[8..12].copy_from_slice(&data_len.to_le_bytes());
+        raw[12] = flags;
+        raw[13] = lun;
+        raw[14] = cdb.len() as u8;
+        raw[15..15 + cdb.len().min(16)].copy_from_slice(&cdb[..cdb.len().min(16)]);
+        raw
+    }
+
+    /// Read the pending CSW from the session's internal buffer.
+    fn read_csw(s: &mut BotSession, data: &mut [u8]) -> (u32, u32, u8) {
+        let csw = s.out_slice(&data[..]);
+        assert_eq!(csw.len(), CSW_LEN);
+        assert_eq!(&csw[0..4], b"USBS");
+        (
+            u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]),
+            u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]),
+            csw[12],
+        )
+    }
+
+    fn inquiry_cdb(alloc: u8) -> [u8; 6] {
+        let mut cdb = [0u8; 6];
+        cdb[0] = scsi_op::INQUIRY;
+        cdb[4] = alloc;
+        cdb
+    }
+
+    #[test]
+    fn need_starts_in_command_phase() {
+        let s = BotSession::new();
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 31,
+                probe: false
+            }
+        );
+        assert_eq!(s.max_lun(), 0);
+    }
+
+    #[test]
+    fn with_luns_sets_max_lun() {
+        assert_eq!(BotSession::with_luns(1).max_lun(), 0);
+        assert_eq!(BotSession::with_luns(3).max_lun(), 2);
+        assert_eq!(BotSession::with_luns(17).max_lun(), 15);
+    }
+
+    #[test]
+    fn cbw_accumulates_across_partial_receives() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        let raw = raw_cbw(1, 96, 0x80, 0, &inquiry_cdb(96));
+        let step = s.poll(BotEvent::OutRecv { data: &raw[..20] }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 11,
+                probe: false
+            }
+        );
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 11,
+                probe: false
+            }
+        );
+
+        let step = s.poll(BotEvent::OutRecv { data: &raw[20..] }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected NeedIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inquiry_roundtrip_with_csw() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        let raw = raw_cbw(0xAAAA_AAAA, 96, 0x80, 0, &inquiry_cdb(96));
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 95);
+                assert_eq!(bytes[0] & 0x1F, 0x00); // PDT = direct-access block
+            }
+            other => panic!("expected NeedIn with INQUIRY data, got {other:?}"),
+        }
+        assert_eq!(s.need(), BotNeed::NeedIn { len: 95 });
+
+        // Data sent → CSW pending (tag echo, Passed; residue 1: host
+        // declared 96 but the INQUIRY response is 95 bytes).
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 0xAAAA_AAAA);
+        assert_eq!(residue, 1);
+        assert_eq!(status, 0x00);
+
+        // CSW sent → back to Command.
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        assert_eq!(step, BotStep::Done(BotStepResult::Processed));
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 31,
+                probe: false
+            }
+        );
+    }
+
+    #[test]
+    fn read_10_chunks_across_work_buffer() {
+        let mut ram = vec![0u8; 64 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // READ(10) LBA 0, 20 blocks → 10240 bytes (> one 8K chunk).
+        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 20, 0];
+        let raw = raw_cbw(0x1111, 10240, 0x80, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 8192);
+                assert_eq!(bytes[0], 0);
+                assert_eq!(bytes[8191], (8191 % 251) as u8);
+            }
+            other => panic!("expected first chunk, got {other:?}"),
+        }
+
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 2048);
+                assert_eq!(bytes[0], (8192 % 251) as u8);
+            }
+            other => panic!("expected second chunk, got {other:?}"),
+        }
+
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 0);
+        assert_eq!(status, 0x00);
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+    }
+
+    #[test]
+    fn write_10_writes_received_data_and_probes_overrun() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // WRITE(10) LBA 0, 1 block → 512 bytes.
+        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x2222, 512, 0x00, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+
+        // Feed the data chunk → declared phase complete → overrun probe.
+        let payload: Vec<u8> = (0..512u16).map(|i| (i % 7) as u8).collect();
+        let wlen = data.len();
+        let step = s.poll(BotEvent::OutRecv { data: &payload }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: wlen,
+                probe: true
+            }
+        );
+        let mut check = [0u8; 512];
+        devs[0].read_data(0, &mut check).unwrap();
+        assert_eq!(&check[..], payload.as_slice());
+
+        // No more data → OutIdle ends the drain → CSW.
+        let step = s.poll(BotEvent::OutIdle, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 0x2222);
+        assert_eq!(residue, 0);
+        assert_eq!(status, 0x00);
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+    }
+
+    #[test]
+    fn data_out_overrun_is_drained_to_short_packet() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x3333, 512, 0x00, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+
+        let payload: Vec<u8> = vec![0x5A; 512];
+        let wlen = data.len();
+        let step = s.poll(BotEvent::OutRecv { data: &payload }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: wlen,
+                probe: true
+            }
+        );
+
+        // Host over-sent 100 extra bytes: drain (short packet) → CSW.
+        let extra = vec![0x6B; 100];
+        let step = s.poll(BotEvent::OutRecv { data: &extra }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW after drain, got {other:?}"),
+        }
+        // The excess was discarded, not written to the backend.
+        let mut check = [0u8; 512];
+        devs[0].read_data(0, &mut check).unwrap();
+        assert_eq!(&check[..], payload.as_slice());
+        let mut tail = [0u8; 64];
+        devs[0].read_data(512, &mut tail).unwrap();
+        assert!(tail.iter().all(|&b| b == 0));
+
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 0);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn phase_error_on_direction_mismatch() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // READ(10) declared with Data-Out direction → Phase Error CSW.
+        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0x4444, 512, 0x00, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 512);
+        assert_eq!(status, 0x02); // Phase Error
+    }
+
+    #[test]
+    fn invalid_cbw_frozen_until_reset() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
+        bad[0] = b'X'; // bad signature
+        let step = s.poll(BotEvent::OutRecv { data: &bad }, &mut data, &mut devs);
+        assert_eq!(step, BotStep::Done(BotStepResult::Stalled));
+        assert_eq!(s.need(), BotNeed::Done(BotStepResult::Stalled));
+
+        // Frozen: any further bulk event is ignored.
+        let step = s.poll(BotEvent::OutRecv { data: &bad }, &mut data, &mut devs);
+        assert_eq!(step, BotStep::Done(BotStepResult::Stalled));
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        assert_eq!(step, BotStep::Done(BotStepResult::Stalled));
+
+        // Reset unfreezes; a valid CBW is then processed (INQUIRY, since the
+        // injected unit attention would intercept TEST UNIT READY).
+        s.reset();
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 31,
+                probe: false
+            }
+        );
+        let raw = raw_cbw(2, 96, 0x80, 0, &inquiry_cdb(96));
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+            other => panic!("expected INQUIRY data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_interrupts_data_phase() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(5, 512, 0x00, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 512,
+                probe: false
+            }
+        );
+
+        // Partial data received.
+        let part = vec![0xAA; 128];
+        let step = s.poll(BotEvent::OutRecv { data: &part }, &mut data, &mut devs);
+        assert_eq!(
+            step,
+            BotStep::NeedOut {
+                len: 384,
+                probe: false
+            }
+        );
+
+        // Reset aborts the transaction and returns to Command.
+        s.reset();
+        assert_eq!(
+            s.need(),
+            BotNeed::NeedOut {
+                len: 31,
+                probe: false
+            }
+        );
+
+        // A new valid CBW is processed.
+        let raw = raw_cbw(6, 96, 0x80, 0, &inquiry_cdb(96));
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected INQUIRY data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_lun_failed_csw_then_request_sense() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // TEST UNIT READY to LUN 3 (only LUN 0 exists) → Failed CSW.
+        let raw = raw_cbw(7, 0, 0, 3, &[0x00, 0, 0, 0, 0, 0]);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 7);
+        assert_eq!(residue, 0);
+        assert_eq!(status, 0x01); // Failed
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+
+        // REQUEST SENSE to the invalid LUN → LOGICAL UNIT NOT SUPPORTED.
+        let mut rs = [0u8; 6];
+        rs[0] = scsi_op::REQUEST_SENSE;
+        rs[4] = 18;
+        let raw = raw_cbw(8, 18, 0x80, 3, &rs);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 18);
+                assert_eq!(bytes[0], 0x70); // fixed format
+                assert_eq!(bytes[2], 0x05); // ILLEGAL REQUEST
+                assert_eq!(bytes[12], 0x25); // LOGICAL UNIT NOT SUPPORTED
+            }
+            other => panic!("expected sense data, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, status) = read_csw(&mut s, &mut data);
+        assert_eq!(status, 0x00); // Passed
+    }
+
+    #[test]
+    fn unit_attention_after_reset() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        s.reset();
+
+        // First TEST UNIT READY → CHECK CONDITION (UA), Failed CSW.
+        let raw = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, status) = read_csw(&mut s, &mut data);
+        assert_eq!(status, 0x01); // Failed
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+
+        // REQUEST SENSE → the UA (0x29/00) is reported and cleared.
+        let mut rs = [0u8; 6];
+        rs[0] = scsi_op::REQUEST_SENSE;
+        rs[4] = 18;
+        let raw = raw_cbw(2, 18, 0x80, 0, &rs);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes[2], 0x06); // UNIT ATTENTION
+                assert_eq!(bytes[12], 0x29);
+                assert_eq!(bytes[13], 0x00);
+            }
+            other => panic!("expected UA sense, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {} // CSW pending
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        assert_eq!(
+            s.poll(BotEvent::InSent, &mut data, &mut devs),
+            BotStep::Done(BotStepResult::Processed)
+        );
+
+        // Subsequent TEST UNIT READY → GOOD (Passed CSW).
+        let raw = raw_cbw(3, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, status) = read_csw(&mut s, &mut data);
+        assert_eq!(status, 0x00); // Passed
+    }
+
+    #[test]
+    fn report_luns_is_synthesized_for_any_lun() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // REPORT LUNS, allocation 16, addressed to LUN 0.
+        let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16];
+        let raw = raw_cbw(9, 16, 0x80, 0, &cdb);
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 16);
+                assert_eq!(
+                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    8
+                ); // one LUN × 8
+                assert_eq!(bytes[8], 0x00); // address method 00b
+                assert_eq!(bytes[9], 0x00); // LUN id 0
+            }
+            other => panic!("expected REPORT LUNS data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_asks_for_more_data_gets_short_packet_and_residue() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // INQUIRY data is 95 bytes, but the host declared 192.
+        let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
+        let step = s.poll(BotEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+            other => panic!("expected short INQUIRY packet, got {other:?}"),
+        }
+        let step = s.poll(BotEvent::InSent, &mut data, &mut devs);
+        match step {
+            BotStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 192 - 95); // short packet + residue, no STALL
+        assert_eq!(status, 0x00);
+    }
+
+    /// Scripted bulk driver for the blocking `step` wrapper.
+    struct ScriptIo {
+        out: VecDeque<u8>,
+        sent: RefCell<Vec<u8>>,
+        stall: u32,
+    }
+
+    impl ScriptIo {
+        fn new(out: &[u8]) -> Self {
+            Self {
+                out: out.iter().copied().collect(),
+                sent: RefCell::new(Vec::new()),
+                stall: 0,
+            }
+        }
+    }
+
+    impl BotIo for ScriptIo {
+        fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+            if self.out.is_empty() {
+                return Err(BotIoErr::WouldBlock);
+            }
+            let n = self.out.len().min(buf.len());
+            for (i, b) in self.out.drain(..n).enumerate() {
+                buf[i] = b;
+            }
+            Ok(n)
+        }
+
+        fn recv_out(
+            &mut self,
+            buf: &mut [u8],
+            _timeout: Option<Duration>,
+        ) -> Result<usize, BotIoErr> {
+            self.try_recv_out(buf)
+        }
+
+        fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+            self.sent.borrow_mut().extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn stall_both(&mut self) -> Result<(), ()> {
+            self.stall += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn step_drives_inquiry_to_completion() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+        let mut recv = work();
+
+        let raw = raw_cbw(0xCAFE, 96, 0x80, 0, &inquiry_cdb(96));
+        let mut io = ScriptIo::new(&raw);
+        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
+        assert_eq!(r, BotStepResult::Processed);
+
+        // Sent: 96-byte INQUIRY response then the 13-byte CSW.
+        let sent = io.sent.borrow();
+        assert_eq!(sent.len(), 95 + CSW_LEN);
+        assert_eq!(sent[0] & 0x1F, 0x00);
+        assert_eq!(
+            &sent[sent.len() - CSW_LEN..sent.len() - CSW_LEN + 4],
+            b"USBS"
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                sent[sent.len() - 9],
+                sent[sent.len() - 8],
+                sent[sent.len() - 7],
+                sent[sent.len() - 6],
+            ]),
+            0xCAFE
+        );
+        assert_eq!(sent[sent.len() - 1], 0x00); // Passed
+    }
+
+    #[test]
+    fn step_drives_write_with_data_phase() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+        let mut recv = work();
+
+        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let raw = raw_cbw(0xBEEF, 512, 0x00, 0, &cdb);
+        let payload: Vec<u8> = (0..512u16).map(|i| (i % 3) as u8).collect();
+        // Queue: CBW + data payload.
+        let mut stream = Vec::with_capacity(31 + 512);
+        stream.extend_from_slice(&raw);
+        stream.extend_from_slice(&payload);
+
+        let mut io = ScriptIo::new(&stream);
+        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
+        assert_eq!(r, BotStepResult::Processed);
+        let mut check = [0u8; 512];
+        devs[0].read_data(0, &mut check).unwrap();
+        assert_eq!(&check[..], payload.as_slice());
+    }
+}
