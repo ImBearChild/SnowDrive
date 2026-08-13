@@ -10,6 +10,7 @@
 //! | iSCSI target over a TCP socket | `scsi`, `iscsi`, `std` |
 //! | Flat CD-ROM device (`CdromDevice`) | `cdrom` (implies `scsi`) |
 //! | Live ISO9660 CD-ROM (`CdLiveFsDevice`) | `livefs` (implies `cdrom`+`iso9660`) |
+//! | USB MSC Bulk-Only Transport core | `usb` (implies `scsi`) |
 //! | C ABI exports | `capi` (implies `std`) |
 //!
 //! ## Modules
@@ -18,6 +19,7 @@
 //! - [`scsi`] *(gated by `scsi`)*: SCSI core, devices, iSCSI PDU + target.
 //! - `iso9660` *(gated by `iso9660`)*: ISO9660/Joliet algorithms.
 //! - `cdrom` *(gated by `cdrom`)*: CD-ROM device emulation (flat / live).
+//! - `usb` *(gated by `usb`)*: USB Mass Storage Bulk-Only Transport core.
 //! - `capi` *(gated by `capi`)*: C ABI exports (`#[allow(unsafe_code)]`).
 //!
 //! ## ISO9660 name limits
@@ -43,6 +45,8 @@ pub mod iscsi;
 pub mod iso9660;
 #[cfg(feature = "scsi")]
 pub mod scsi;
+#[cfg(feature = "usb")]
+pub mod usb;
 
 /// Minimum data-area size for `ScsiDevice::do_cmd`: 8192 bytes
 /// (= MaxRecvDataSegmentLength). The `data` argument is a pure data
