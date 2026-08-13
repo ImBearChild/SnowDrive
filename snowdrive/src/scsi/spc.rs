@@ -211,7 +211,9 @@ pub fn execute_spc<'a, D: SpcDevice>(
             let header_len = if long { 8 } else { 4 };
             let total = header_len + page_bytes.len();
             let mode_len = if long { total - 2 } else { total - 1 };
-            let mut buf = [0u8; 32];
+            // Large enough for the CD-ROM all-pages (0x3F) response:
+            // 8-byte header + 68 bytes of pages = 76.
+            let mut buf = [0u8; 128];
             if long {
                 buf[0] = (mode_len >> 8) as u8;
                 buf[1] = mode_len as u8;

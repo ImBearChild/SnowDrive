@@ -155,7 +155,7 @@ const CDROM_CAPABILITIES: [u8; 24] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// Return the MODE SENSE page data for `page` (`0x3F` handled specially).
+/// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
     match page {
         0x08 => Some(&CACHING_PAGE),
@@ -163,41 +163,43 @@ pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
         0x0D => Some(&CDROM_PARAMS),
         0x0E => Some(&CDROM_AUDIO),
         0x2A => Some(&CDROM_CAPABILITIES),
-        0x3F => None, // caller must use build_cdrom_all_pages()
+        0x3F => Some(&ALL_CDROM_PAGES),
         _ => None,
     }
 }
 
 /// Total byte count of all CD-ROM mode pages (for 0x3F sizing).
-#[allow(dead_code)] // used in Phase 2c (CdromDevice)
 pub(crate) const ALL_CDROM_PAGES_LEN: usize = CACHING_PAGE.len()
     + VENDOR_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
     + CDROM_CAPABILITIES.len();
 
-/// Build the concatenated 0x3F response into `out`.
-/// Returns the number of bytes written.
-#[allow(dead_code)] // used in Phase 2c (CdromDevice)
-pub(crate) fn build_cdrom_all_pages(out: &mut [u8]) -> usize {
-    let pages: [&[u8]; 5] = [
-        &CACHING_PAGE,
-        &VENDOR_PAGE,
-        &CDROM_PARAMS,
-        &CDROM_AUDIO,
-        &CDROM_CAPABILITIES,
-    ];
-    let mut off = 0;
-    for page in &pages {
-        let end = off + page.len();
-        if end > out.len() {
-            break;
+/// Concatenate `parts` into a `[u8; N]` (const, for building 0x3F).
+const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = 0;
+    let mut p = 0;
+    while p < parts.len() {
+        let mut j = 0;
+        while j < parts[p].len() {
+            out[i] = parts[p][j];
+            i += 1;
+            j += 1;
         }
-        out[off..end].copy_from_slice(page);
-        off = end;
+        p += 1;
     }
-    off
+    out
 }
+
+/// All CD-ROM mode pages, in MODE SENSE page order (for `0x3F`).
+const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
+    &CACHING_PAGE,
+    &VENDOR_PAGE,
+    &CDROM_PARAMS,
+    &CDROM_AUDIO,
+    &CDROM_CAPABILITIES,
+]);
 
 // ── GET CONFIGURATION common features builder ───────────────────────
 
@@ -500,6 +502,42 @@ mod tests {
         assert_eq!(n, 28); /* 4 header + 24 page */
         assert_eq!(buf[4], 0x2A); /* page code */
         assert_eq!(buf[5], 0x16); /* page length = 22 */
+    }
+
+    #[test]
+    fn cdrom_mode_sense_10_all_pages() {
+        let mut td = CdTestDev::new(1024 * 1024);
+        let mut dev = CdDev(&mut td);
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::MODE_SENSE_10;
+        cdb[2] = 0x3F;
+        cdb[8] = 80;
+        let mut buf = [0u8; 80];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + 68 pages */
+        assert_eq!(buf[0], ((n - 2) >> 8) as u8);
+        assert_eq!(buf[1], (n - 2) as u8); /* mode data length */
+        // Page codes in order: 0x08 (caching), 0x00, 0x0D, 0x0E, 0x2A.
+        assert_eq!(buf[8] & 0x3F, 0x08);
+        assert_eq!(buf[28] & 0x3F, 0x00);
+        assert_eq!(buf[32] & 0x3F, 0x0D);
+        assert_eq!(buf[36] & 0x3F, 0x0E);
+        assert_eq!(buf[52] & 0x3F, 0x2A);
+    }
+
+    #[test]
+    fn cdrom_mode_page_all_pages_contains_each_page() {
+        let all = cdrom_mode_page(0x3F).expect("0x3F must return all pages");
+        assert_eq!(all.len(), ALL_CDROM_PAGES_LEN);
+        // Walk pages by their length fields and collect the page codes.
+        let mut codes = Vec::new();
+        let mut off = 0;
+        while off < all.len() {
+            let page_len = all[off + 1] as usize;
+            codes.push(all[off] & 0x3F);
+            off += page_len + 2;
+        }
+        assert_eq!(codes, vec![0x08, 0x00, 0x0D, 0x0E, 0x2A]);
     }
 
     // ── GET CONFIGURATION common features ───────────────────────────
