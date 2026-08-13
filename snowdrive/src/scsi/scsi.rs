@@ -44,6 +44,9 @@ pub mod asc {
     pub const INVALID_FIELD: u8 = 0x24;
     pub const LOGICAL_UNIT_NOT_SUPPORTED: u8 = 0x25;
     pub const WRITE_PROTECTED: u8 = 0x27;
+    /// ASC 29h — POWER ON, RESET, OR BUS DEVICE RESET OCCURRED (SPC-4
+    /// §4.5.6), injected as a unit attention after a device reset.
+    pub const POWER_ON_RESET: u8 = 0x29;
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
     pub const MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
     /// ASCQ for [`MEDIUM_REMOVAL_PREVENTED`]. ASC 53h/02h is MEDIUM
