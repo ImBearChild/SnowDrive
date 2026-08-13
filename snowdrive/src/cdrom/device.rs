@@ -8,8 +8,8 @@
 //! Write commands return DATA PROTECT (read-only device).
 
 use crate::cdrom::common::{
-    build_get_config_response, build_read_disc_info, cdrom_mode_page, CdromDeviceCommon,
-    CurrentProfile, DiscInfo, CDROM_IDENTITY, SECTOR_SIZE,
+    build_get_config_response, build_read_buffer_capacity, build_read_disc_info, cdrom_mode_page,
+    CdromDeviceCommon, CurrentProfile, DiscInfo, CDROM_IDENTITY, READ_ONLY_CDROM_CAPS, SECTOR_SIZE,
 };
 use crate::scsi::backend::{BlockStorage, BlockStorageError};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
@@ -161,6 +161,9 @@ impl<B: BlockStorage> CdromDevice<B> {
 
                 // READ DISC INFORMATION (0x51)
                 op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
+
+                // READ BUFFER CAPACITY (0x5C)
+                op::READ_BUFFER_CAPACITY => self.read_buffer_capacity_cmd(cdb, data),
 
                 // WRITE commands → DATA PROTECT (read-only)
                 op::WRITE_6
@@ -342,6 +345,20 @@ impl<B: BlockStorage> CdromDevice<B> {
         build_read_disc_info(data, alloc, &info)
     }
 
+    /// READ BUFFER CAPACITY (0x5C) — a read-only drive has no write buffer.
+    /// Only byte-length reporting (Block = 0) is supported (MMC-6 §6.17.2.2).
+    fn read_buffer_capacity_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        data: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        if cdb[1] & 0x01 != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let alloc = (u16::from(cdb[8]) << 8) | u16::from(cdb[9]);
+        build_read_buffer_capacity(data, alloc, 0, 0)
+    }
+
     fn toc_address(&self, lba: u32, msf: bool) -> [u8; 4] {
         if !msf {
             return lba.to_be_bytes();
@@ -368,7 +385,14 @@ impl<B: BlockStorage> CdromDevice<B> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
 
-        build_get_config_response(data, self.common.profile, rt, start, alloc)
+        build_get_config_response(
+            data,
+            self.common.profile,
+            &READ_ONLY_CDROM_CAPS,
+            rt,
+            start,
+            alloc,
+        )
     }
 }
 

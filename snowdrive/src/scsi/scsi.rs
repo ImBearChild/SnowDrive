@@ -33,6 +33,7 @@ pub mod op {
     pub const READ_TOC: u8 = 0x43;
     pub const GET_CONFIGURATION: u8 = 0x46;
     pub const READ_DISC_INFORMATION: u8 = 0x51;
+    pub const READ_BUFFER_CAPACITY: u8 = 0x5C;
 }
 
 /// Additional sense codes (SPC-4 §4.5.6).
@@ -284,6 +285,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::READ_TOC => "READ_TOC",
         op::GET_CONFIGURATION => "GET_CONFIGURATION",
         op::READ_DISC_INFORMATION => "READ_DISC_INFORMATION",
+        op::READ_BUFFER_CAPACITY => "READ_BUFFER_CAPACITY",
         _ => "UNKNOWN",
     }
 }

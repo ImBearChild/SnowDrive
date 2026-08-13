@@ -148,12 +148,118 @@ const CDROM_AUDIO: [u8; 16] = [
     0x00, 0x00, // output port 1: volume = 0
 ];
 
-/// CD/DVD Capabilities & Mechanical Status page (0x2A, MMC-6 §6.12.4):
-/// page_length=22, no mechanical features for virtual drive.  Total = 24 bytes.
-const CDROM_CAPABILITIES: [u8; 24] = [
-    0x2A, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
+/// Device-declared capability set — the single model every
+/// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
+/// 0x2A page) is built from (plan §5.3). Devices feed their capabilities;
+/// the shared builders only lay out bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdromCapabilities {
+    /// Loading mechanism is a tray (MMC-6 Table 99); `false` = caddy/slot.
+    pub tray: bool,
+    /// Media can be loaded / ejected via START STOP UNIT (LoEj).
+    pub load: bool,
+    pub eject: bool,
+    /// Medium can be locked with PREVENT ALLOW MEDIUM REMOVAL.
+    pub lock: bool,
+    /// Read-side extras (baseline Mode-1 CD-ROM read is implicit in MMC).
+    pub mode2_form1: bool,
+    pub mode2_form2: bool,
+    pub multi_session: bool,
+    pub cd_da: bool,
+    pub read_cdr: bool,
+    pub read_cdrw: bool,
+    pub read_dvd_rom: bool,
+    /// Write-side extras (Phase 3+ CD-R/CD-RW).
+    pub write_cdr: bool,
+    pub write_cdrw: bool,
+    pub test_write: bool,
+    pub burn_proof: bool,
+    pub num_volume_levels: u8,
+    pub buffer_size: u16,
+    pub max_read_speed: u16,  // KB/s
+    pub max_write_speed: u16, // KB/s
+}
+
+impl CdromCapabilities {
+    /// A read-only CD-ROM drive: Mode-1 data read is the implicit baseline,
+    /// tray mechanism, no write / audio / multi-session extras.
+    pub const fn read_only_cd_rom() -> Self {
+        Self {
+            tray: true,
+            load: false,
+            eject: false,
+            lock: false,
+            mode2_form1: false,
+            mode2_form2: false,
+            multi_session: false,
+            cd_da: false,
+            read_cdr: false,
+            read_cdrw: false,
+            read_dvd_rom: false,
+            write_cdr: false,
+            write_cdrw: false,
+            test_write: false,
+            burn_proof: false,
+            num_volume_levels: 0,
+            buffer_size: 0,
+            max_read_speed: 0,
+            max_write_speed: 0,
+        }
+    }
+}
+
+/// The capabilities of the read-only CD-ROM devices (flat / livefs).
+pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
+
+/// `true` → 1 (const bit packing).
+const fn bit(b: bool) -> u8 {
+    b as u8
+}
+
+/// 3-bit loading mechanism type (MMC-6 Table 99: 000b caddy/slot, 001b tray).
+const fn loading_type_bits(tray: bool) -> u8 {
+    if tray {
+        0b001
+    } else {
+        0b000
+    }
+}
+
+/// Build the CD/DVD Capabilities & Mechanical Status mode page (0x2A) from
+/// `caps` (MMC-3 / SFF-8090 layout). MMC-6 Appendix E.9 marks this page
+/// legacy ("implementing mode page 2Ah is not recommended") — GET
+/// CONFIGURATION is the authoritative channel — so this is the 0x2A "view"
+/// of the same capability model the features are built from.
+pub const fn build_capabilities_page(caps: &CdromCapabilities) -> [u8; 24] {
+    let mut p = [0u8; 24];
+    p[0] = 0x2A;
+    p[1] = 22; // page length
+    p[2] = (bit(caps.read_cdrw) << 7)
+        | (bit(caps.read_cdr) << 6)
+        | (bit(caps.mode2_form2) << 5)
+        | (bit(caps.mode2_form1) << 4)
+        | (bit(caps.multi_session) << 3)
+        | (bit(caps.cd_da) << 2);
+    p[3] = bit(caps.read_dvd_rom) << 3;
+    p[4] = (bit(caps.write_cdrw) << 7)
+        | (bit(caps.write_cdr) << 6)
+        | (bit(caps.test_write) << 5)
+        | (bit(caps.burn_proof) << 4);
+    // Byte 8: Loading Mechanism Type (bits 2-0) | Load | Eject.
+    p[8] = loading_type_bits(caps.tray) | (bit(caps.load) << 3) | (bit(caps.eject) << 4);
+    p[9] = caps.num_volume_levels;
+    p[10] = (caps.buffer_size >> 8) as u8;
+    p[11] = caps.buffer_size as u8;
+    p[14] = (caps.max_read_speed >> 8) as u8;
+    p[15] = caps.max_read_speed as u8;
+    p[18] = (caps.max_write_speed >> 8) as u8;
+    p[19] = caps.max_write_speed as u8;
+    p
+}
+
+/// CD/DVD Capabilities & Mechanical Status page (0x2A) for the read-only
+/// devices, built from the capability model rather than hardcoded bytes.
+const CDROM_CAPABILITIES: [u8; 24] = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
 
 /// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
@@ -218,6 +324,7 @@ pub fn build_get_config_features(
     buf: &mut [u8],
     mut off: usize,
     profile: CurrentProfile,
+    caps: &CdromCapabilities,
     rt: u8,
     start_feature: u16,
 ) -> usize {
@@ -239,7 +346,14 @@ pub fn build_get_config_features(
         buf[off] = 0x00;
         buf[off + 1] = 0x03;
         buf[off + 2] = 0x01; // current
-        off += 4;
+        buf[off + 3] = 0x04; // additional length
+                             // Byte 4: Loading Mechanism Type (bits 7-5) | Load | Eject | Pvnt
+                             // Jmpr | DBML | Lock (MMC-6 Table 98) — same model as the 0x2A page.
+        buf[off + 4] = (loading_type_bits(caps.tray) << 5)
+            | (bit(caps.load) << 4)
+            | (bit(caps.eject) << 3)
+            | bit(caps.lock);
+        off += 8;
     }
 
     // Random Readable (0x0010)
@@ -286,6 +400,7 @@ pub fn build_get_config_features(
 pub fn build_get_config_response<'a>(
     data: &'a mut [u8],
     profile: CurrentProfile,
+    caps: &CdromCapabilities,
     rt: u8,
     start_feature: u16,
     alloc: u16,
@@ -295,7 +410,7 @@ pub fn build_get_config_response<'a>(
     buf[6] = (profile.code() >> 8) as u8;
     buf[7] = profile.code() as u8;
 
-    let off = build_get_config_features(&mut buf, 8, profile, rt, start_feature);
+    let off = build_get_config_features(&mut buf, 8, profile, caps, rt, start_feature);
 
     // Data length = bytes following the 4-byte data-length field itself.
     let data_len = (off - 4) as u32;
@@ -303,6 +418,28 @@ pub fn build_get_config_response<'a>(
 
     let n = off.min(alloc as usize);
     data[0..n].copy_from_slice(&buf[..n]);
+    CommandOutcome::DataIn {
+        transfer_len: n as u64,
+        byte_offset: 0,
+        immediate: &data[0..n],
+    }
+}
+
+/// Build the READ BUFFER CAPACITY response (MMC-6 §6.17.3.1, Table 342):
+/// 12-byte structure with Data Length = 10. `buffer_len` / `blank_len` are
+/// the whole / unused buffer bytes (0 for a drive without a write buffer).
+pub fn build_read_buffer_capacity<'a>(
+    data: &'a mut [u8],
+    alloc: u16,
+    buffer_len: u32,
+    blank_len: u32,
+) -> CommandOutcome<'a> {
+    let mut buf = [0u8; 12];
+    buf[1] = 0x0A; // Data Length = 10 (excludes itself), big-endian
+    buf[4..8].copy_from_slice(&buffer_len.to_be_bytes());
+    buf[8..12].copy_from_slice(&blank_len.to_be_bytes());
+    let n = buf.len().min(alloc as usize);
+    data[..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
         byte_offset: 0,
@@ -546,7 +683,8 @@ mod tests {
     fn cdrom_get_config_cd_profile() {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
-        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 64);
+        let outcome =
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert!(n >= 8);
@@ -559,7 +697,8 @@ mod tests {
     fn cdrom_get_config_dvd_profile() {
         let mut w = work();
         let profile = CurrentProfile::DvdRom;
-        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 64);
+        let outcome =
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert!(n >= 8);
@@ -571,21 +710,21 @@ mod tests {
     fn cdrom_get_config_features_present() {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
-        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 255);
+        let outcome =
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 255);
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &mut buf);
-        // Should contain Core (0x0001), Removable (0x0003), Random Readable
-        // (0x0010), Multi-Read (0x001D), CD Read (0x001E)
-        assert!(n >= 44);
-        // Check feature 0x0001 present at offset 8
+        // Core (0x0001) at 8, Removable (0x0003, 8 bytes) at 20, Random
+        // Readable (0x0010) at 28, Multi-Read (0x001D), CD Read (0x001E).
+        assert!(n >= 48);
         assert_eq!(buf[8], 0x00);
         assert_eq!(buf[9], 0x01);
-        // Check feature 0x0003 present
         assert_eq!(buf[20], 0x00);
         assert_eq!(buf[21], 0x03);
-        // Check feature 0x0010 present
-        assert_eq!(buf[24], 0x00);
-        assert_eq!(buf[25], 0x10);
+        // Removable feature byte 4: Loading Mechanism Type (001b tray) << 5.
+        assert_eq!(buf[24], 0x20);
+        assert_eq!(buf[28], 0x00);
+        assert_eq!(buf[29], 0x10);
     }
 
     #[test]
@@ -593,7 +732,8 @@ mod tests {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
         // RT=10b, start 0x0010 → Random Readable + Multi-Read + CD Read
-        let outcome = build_get_config_response(&mut w, profile, 0x02, 0x0010, 255);
+        let outcome =
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x02, 0x0010, 255);
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &mut buf);
         // Header (8) + Random Readable (12) + Multi-Read (4) + CD Read (8) = 32
@@ -608,7 +748,8 @@ mod tests {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
         // Very small alloc — only header returned
-        let outcome = build_get_config_response(&mut w, profile, 0x00, 0x0000, 8);
+        let outcome =
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 8);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert_eq!(n, 8); // only header fits
@@ -682,6 +823,63 @@ mod tests {
         // Byte 2: 00 (type) | 01 (incomplete session) | 1 (erasable) |
         // 01 (incomplete disc) = 0b00011001.
         assert_eq!(buf[2], 0x19);
+    }
+
+    // ── Capabilities page (0x2A) ────────────────────────────────────
+
+    #[test]
+    fn capabilities_page_read_only_cd_rom_layout() {
+        let p = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
+        assert_eq!(p.len(), 24);
+        assert_eq!(p[0], 0x2A);
+        assert_eq!(p[1], 22); // page length
+                              // Read-only, Mode-1 baseline only: no extra read/write bits.
+        assert_eq!(p[2], 0x00);
+        assert_eq!(p[3], 0x00);
+        assert_eq!(p[4], 0x00);
+        // Loading mechanism = tray (001b).
+        assert_eq!(p[8], 0b001);
+        // No buffer, no speeds.
+        assert_eq!(&p[10..12], &[0, 0]);
+        assert_eq!(&p[14..16], &[0, 0]);
+        assert_eq!(&p[18..20], &[0, 0]);
+    }
+
+    #[test]
+    fn capabilities_page_parameterized_by_model() {
+        let mut caps = READ_ONLY_CDROM_CAPS;
+        caps.write_cdr = true;
+        caps.read_cdr = true;
+        caps.cd_da = true;
+        caps.eject = true;
+        caps.buffer_size = 4096;
+        caps.max_read_speed = 3528; // 20x
+        let p = build_capabilities_page(&caps);
+        assert_eq!(p[2] & 0x40, 0x40); // CD-R read
+        assert_eq!(p[2] & 0x04, 0x04); // CD-DA accurate
+        assert_eq!(p[4] & 0x40, 0x40); // CD-R write
+        assert_eq!(p[8] & 0x10, 0x10); // eject
+        assert_eq!(&p[10..12], &[0x10, 0x00]); // buffer 4096
+        assert_eq!(&p[14..16], &[0x0D, 0xC8]); // max read 3528
+    }
+
+    // ── READ BUFFER CAPACITY ────────────────────────────────────────
+
+    #[test]
+    fn read_buffer_capacity_structure() {
+        let mut w = work();
+        let mut buf = [0u8; 12];
+        let n = data_in(build_read_buffer_capacity(&mut w, 12, 4096, 2048), &mut buf);
+        assert_eq!(n, 12);
+        assert_eq!(&buf[0..2], &[0x00, 0x0A]); // Data Length = 10
+        assert_eq!(&buf[4..8], &[0x00, 0x00, 0x10, 0x00]); // buffer 4096
+        assert_eq!(&buf[8..12], &[0x00, 0x00, 0x08, 0x00]); // blank 2048
+
+        // Allocation clamp and zero-alloc (not an error).
+        let mut small = [0u8; 2];
+        let n = data_in(build_read_buffer_capacity(&mut w, 2, 0, 0), &mut small);
+        assert_eq!(n, 2);
+        assert_eq!(&small, &[0x00, 0x0A]);
     }
 
     // ── Profile selection ───────────────────────────────────────────
