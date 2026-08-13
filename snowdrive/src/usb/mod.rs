@@ -12,8 +12,12 @@
 //! buffers, so protocol frames never share memory with SCSI data.
 
 pub mod bot;
+pub mod gadget;
+pub mod io;
 
 pub use bot::{BotDir, Cbw, Csw, CswStatus};
+pub use gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
+pub use io::{BotIo, BotIoErr};
 
 /// Command Block Wrapper signature (`"USBC"`, BOT §5.1) — stored little
 /// endian in the raw 31-byte CBW.
