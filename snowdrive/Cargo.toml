@@ -23,7 +23,7 @@ livefs = ["cdrom", "iso9660"]
 usb = ["scsi"]
 
 # CLI feature: the `snowdrive` binary + its std-only deps (clap etc.).
-cli = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "log",
+cli = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "usb", "log",
        "dep:clap", "dep:ctrlc", "dep:env_logger"]
 
 # Optional features.
@@ -46,3 +46,10 @@ env_logger = { version = "0.11", optional = true }
 # compiling the CLI at all.
 name = "snowdrive"
 required-features = ["cli"]
+
+# Linux-only deps for `snowdrive serve --usb` (FunctionFS gadget): never
+# compiled or even resolved on other targets. Pin >= 1.1.0 for
+# `Class::MASS_STORAGE_SCSI_BULK`.
+[target.'cfg(target_os = "linux")'.dependencies]
+usb-gadget = "1.1"
+bytes = "1"

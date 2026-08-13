@@ -34,6 +34,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
 use clap::{Args, Parser};
 use snowdrive::cdrom::CdLiveFsDevice;
 use snowdrive::cdrom::CdromDevice;
@@ -45,12 +48,29 @@ use snowdrive::scsi::device::Device;
 use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
 use snowdrive::MIN_DATA_LEN;
 
+#[cfg(target_os = "linux")]
+use snowdrive::usb::{
+    BotEvent, BotIo, BotIoErr, BotNeed, BotSession, BotStep, BotStepResult, CtrlAck, CtrlReply,
+    CtrlReq, Gadget,
+};
+#[cfg(target_os = "linux")]
+use usb_gadget::function::custom::{
+    CtrlReceiver, CtrlSender, Custom, Endpoint, EndpointDirection, EndpointReceiver,
+    EndpointSender, Event, Interface,
+};
+#[cfg(target_os = "linux")]
+use usb_gadget::{default_udc, udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
+
 /// Default work buffer size (256 KiB).
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
 const ISO_SECTOR_SIZE: u32 = 2048;
+/// Serve loop re-checks the control pipe / stop flag at this granularity
+/// (bounds Bulk-Only Reset / Get Max LUN response latency, §6.3).
+#[cfg(target_os = "linux")]
+const BOT_POLL_GRANULARITY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,6 +86,7 @@ enum Cli {
 }
 
 #[derive(Args, Debug)]
+#[command(group = clap::ArgGroup::new("transport").required(true).multiple(false))]
 struct ServeArgs {
     /// Block plane device: `[img=]<path>[,ro]` (file, `img=` default),
     /// `ram=<size>` (K/M/G suffixes), or `cd=<path>` (read-only ISO as a
@@ -80,9 +101,32 @@ struct ServeArgs {
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
-    /// iSCSI listen address (required).
-    #[arg(long = "iscsi", value_name = "ADDR:PORT")]
+    /// iSCSI listen address (ADDR:PORT). Mutually exclusive with `--usb`;
+    /// exactly one transport is required.
+    #[arg(long = "iscsi", value_name = "ADDR:PORT", group = "transport")]
     iscsi: Option<String>,
+
+    /// Serve the devices over USB Mass Storage (Bulk-Only Transport) by
+    /// binding a FunctionFS gadget to a UDC (Linux only). Mutually
+    /// exclusive with `--iscsi`.
+    #[arg(long = "usb", group = "transport")]
+    usb: bool,
+
+    /// UDC name to bind the USB gadget to (default: the first UDC).
+    #[arg(long = "udc", value_name = "NAME")]
+    udc: Option<String>,
+
+    /// USB vendor ID (hex).
+    #[arg(long = "vid", value_name = "VID", default_value = "1209", value_parser = parse_hex_u16)]
+    vid: u16,
+
+    /// USB product ID (hex).
+    #[arg(long = "pid", value_name = "PID", default_value = "0001", value_parser = parse_hex_u16)]
+    pid: u16,
+
+    /// USB serial number.
+    #[arg(long = "serial", value_name = "SERIAL", default_value = "SNOWSCSI")]
+    serial: String,
 
     /// Verbose logging: -v = debug, -vv = trace.
     #[arg(long, short, action = clap::ArgAction::Count)]
@@ -121,6 +165,35 @@ fn main() -> ExitCode {
 fn run_serve(args: ServeArgs) -> ExitCode {
     init_logging(args.verbose);
 
+    let work_size = match parse_work_size(args.work_buf_size.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("snowdrive: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The device pipeline is shared by both transports: parse the specs,
+    // validate sources, allocate RAM disks and build the LUN list.
+    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
+    let mut devices: Vec<Device<'_>> = Vec::new();
+    if build_devices(&args, &mut ram_disks, &mut devices).is_err() {
+        return ExitCode::FAILURE;
+    }
+
+    if args.usb {
+        #[cfg(target_os = "linux")]
+        {
+            return run_serve_usb(&args, &mut devices, work_size);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("snowdrive: --usb is only supported on Linux");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // iSCSI transport: the ArgGroup guarantees --iscsi when --usb is absent.
     let addr = match args.iscsi.as_deref() {
         None => {
             eprintln!("snowdrive: --iscsi is required");
@@ -134,186 +207,6 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             }
         },
     };
-
-    if args.disk.is_empty() && args.cdrom.is_empty() {
-        eprintln!("snowdrive: --disk or --cdrom is required (at least one device)");
-        return ExitCode::FAILURE;
-    }
-
-    let work_size = match parse_work_size(args.work_buf_size.as_deref()) {
-        Ok(n) => n,
-        Err(msg) => {
-            eprintln!("snowdrive: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let mut disk_specs = Vec::with_capacity(args.disk.len());
-    for spec in &args.disk {
-        let parsed = match parse_disk_spec(spec) {
-            Ok(p) => p,
-            Err(msg) => {
-                eprintln!("snowdrive: invalid --disk spec '{spec}': {msg}");
-                return ExitCode::FAILURE;
-            }
-        };
-        disk_specs.push(parsed);
-    }
-
-    let mut cdrom_specs = Vec::with_capacity(args.cdrom.len());
-    for spec in &args.cdrom {
-        let parsed = match parse_cdrom_spec(spec) {
-            Ok(p) => p,
-            Err(msg) => {
-                eprintln!("snowdrive: invalid --cdrom spec '{spec}': {msg}");
-                return ExitCode::FAILURE;
-            }
-        };
-        cdrom_specs.push(parsed);
-    }
-
-    // Reject missing sources up front (FileBackend would otherwise create a
-    // fresh empty file when opened writable; CdromDevice/CdLiveFs would
-    // otherwise fail later).
-    for spec in &disk_specs {
-        match spec {
-            DiskSpec::Img { path, .. } | DiskSpec::Cdrom { path } => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            DiskSpec::Ram(_) => {}
-        }
-    }
-    for spec in &cdrom_specs {
-        match spec {
-            CdromSpec::Flat { path } => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            CdromSpec::Live { dir } => {
-                if !Path::new(dir).is_dir() {
-                    eprintln!("snowdrive: directory not found: {dir}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    }
-
-    for w in check_dual_mount(&dual_mount_specs(&disk_specs, &cdrom_specs)) {
-        eprintln!("{w}");
-    }
-
-    // Allocate every RAM disk first so the Device array can borrow them
-    // without 'static / Box::leak — disjoint borrows via split_first_mut.
-    let mut ram_disks: Vec<Vec<u8>> = Vec::with_capacity(disk_specs.len());
-    for spec in &disk_specs {
-        if let DiskSpec::Ram(size) = spec {
-            let bytes = match usize::try_from(*size) {
-                Ok(n) => n,
-                Err(_) => {
-                    eprintln!("snowdrive: RAM size {size} too large for this platform");
-                    return ExitCode::FAILURE;
-                }
-            };
-            ram_disks.push(vec![0u8; bytes]);
-        }
-    }
-
-    // LUN order: all --disk devices first, then all --cdrom devices (clap
-    // collects each flag separately, so the interleaved appearance order
-    // cannot be restored; the two planes do not interleave).
-    let mut devices: Vec<Device<'_>> = Vec::with_capacity(disk_specs.len() + cdrom_specs.len());
-    let mut ram_rest: &mut [Vec<u8>] = &mut ram_disks;
-    let mut lun = 0usize;
-    for spec in &disk_specs {
-        match spec {
-            DiskSpec::Ram(_) => {
-                let (slot, tail) = ram_rest.split_first_mut().unwrap();
-                ram_rest = tail;
-                let backend = BlockBackend::Ram(RamBackend::new(slot));
-                let mut dev =
-                    BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-                log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
-                devices.push(Device::Block(dev));
-            }
-            DiskSpec::Img { path, read_only } => {
-                // Existence was checked by parse; FileBackend would otherwise
-                // create a fresh file when opened writable.
-                match FileBackend::open(path, !*read_only) {
-                    Ok(b) => {
-                        let mut dev = BlockDevice::new(BlockBackend::File(b), SECTOR_SIZE)
-                            .expect("SECTOR_SIZE is nonzero");
-                        log::debug!(
-                            "LUN {lun}: {path} block device ({}{} bytes)",
-                            if *read_only { "read-only, " } else { "" },
-                            dev.backend().capacity()
-                        );
-                        devices.push(Device::Block(dev));
-                    }
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open file block device {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            DiskSpec::Cdrom { path } => {
-                let dev = match CDBlockDevice::new(path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                log::debug!("LUN {lun}: {path} CD-ROM image");
-                devices.push(Device::CdBlock(dev));
-            }
-        }
-        lun += 1;
-    }
-    for spec in &cdrom_specs {
-        match spec {
-            CdromSpec::Flat { path } => {
-                let backend = match FileBackend::open(path, false) {
-                    Ok(b) => BlockBackend::File(b),
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let mut dev = CdromDevice::new(backend);
-                log::debug!(
-                    "LUN {lun}: {path} flat CD-ROM ({} bytes)",
-                    dev.backend().capacity()
-                );
-                devices.push(Device::CdFlat(dev));
-            }
-            CdromSpec::Live { dir } => {
-                let fs = FsBackend::Std(StdFsBackend::new(dir));
-                let label = Path::new(dir)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("SNOWDRIVE");
-                match CdLiveFsDevice::new(fs, label) {
-                    Ok(dev) => {
-                        log::debug!(
-                            "LUN {lun}: {dir} live ISO9660 CD-ROM ({} sectors)",
-                            dev.layout().total
-                        );
-                        devices.push(Device::CdLiveFs(dev));
-                    }
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-        }
-        lun += 1;
-    }
 
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
@@ -359,6 +252,13 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     // Graceful exit: flush backends.
+    sync_devices(&mut devices);
+    log::info!("shutting down");
+    ExitCode::SUCCESS
+}
+
+/// Flush every backend; errors are reported to stderr but not fatal.
+fn sync_devices(devices: &mut [Device<'_>]) {
     for (i, dev) in devices.iter_mut().enumerate() {
         let result = match dev {
             Device::Block(d) => d.backend().sync(),
@@ -370,8 +270,532 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             eprintln!("snowdrive: sync failed for LUN {i}: {e}");
         }
     }
+}
+
+/// Shared device pipeline: parse the `--disk` / `--cdrom` specs, validate
+/// the sources, allocate the RAM disks and build the LUN list in order
+/// (all `--disk` devices first, then all `--cdrom` devices).
+///
+/// `devices` borrows `ram_disks` (RAM-backed LUNs), which must therefore
+/// outlive it. On failure prints the error and returns `Err(())`.
+fn build_devices<'a>(
+    args: &ServeArgs,
+    ram_disks: &'a mut Vec<Vec<u8>>,
+    devices: &mut Vec<Device<'a>>,
+) -> Result<(), ()> {
+    if args.disk.is_empty() && args.cdrom.is_empty() {
+        eprintln!("snowdrive: --disk or --cdrom is required (at least one device)");
+        return Err(());
+    }
+
+    let mut disk_specs = Vec::with_capacity(args.disk.len());
+    for spec in &args.disk {
+        let parsed = match parse_disk_spec(spec) {
+            Ok(p) => p,
+            Err(msg) => {
+                eprintln!("snowdrive: invalid --disk spec '{spec}': {msg}");
+                return Err(());
+            }
+        };
+        disk_specs.push(parsed);
+    }
+
+    let mut cdrom_specs = Vec::with_capacity(args.cdrom.len());
+    for spec in &args.cdrom {
+        let parsed = match parse_cdrom_spec(spec) {
+            Ok(p) => p,
+            Err(msg) => {
+                eprintln!("snowdrive: invalid --cdrom spec '{spec}': {msg}");
+                return Err(());
+            }
+        };
+        cdrom_specs.push(parsed);
+    }
+
+    // Reject missing sources up front (FileBackend would otherwise create a
+    // fresh empty file when opened writable; CdromDevice/CdLiveFs would
+    // otherwise fail later).
+    for spec in &disk_specs {
+        match spec {
+            DiskSpec::Img { path, .. } | DiskSpec::Cdrom { path } => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowdrive: file not found: {path}");
+                    return Err(());
+                }
+            }
+            DiskSpec::Ram(_) => {}
+        }
+    }
+    for spec in &cdrom_specs {
+        match spec {
+            CdromSpec::Flat { path } => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowdrive: file not found: {path}");
+                    return Err(());
+                }
+            }
+            CdromSpec::Live { dir } => {
+                if !Path::new(dir).is_dir() {
+                    eprintln!("snowdrive: directory not found: {dir}");
+                    return Err(());
+                }
+            }
+        }
+    }
+
+    for w in check_dual_mount(&dual_mount_specs(&disk_specs, &cdrom_specs)) {
+        eprintln!("{w}");
+    }
+
+    // Allocate every RAM disk first so the Device array can borrow them
+    // without 'static / Box::leak — disjoint borrows via split_first_mut.
+    ram_disks.clear();
+    for spec in &disk_specs {
+        if let DiskSpec::Ram(size) = spec {
+            let bytes = match usize::try_from(*size) {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("snowdrive: RAM size {size} too large for this platform");
+                    return Err(());
+                }
+            };
+            ram_disks.push(vec![0u8; bytes]);
+        }
+    }
+
+    // LUN order: all --disk devices first, then all --cdrom devices (clap
+    // collects each flag separately, so the interleaved appearance order
+    // cannot be restored; the two planes do not interleave).
+    devices.clear();
+    let mut ram_rest: &mut [Vec<u8>] = ram_disks;
+    let mut lun = 0usize;
+    for spec in &disk_specs {
+        match spec {
+            DiskSpec::Ram(_) => {
+                let (slot, tail) = ram_rest.split_first_mut().unwrap();
+                ram_rest = tail;
+                let backend = BlockBackend::Ram(RamBackend::new(slot));
+                let mut dev =
+                    BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+                log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
+                devices.push(Device::Block(dev));
+            }
+            DiskSpec::Img { path, read_only } => {
+                // Existence was checked by parse; FileBackend would otherwise
+                // create a fresh file when opened writable.
+                match FileBackend::open(path, !*read_only) {
+                    Ok(b) => {
+                        let mut dev = BlockDevice::new(BlockBackend::File(b), SECTOR_SIZE)
+                            .expect("SECTOR_SIZE is nonzero");
+                        log::debug!(
+                            "LUN {lun}: {path} block device ({}{} bytes)",
+                            if *read_only { "read-only, " } else { "" },
+                            dev.backend().capacity()
+                        );
+                        devices.push(Device::Block(dev));
+                    }
+                    Err(e) => {
+                        eprintln!("snowdrive: failed to open file block device {path}: {e}");
+                        return Err(());
+                    }
+                }
+            }
+            DiskSpec::Cdrom { path } => {
+                let dev = match CDBlockDevice::new(path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
+                        return Err(());
+                    }
+                };
+                log::debug!("LUN {lun}: {path} CD-ROM image");
+                devices.push(Device::CdBlock(dev));
+            }
+        }
+        lun += 1;
+    }
+    for spec in &cdrom_specs {
+        match spec {
+            CdromSpec::Flat { path } => {
+                let backend = match FileBackend::open(path, false) {
+                    Ok(b) => BlockBackend::File(b),
+                    Err(e) => {
+                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
+                        return Err(());
+                    }
+                };
+                let mut dev = CdromDevice::new(backend);
+                log::debug!(
+                    "LUN {lun}: {path} flat CD-ROM ({} bytes)",
+                    dev.backend().capacity()
+                );
+                devices.push(Device::CdFlat(dev));
+            }
+            CdromSpec::Live { dir } => {
+                let fs = FsBackend::Std(StdFsBackend::new(dir));
+                let label = Path::new(dir)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("SNOWDRIVE");
+                match CdLiveFsDevice::new(fs, label) {
+                    Ok(dev) => {
+                        log::debug!(
+                            "LUN {lun}: {dir} live ISO9660 CD-ROM ({} sectors)",
+                            dev.layout().total
+                        );
+                        devices.push(Device::CdLiveFs(dev));
+                    }
+                    Err(e) => {
+                        eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
+                        return Err(());
+                    }
+                }
+            }
+        }
+        lun += 1;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// `snowdrive serve --usb`: assemble the MSC FunctionFS gadget, bind it to a
+/// UDC and run the BOT poll loop (§6).
+fn run_serve_usb(args: &ServeArgs, devices: &mut [Device<'_>], work_size: usize) -> ExitCode {
+    // Gadget assembly (§6.1): a single MSC interface (class 08/06/50) with
+    // one bulk OUT + one bulk IN endpoint.
+    let (ep_out, out_dir) = EndpointDirection::host_to_device();
+    let (ep_in, in_dir) = EndpointDirection::device_to_host();
+
+    let (custom, handle) = Custom::builder()
+        .with_interface(
+            Interface::new(Class::MASS_STORAGE_SCSI_BULK, "snowdrive msc")
+                .with_endpoint(Endpoint::bulk(out_dir))
+                .with_endpoint(Endpoint::bulk(in_dir)),
+        )
+        .build();
+
+    let udc = match select_udc(args.udc.as_deref()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("snowdrive: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log::info!("binding USB gadget to UDC {:?}", udc.name());
+    let reg = match UsbGadget::new(
+        Class::INTERFACE_SPECIFIC,
+        Id::new(args.vid, args.pid),
+        Strings::new("SnowDrive", "SnowDrive USB Disk", &args.serial),
+    )
+    .with_config(Config::new("config").with_function(handle))
+    .bind(&udc)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("snowdrive: failed to bind USB gadget: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        if let Err(e) = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst)) {
+            eprintln!("snowdrive: failed to install signal handler: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let mut ffs_bot = FfsBot::new(ep_out, ep_in);
+    let mut ffs_gadget = FfsGadget { custom };
+    let mut session = BotSession::with_luns(devices.len());
+    let mut work = vec![0u8; work_size];
+    let mut recv = vec![0u8; work_size];
+
+    log::info!("serving {} LUN(s) over USB", devices.len());
+    if let Err(e) = serve_bot(
+        &mut ffs_bot,
+        &mut ffs_gadget,
+        &mut session,
+        &mut recv,
+        &mut work,
+        devices,
+        &stop,
+    ) {
+        eprintln!("snowdrive: usb serve error: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Graceful exit: flush backends, then unregister the gadget (RAII).
+    sync_devices(devices);
+    drop(reg);
     log::info!("shutting down");
     ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "linux")]
+/// Pick the UDC to bind: `--udc NAME` or the system default.
+fn select_udc(name: Option<&str>) -> Result<Udc, String> {
+    match name {
+        None => default_udc()
+            .map_err(|e| format!("no USB device controller (is dummy_hcd loaded?): {e}")),
+        Some(n) => udcs()
+            .map_err(|e| format!("failed to enumerate UDCs: {e}"))?
+            .into_iter()
+            .find(|u| u.name().to_str() == Some(n))
+            .ok_or_else(|| format!("UDC not found: {n}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// bulk I/O bridge: FunctionFS endpoint <-> [`BotIo`].
+///
+/// The crate's bulk endpoints use Linux native aio with `Bytes`/`BytesMut`
+/// buffers; each receive copies the aio buffer into the caller's slice
+/// (§6.2). `halt()` reports success as `Err(-EBADMSG)` (errno 74), so
+/// `stall_both` treats it as success and ignores the error.
+struct FfsBot {
+    out: EndpointReceiver,
+    in_: EndpointSender,
+}
+
+#[cfg(target_os = "linux")]
+impl FfsBot {
+    fn new(out: EndpointReceiver, in_: EndpointSender) -> Self {
+        Self { out, in_ }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BotIo for FfsBot {
+    fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+        let d = self
+            .out
+            .recv_timeout(bytes::BytesMut::zeroed(buf.len()), Duration::ZERO)
+            .map_err(|_| BotIoErr::Io)?
+            .ok_or(BotIoErr::WouldBlock)?;
+        let n = d.len();
+        buf[..n].copy_from_slice(&d);
+        Ok(n)
+    }
+
+    fn recv_out(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, BotIoErr> {
+        let d = match timeout {
+            Some(t) => self
+                .out
+                .recv_timeout(bytes::BytesMut::zeroed(buf.len()), t)
+                .map_err(|_| BotIoErr::Io)?
+                .ok_or(BotIoErr::WouldBlock)?,
+            None => self
+                .out
+                .recv_and_fetch(bytes::BytesMut::zeroed(buf.len()))
+                .map_err(|_| BotIoErr::Io)?,
+        };
+        let n = d.len();
+        buf[..n].copy_from_slice(&d);
+        Ok(n)
+    }
+
+    fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+        self.in_
+            .send(bytes::Bytes::copy_from_slice(buf))
+            .map_err(|_| BotIoErr::Io)
+    }
+
+    fn stall_both(&mut self) -> Result<(), ()> {
+        // halt() succeeds by returning Err(-EBADMSG) (errno 74) — treated as
+        // success; discard in-flight aio first (§4.7).
+        let _ = self.out.control().and_then(|c| {
+            let _ = c.discard_fifo();
+            c.halt()
+        });
+        let _ = self.in_.control().and_then(|c| {
+            let _ = c.discard_fifo();
+            c.halt()
+        });
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Bulk-Only Reset ack handle: completing the control status stage is the
+/// drop of the FunctionFS receiver (§6.2).
+struct FfsAck<'a> {
+    /// Held for its drop side-effect; never read.
+    #[allow(dead_code)]
+    receiver: Option<CtrlReceiver<'a>>,
+}
+
+#[cfg(target_os = "linux")]
+impl CtrlAck for FfsAck<'_> {
+    fn ack(self) {}
+}
+
+#[cfg(target_os = "linux")]
+/// Get Max LUN reply handle.
+struct FfsReply<'a> {
+    sender: Option<CtrlSender<'a>>,
+}
+
+#[cfg(target_os = "linux")]
+impl CtrlReply for FfsReply<'_> {
+    fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        // CtrlSender::send consumes itself; the short write (≤ wLength) is
+        // tolerated. Never STALL Get Max LUN (§4.3).
+        self.sender
+            .take()
+            .map(|s| s.send(data))
+            .unwrap_or(Ok(0))
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Control-plane bridge: FunctionFS ep0 setup events -> [`CtrlReq`].
+struct FfsGadget {
+    custom: Custom,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> Gadget<'a> for FfsGadget {
+    type Ack = FfsAck<'a>;
+    type Reply = FfsReply<'a>;
+
+    fn try_next_ctrl(&'a mut self) -> Option<CtrlReq<Self::Ack, Self::Reply>> {
+        let ev = self.custom.try_event().ok()??;
+        match ev {
+            Event::SetupHostToDevice(receiver)
+                if receiver.ctrl_req().request == snowdrive::usb::BOT_RESET =>
+            {
+                Some(CtrlReq::BotReset {
+                    ack: FfsAck {
+                        receiver: Some(receiver),
+                    },
+                })
+            }
+            Event::SetupDeviceToHost(sender)
+                if sender.ctrl_req().request == snowdrive::usb::GET_MAX_LUN =>
+            {
+                Some(CtrlReq::GetMaxLun {
+                    reply: FfsReply {
+                        sender: Some(sender),
+                    },
+                })
+            }
+            Event::Bind | Event::Enable | Event::Disable => Some(CtrlReq::LinkReset),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// The PC poll driver (§6.3): control requests first, then one bulk step of
+/// the non-blocking `BotSession` core, bounded by the stop flag.
+fn serve_bot(
+    ffs_bot: &mut FfsBot,
+    ffs_gadget: &mut FfsGadget,
+    session: &mut BotSession,
+    recv: &mut [u8],
+    work: &mut [u8],
+    devs: &mut [Device<'_>],
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    if work.len() < MIN_DATA_LEN {
+        return Err(format!("work buffer smaller than {MIN_DATA_LEN}"));
+    }
+    let mut stalled = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // 1) Control requests first (arrive at any time, even mid data phase).
+        if let Some(req) = ffs_gadget.try_next_ctrl() {
+            match req {
+                CtrlReq::BotReset { ack } => {
+                    session.reset();
+                    ack.ack();
+                    stalled = false;
+                }
+                CtrlReq::GetMaxLun { mut reply } => {
+                    reply
+                        .send(&[session.max_lun()])
+                        .map_err(|_| "Get Max LUN reply failed".to_string())?;
+                }
+                CtrlReq::LinkReset => {
+                    session.reset();
+                    stalled = false;
+                }
+            }
+            continue;
+        }
+        // 2) STALLed: only control events until the host resets (§4.5).
+        if stalled {
+            continue;
+        }
+        match session.need() {
+            BotNeed::NeedOut { len, probe } => {
+                // probe = non-blocking overrun drain (no wait); everything
+                // else bounds the ctrl/stop check latency.
+                let timeout = if probe {
+                    Duration::ZERO
+                } else {
+                    BOT_POLL_GRANULARITY
+                };
+                match ffs_bot.recv_out(&mut recv[..len], Some(timeout)) {
+                    Ok(n) => {
+                        let step = session.poll(BotEvent::OutRecv { data: &recv[..n] }, work, devs);
+                        if let BotStep::Done(r) = step {
+                            handle_done(r, &mut stalled, ffs_bot)?;
+                        }
+                    }
+                    Err(BotIoErr::WouldBlock) => {
+                        if probe {
+                            let step = session.poll(BotEvent::OutIdle, work, devs);
+                            if let BotStep::Done(r) = step {
+                                handle_done(r, &mut stalled, ffs_bot)?;
+                            }
+                        }
+                    }
+                    Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
+                }
+            }
+            BotNeed::NeedIn { len } => {
+                let data = session.out_slice(&work[..]);
+                if data.len() != len {
+                    return Err("internal: out_slice length mismatch".to_string());
+                }
+                ffs_bot
+                    .send_in(data)
+                    .map_err(|_| "bulk IN send failed".to_string())?;
+                let step = session.poll(BotEvent::InSent, work, devs);
+                if let BotStep::Done(r) = step {
+                    handle_done(r, &mut stalled, ffs_bot)?;
+                }
+            }
+            BotNeed::Done(r) => handle_done(r, &mut stalled, ffs_bot)?,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// React to a transaction-end result from the core.
+fn handle_done(
+    result: BotStepResult,
+    stalled: &mut bool,
+    ffs_bot: &mut FfsBot,
+) -> Result<(), String> {
+    match result {
+        BotStepResult::Stalled => {
+            if !*stalled {
+                let _ = ffs_bot.stall_both();
+                *stalled = true;
+            }
+            Ok(())
+        }
+        BotStepResult::Error(e) => Err(format!("BOT core error: {e}")),
+        BotStepResult::Processed | BotStepResult::Closed => Ok(()),
+    }
 }
 
 /// `snowdrive mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
@@ -665,6 +1089,12 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
         ));
     }
     Ok(n)
+}
+
+/// Parse a hexadecimal u16 (with optional `0x` prefix) for `--vid`/`--pid`.
+fn parse_hex_u16(s: &str) -> Result<u16, String> {
+    let body = s.trim_start_matches("0x").trim_start_matches("0X");
+    u16::from_str_radix(body, 16).map_err(|_| format!("invalid hex value: {s}"))
 }
 
 /// Parse a size with an optional K/M/G suffix (C `parse_size`).
@@ -968,6 +1398,64 @@ mod tests {
         // `--block` / `--cdblock` were removed in the dual-plane redesign.
         assert!(Cli::try_parse_from(["snowdrive", "serve", "--block", "ram=1M"]).is_err());
         assert!(Cli::try_parse_from(["snowdrive", "serve", "--cdblock", "x.iso"]).is_err());
+    }
+
+    #[test]
+    fn cli_usb_transport_parses() {
+        match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--disk", "ram=1M"]).unwrap() {
+            Cli::Serve(a) => {
+                assert!(a.usb);
+                assert_eq!(a.iscsi, None);
+                assert_eq!(a.vid, 0x1209);
+                assert_eq!(a.pid, 0x0001);
+                assert_eq!(a.serial, "SNOWSCSI");
+                assert_eq!(a.udc, None);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_both_transports() {
+        // `--iscsi` + `--usb` are mutually exclusive (ArgGroup).
+        assert!(
+            Cli::try_parse_from(["snowdrive", "serve", "--usb", "--iscsi", "127.0.0.1:3260"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_requires_a_transport() {
+        // serve without `--iscsi`/`--usb` fails at parse time.
+        assert!(Cli::try_parse_from(["snowdrive", "serve", "--disk", "ram=1M"]).is_err());
+    }
+
+    #[test]
+    fn cli_usb_descriptor_overrides() {
+        match Cli::try_parse_from([
+            "snowdrive",
+            "serve",
+            "--usb",
+            "--udc",
+            "dummy_udc.0",
+            "--vid",
+            "1d6b",
+            "--pid",
+            "0105",
+            "--serial",
+            "SNOWSCSI-1",
+        ])
+        .unwrap()
+        {
+            Cli::Serve(a) => {
+                assert!(a.usb);
+                assert_eq!(a.udc.as_deref(), Some("dummy_udc.0"));
+                assert_eq!(a.vid, 0x1d6b);
+                assert_eq!(a.pid, 0x0105);
+                assert_eq!(a.serial, "SNOWSCSI-1");
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]
