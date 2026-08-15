@@ -617,6 +617,10 @@ pub struct DiscInfo {
     pub last_track: u8,
     /// Disc Type (MMC-6 Table 369): 0x00=CD-DA/CD-ROM, 0x20=CD-ROM XA.
     pub disc_type: u8,
+    /// MRW Status (byte 7 bits 0-1): 0=not MRW formatted, 1=bgformat
+    /// inactive, 2=bgformat active, 3=MRW formatting complete. The kernel's
+    /// `cdrom_mrw_open_write()` refuses a write open when this is 0.
+    pub mrw_status: u8,
     /// Last Possible Lead-out Start Address (bytes 20-23, LBA).
     pub lead_out_lba: u32,
 }
@@ -642,7 +646,10 @@ pub fn build_read_disc_info<'a>(
     buf[4] = info.sessions;
     buf[5] = info.first_track;
     buf[6] = info.last_track;
-    // Byte 7: DID_V/DBC_V/URU/DAC_V reserved, BG Format Status 00b.
+    // Byte 7: DID_V/DBC_V/URU/DAC_V reserved, MRW Status (bits 1:0).
+    // The kernel's cdrom_mrw_open_write() requires a nonzero MRW status
+    // for a writable open (else mount -o rw fails with EROFS).
+    buf[7] = info.mrw_status & 0x03;
     buf[8] = info.disc_type;
     // Bytes 9-11: MSB halves of sessions / first / last track (all 0).
     // Bytes 12-19: Disc Identification, Last Session Lead-in Start (0).
@@ -946,6 +953,7 @@ mod tests {
             first_track: 1,
             last_track: 1,
             disc_type: 0x20, // CD-ROM XA
+            mrw_status: 0,
             lead_out_lba,
         }
     }

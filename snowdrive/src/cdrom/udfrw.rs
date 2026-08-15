@@ -536,6 +536,10 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             first_track: 1,
             last_track: 1,
             disc_type: 0x00, // oracle-verify: DVD media disc type
+            // MRW formatting complete: the kernel's cdrom_mrw_open_write()
+            // refuses a writable open while mrw_status is 0 ('not mrw'),
+            // which made mount -o rw fail with EROFS.
+            mrw_status: 3,
             lead_out_lba: self.lead_out_lba(),
         };
         build_read_disc_info(data, alloc, &info)
@@ -1105,5 +1109,31 @@ mod tests {
         assert_eq!(buf[7] & 0x20, 0x20, "DVD-RAM write");
         // Byte 2 bit 3: DVD read.
         assert_eq!(buf[6] & 0x08, 0x08, "DVD read");
+    }
+
+    #[test]
+    fn device_read_disc_info_reports_mrw_complete() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_DISC_INFORMATION;
+        cdb[8] = 52;
+        let mut buf = [0u8; 64];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 52);
+        // Byte 7 bits 1:0 = MRW status. The kernel's
+        // cdrom_mrw_open_write() requires a nonzero value to allow a
+        // writable open.
+        assert_eq!(buf[7] & 0x03, 0x03, "MRW formatting complete");
+        // Erasable bit (byte 2 bit 4).
+        assert_eq!(buf[2] & 0x10, 0x10, "erasable");
     }
 }

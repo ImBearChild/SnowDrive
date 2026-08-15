@@ -488,6 +488,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             first_track: 1,
             last_track: 1,
             disc_type: 0x20, // CD-ROM XA
+            mrw_status: 0,
             lead_out_lba: self.lead_out_lba(),
         };
         build_read_disc_info(data, alloc, &info)
