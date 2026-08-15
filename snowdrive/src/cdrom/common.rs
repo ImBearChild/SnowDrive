@@ -427,11 +427,17 @@ pub fn build_get_config_features(
     mut off: usize,
     profile: CurrentProfile,
     caps: &CdromCapabilities,
-    rt: u8,
+    _rt: u8,
     start_feature: u16,
     last_lba: u32,
 ) -> usize {
-    let include = |code: u16| rt != 0x02 || code >= start_feature;
+    // The kernel's cdrom_is_mrw()/cdrom_is_random_writable() issue
+    // GET CONFIGURATION with RT=0 (current) plus a starting feature
+    // (0x0028 / 0x0020) and read the FIRST descriptor expecting the
+    // requested feature — the same behavior real drives exhibit (they
+    // honor Starting Feature Number for every RT). So always start the
+    // response at the requested feature; RT=0 + start 0 yields everything.
+    let include = |code: u16| code >= start_feature;
 
     // Core (0x0001)
     if include(0x0001) {
