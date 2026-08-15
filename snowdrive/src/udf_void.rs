@@ -737,6 +737,7 @@ const ROOT_FE_SIZE: u32 = 184;
 fn write_root_icb(out: &mut [u8], layout: &Layout) {
     put_u16_le(out, 20, 4); // icb strategy type
     out[27] = 4; // icb file type: directory
+    put_u32_le(out, 44, 0x3CA5); // rwxr-xr-x (mkudffs --mode=0755 encoding)
     put_u16_le(out, 48, 1); // link count
     put_u64_le(out, 56, ROOT_DIR_BYTES as u64); // information length
     put_u64_le(out, 64, 1); // logical blocks recorded
