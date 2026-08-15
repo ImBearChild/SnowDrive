@@ -5,6 +5,8 @@
 use crate::cdrom::device::CdromDevice;
 #[cfg(all(feature = "livefs", feature = "std"))]
 use crate::cdrom::livefs::CdLiveFsDevice;
+#[cfg(all(feature = "cdrom", feature = "udf_void"))]
+use crate::cdrom::udfrw::UdfRwDevice;
 use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
@@ -138,6 +140,9 @@ pub enum Device<'a> {
     /// Flat ISO/RAM CD-ROM (Phase 2c).
     #[cfg(feature = "cdrom")]
     CdFlat(CdromDevice<BlockBackend<'a>>),
+    /// Random-writable DVD+RW (UdfRw, plan commit 4).
+    #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+    UdfRw(UdfRwDevice<BlockBackend<'a>>),
     /// Live ISO9660 CD-ROM over a host directory (Phase 2e).
     #[cfg(all(feature = "livefs", feature = "std"))]
     CdLiveFs(CdLiveFsDevice<FsBackend>),
@@ -156,6 +161,8 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.do_cmd(cdb, data, dsl),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Self::UdfRw(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.do_cmd(cdb, data, dsl),
         }
@@ -168,6 +175,8 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => dev.read_data(byte_offset, buf),
             #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.read_data(byte_offset, buf),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Self::UdfRw(dev) => dev.read_data(byte_offset, buf),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.read_data(byte_offset, buf),
         }
@@ -180,6 +189,8 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => dev.write_data(byte_offset, buf),
             #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.write_data(byte_offset, buf),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Self::UdfRw(dev) => dev.write_data(byte_offset, buf),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.write_data(byte_offset, buf),
         }
@@ -192,6 +203,8 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => dev.sense(),
             #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => dev.sense(),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Self::UdfRw(dev) => dev.sense(),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => dev.sense(),
         }
@@ -204,6 +217,8 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => <CDBlockDevice as ScsiDevice>::device_type(dev),
             #[cfg(feature = "cdrom")]
             Self::CdFlat(dev) => <CdromDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Self::UdfRw(dev) => <UdfRwDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::CdLiveFs(dev) => <CdLiveFsDevice<FsBackend> as ScsiDevice>::device_type(dev),
         }

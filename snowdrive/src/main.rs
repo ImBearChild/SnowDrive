@@ -17,6 +17,11 @@
 //!   ISO9660 over a directory); bare `.iso` maps to `img=`. Other bare
 //!   values are rejected (no auto-typing by suffix). `bundle=` (Phase 3)
 //!   and `ram=` (Phase 4) are reserved.
+//! - `--cdrom udfrw=<path>[,size=…][,mkfs=true]` or `--cdrom udfrw=ram:<size>`:
+//!   a random-writable DVD+RW (empty UDF 2.01 volume). `size=` creates a new
+//!   file (K/M/G suffixes) and writes the volume structure; `mkfs=true`
+//!   forces the structure into an existing blank file; `ram:<size>` uses
+//!   memory. An existing formatted volume opens as-is.
 //!
 //! LUN numbering: all `--disk` devices first, then all `--cdrom` devices
 //! (the two planes cannot interleave). The same file path may appear on
@@ -40,6 +45,8 @@ use std::time::Duration;
 use clap::{Args, Parser};
 use snowdrive::cdrom::CdLiveFsDevice;
 use snowdrive::cdrom::CdromDevice;
+#[cfg(feature = "udf_void")]
+use snowdrive::cdrom::{UdfRwDevice, UdfRwMedia};
 use snowdrive::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowdrive::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowdrive::scsi::block::BlockDevice;
@@ -275,6 +282,8 @@ fn sync_devices(devices: &mut [Device<'_>]) {
             Device::Block(d) => d.backend().sync(),
             Device::CdBlock(d) => d.backend().sync(),
             Device::CdFlat(d) => d.backend().sync(),
+            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
+            Device::UdfRw(d) => d.media().sync(),
             Device::CdLiveFs(d) => d.sync().map_err(Into::into),
         };
         if let Err(e) = result {
@@ -351,6 +360,11 @@ fn build_devices<'a>(
                     return Err(());
                 }
             }
+            #[cfg(feature = "udf_void")]
+            CdromSpec::UdfRw { .. } => {
+                // Existence / size / mkfs handling happens in build (new
+                // files are created with size=).
+            }
         }
     }
 
@@ -360,6 +374,8 @@ fn build_devices<'a>(
 
     // Allocate every RAM disk first so the Device array can borrow them
     // without 'static / Box::leak — disjoint borrows via split_first_mut.
+    // Order: --disk RAM slots, then udfrw=ram: slots (consumed in the same
+    // order by the build loops below).
     ram_disks.clear();
     for spec in &disk_specs {
         if let DiskSpec::Ram(size) = spec {
@@ -367,6 +383,24 @@ fn build_devices<'a>(
                 Ok(n) => n,
                 Err(_) => {
                     eprintln!("snowdrive: RAM size {size} too large for this platform");
+                    return Err(());
+                }
+            };
+            ram_disks.push(vec![0u8; bytes]);
+        }
+    }
+    #[cfg(feature = "udf_void")]
+    for spec in &cdrom_specs {
+        if let CdromSpec::UdfRw {
+            path: None,
+            size: Some(size),
+            ..
+        } = spec
+        {
+            let bytes = match usize::try_from(*size) {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("snowdrive: udfrw=ram: size {size} too large for this platform");
                     return Err(());
                 }
             };
@@ -462,9 +496,124 @@ fn build_devices<'a>(
                     }
                 }
             }
+            #[cfg(feature = "udf_void")]
+            CdromSpec::UdfRw { .. } => {
+                ram_rest = match build_udfrw(ram_rest, lun, spec, devices) {
+                    Ok(tail) => tail,
+                    Err(()) => return Err(()),
+                };
+            }
         }
         lun += 1;
     }
+    Ok(())
+}
+
+/// Build a `--cdrom udfrw=` device (file or RAM) per `__UDFRW_PLAN.md`
+/// §7.x: an existing formatted volume opens as-is, `size=` creates a new
+/// file + structure, `mkfs=true` forces the structure into an existing
+/// blank file, `ram:<size>` uses memory. Consumes the next `udfrw=ram:`
+/// slot from `ram_rest` and returns the remaining tail.
+#[cfg(feature = "udf_void")]
+fn build_udfrw<'a>(
+    mut ram_rest: &'a mut [Vec<u8>],
+    lun: usize,
+    spec: &CdromSpec,
+    devices: &mut Vec<Device<'a>>,
+) -> Result<&'a mut [Vec<u8>], ()> {
+    let (path, size, mkfs) = match spec {
+        CdromSpec::UdfRw { path, size, mkfs } => (path.as_deref(), *size, *mkfs),
+        _ => unreachable!("build_udfrw called with a non-udfrw spec"),
+    };
+    let mut scratch = [0u8; 256];
+
+    let dev = if let Some(path) = path {
+        let existed = Path::new(path).exists();
+        if existed && size.is_some() {
+            eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
+            return Err(());
+        }
+        if !existed {
+            let Some(size) = size else {
+                eprintln!("snowdrive: udfrw: file not found, use size= to create it: {path}");
+                return Err(());
+            };
+            if let Err(e) = create_sparse(path, size) {
+                eprintln!("snowdrive: udfrw: failed to create {path}: {e}");
+                return Err(());
+            }
+        }
+        let label = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("SNOWDRIVE");
+        let backend = match FileBackend::open(path, true) {
+            Ok(b) => BlockBackend::File(b),
+            Err(e) => {
+                eprintln!("snowdrive: udfrw: failed to open {path}: {e}");
+                return Err(());
+            }
+        };
+        let dev = match udfrw_open(backend, label, mkfs, existed, &mut scratch) {
+            Ok(d) => d,
+            Err(msg) => {
+                eprintln!("snowdrive: {msg}");
+                return Err(());
+            }
+        };
+        log::debug!("LUN {lun}: {path} UdfRw DVD+RW ({} bytes)", dev.capacity());
+        dev
+    } else {
+        let (slot, tail) = ram_rest.split_first_mut().unwrap();
+        ram_rest = tail;
+        let backend = BlockBackend::Ram(RamBackend::new(slot));
+        let dev = match udfrw_open(backend, "SNOWDRIVE", false, false, &mut scratch) {
+            Ok(d) => d,
+            Err(msg) => {
+                eprintln!("snowdrive: {msg}");
+                return Err(());
+            }
+        };
+        log::debug!("LUN {lun}: UdfRw DVD+RW in RAM ({} bytes)", dev.capacity());
+        dev
+    };
+    devices.push(Device::UdfRw(dev));
+    Ok(ram_rest)
+}
+
+/// Open (or materialize) a UdfRw volume, applying the CLI policy
+/// (`__UDFRW_PLAN.md` §7.x rules): refuse `mkfs=true` over an existing
+/// formatted volume; require `mkfs=true` for an existing non-udfrw file.
+#[cfg(feature = "udf_void")]
+fn udfrw_open<B: BlockStorage>(
+    mut backend: B,
+    label: &str,
+    mkfs: bool,
+    existed: bool,
+    scratch: &mut [u8],
+) -> Result<UdfRwDevice<B>, String> {
+    let formatted = UdfRwMedia::formatted(&mut backend);
+    if formatted && mkfs {
+        return Err(format!(
+            "udfrw: '{label}' is already a UdfRw volume; refusing mkfs=true (delete it first)"
+        ));
+    }
+    if !formatted && existed && !mkfs {
+        return Err(format!(
+            "udfrw: '{label}' is not a UdfRw volume; use mkfs=true to format it"
+        ));
+    }
+    let force = mkfs || !existed || !formatted;
+    UdfRwDevice::open_or_materialize(backend, label, force, scratch)
+        .map_err(|e| format!("udfrw: {e}"))
+}
+
+/// Create (or truncate) `path` as a sparse file of `size` bytes. `size` is
+/// floored to a whole 2048-byte sector by the media layer.
+#[cfg(feature = "udf_void")]
+fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
+    let f = File::create(path)?;
+    f.set_len(size)?;
     Ok(())
 }
 
@@ -966,6 +1115,14 @@ enum CdromSpec {
     /// `live=<dir>` → live ISO9660 over a directory
     /// (`CdLiveFsDevice<FsBackend>`).
     Live { dir: String },
+    /// `udfrw=<path>[,size=…][,mkfs=true]` or `udfrw=ram:<size>` → a
+    /// random-writable DVD+RW (`UdfRwDevice`). `path = None` means RAM.
+    #[cfg(feature = "udf_void")]
+    UdfRw {
+        path: Option<String>,
+        size: Option<u64>,
+        mkfs: bool,
+    },
 }
 
 /// How a path is exposed as a SCSI device (dual-mount detection).
@@ -974,6 +1131,8 @@ enum DeviceKind {
     Block,
     CdBlock,
     CdFlat,
+    #[cfg(feature = "udf_void")]
+    UdfRw,
     CdLiveFs,
 }
 
@@ -992,9 +1151,15 @@ fn dual_mount_specs<'a>(
             DiskSpec::Ram(_) => None,
         })
         .collect();
-    out.extend(cdrom_specs.iter().map(|s| match s {
-        CdromSpec::Flat { path } => (DeviceKind::CdFlat, path.as_str()),
-        CdromSpec::Live { dir } => (DeviceKind::CdLiveFs, dir.as_str()),
+    out.extend(cdrom_specs.iter().filter_map(|s| match s {
+        CdromSpec::Flat { path } => Some((DeviceKind::CdFlat, path.as_str())),
+        CdromSpec::Live { dir } => Some((DeviceKind::CdLiveFs, dir.as_str())),
+        #[cfg(feature = "udf_void")]
+        CdromSpec::UdfRw {
+            path: Some(path), ..
+        } => Some((DeviceKind::UdfRw, path.as_str())),
+        #[cfg(feature = "udf_void")]
+        CdromSpec::UdfRw { path: None, .. } => None, // RAM: no path
     }));
     out
 }
@@ -1082,6 +1247,9 @@ fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
     if spec.starts_with("ram=") {
         return Err("ram= cdrom mode is not yet supported (Phase 4)".to_string());
     }
+    if let Some(rest) = spec.strip_prefix("udfrw=") {
+        return parse_udfrw_spec(rest);
+    }
     let (value, opts) = match spec.split_once(',') {
         Some((v, o)) => (v, o),
         None => (spec, ""),
@@ -1125,6 +1293,75 @@ fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
         "{path}: not a .iso file and no explicit cdrom key; use \
          `--cdrom img=<iso>` / `--cdrom live=<dir>` / `--cdrom <file>.iso`"
     ))
+}
+
+/// Parse the `udfrw=` value: `ram:<size>` (memory) or
+/// `<path>[,size=…][,mkfs=true]` (file). File semantics per
+/// `__UDFRW_PLAN.md` §7.x: `size=` creates a new file + structure, `mkfs`
+/// forces the structure into an existing blank file, both are exclusive.
+#[cfg(feature = "udf_void")]
+fn parse_udfrw_spec(spec: &str) -> Result<CdromSpec, String> {
+    if let Some(size) = spec.strip_prefix("ram:") {
+        if spec.contains(',') {
+            return Err("udfrw=ram:<size> takes no options".to_string());
+        }
+        let size = parse_byte_size(size)?;
+        return Ok(CdromSpec::UdfRw {
+            path: None,
+            size: Some(size),
+            mkfs: false,
+        });
+    }
+    let (path, opts) = match spec.split_once(',') {
+        Some((p, o)) => (p, o),
+        None => (spec, ""),
+    };
+    if path.is_empty() {
+        return Err("empty udfrw path".to_string());
+    }
+    let mut size = None;
+    let mut mkfs = false;
+    for opt in opts.split(',') {
+        if opt.is_empty() {
+            continue;
+        }
+        if let Some(v) = opt.strip_prefix("size=") {
+            if size.is_some() {
+                return Err("duplicate size=".to_string());
+            }
+            size = Some(parse_byte_size(v)?);
+        } else if opt == "mkfs=true" {
+            mkfs = true;
+        } else if opt == "mkfs=false" {
+            mkfs = false;
+        } else {
+            return Err(format!("unknown udfrw option '{opt}'"));
+        }
+    }
+    if size.is_some() && mkfs {
+        return Err("size= (new file) and mkfs=true (existing file) are exclusive".to_string());
+    }
+    Ok(CdromSpec::UdfRw {
+        path: Some(path.to_string()),
+        size,
+        mkfs,
+    })
+}
+
+/// Parse a byte size with an optional `K`/`M`/`G` suffix (QEMU-style).
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    if s.is_empty() {
+        return Err("empty size".to_string());
+    }
+    let (num, mult) = match s.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1u64 << 10),
+        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1u64 << 20),
+        Some(b'g') | Some(b'G') => (&s[..s.len() - 1], 1u64 << 30),
+        _ => (s, 1),
+    };
+    let n: u64 = num.parse().map_err(|_| format!("invalid size '{s}'"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("size '{s}' too large"))
 }
 
 /// Resolve the work buffer size (default 256K), validating it against
@@ -1283,6 +1520,71 @@ mod tests {
         }
         assert!(parse_cdrom_spec("").is_err());
         assert!(parse_cdrom_spec(",live").is_err());
+    }
+
+    #[cfg(feature = "udf_void")]
+    #[test]
+    fn parse_udfrw_spec_file_and_ram() {
+        match parse_cdrom_spec("udfrw=disk.img").unwrap() {
+            CdromSpec::UdfRw {
+                path: Some(p),
+                size: None,
+                mkfs: false,
+            } => assert_eq!(p, "disk.img"),
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        match parse_cdrom_spec("udfrw=disk.img,size=4G").unwrap() {
+            CdromSpec::UdfRw {
+                path: Some(p),
+                size: Some(s),
+                mkfs: false,
+            } => {
+                assert_eq!(p, "disk.img");
+                assert_eq!(s, 4 << 30);
+            }
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        match parse_cdrom_spec("udfrw=disk.img,mkfs=true").unwrap() {
+            CdromSpec::UdfRw {
+                path: Some(p),
+                size: None,
+                mkfs: true,
+            } => assert_eq!(p, "disk.img"),
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        match parse_cdrom_spec("udfrw=ram:64M").unwrap() {
+            CdromSpec::UdfRw {
+                path: None,
+                size: Some(s),
+                mkfs: false,
+            } => assert_eq!(s, 64 << 20),
+            other => panic!("unexpected spec: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "udf_void")]
+    #[test]
+    fn parse_udfrw_spec_rejects_conflicts() {
+        // size= (new file) and mkfs=true (existing file) are exclusive.
+        assert!(parse_cdrom_spec("udfrw=a.img,size=1M,mkfs=true").is_err());
+        // ram: takes no options.
+        assert!(parse_cdrom_spec("udfrw=ram:64M,size=1M").is_err());
+        // Empty / unknown / bad size.
+        assert!(parse_cdrom_spec("udfrw=").is_err());
+        assert!(parse_cdrom_spec("udfrw=a.img,bogus=1").is_err());
+        assert!(parse_cdrom_spec("udfrw=a.img,size=zz").is_err());
+    }
+
+    #[cfg(feature = "udf_void")]
+    #[test]
+    fn parse_byte_size_suffixes() {
+        assert_eq!(parse_byte_size("512").unwrap(), 512);
+        assert_eq!(parse_byte_size("4K").unwrap(), 4 << 10);
+        assert_eq!(parse_byte_size("16m").unwrap(), 16 << 20);
+        assert_eq!(parse_byte_size("1G").unwrap(), 1 << 30);
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("zz").is_err());
+        assert!(parse_byte_size("999999999999999999999999G").is_err());
     }
 
     #[test]

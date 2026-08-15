@@ -24,7 +24,7 @@ livefs = ["cdrom", "iso9660"]
 usb = ["scsi"]
 
 # CLI feature: the `snowdrive` binary + its std-only deps (clap etc.).
-cli = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "usb", "log",
+cli = ["std", "scsi", "iscsi", "iso9660", "udf_void", "cdrom", "livefs", "usb", "log",
        "dep:clap", "dep:ctrlc", "dep:env_logger"]
 
 # Optional features.
