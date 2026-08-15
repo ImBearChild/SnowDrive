@@ -24,6 +24,8 @@ pub mod common;
 pub mod device;
 #[cfg(feature = "livefs")]
 pub mod livefs;
+#[cfg(feature = "udf_void")]
+pub mod udfrw;
 
 pub use common::{
     build_get_config_response, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY, SECTOR_SIZE,
@@ -31,3 +33,5 @@ pub use common::{
 pub use device::CdromDevice;
 #[cfg(feature = "livefs")]
 pub use livefs::CdLiveFsDevice;
+#[cfg(feature = "udf_void")]
+pub use udfrw::{UdfRwError, UdfRwMedia};

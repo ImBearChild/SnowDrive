@@ -51,7 +51,7 @@ pub const MIN_CAPACITY_SECTORS: u32 = 2048;
 const VRS_LBA: u32 = 16;
 
 /// Primary anchor (ECMA-167 3/10.2: anchors at 256 / N-256 / N).
-const AVDP_LBA: u32 = 256;
+pub const AVDP_LBA: u32 = 256;
 
 /// Volume descriptor sequence extent size (spec minimum 16 sectors).
 const VDS_SECTORS: u32 = 16;
@@ -350,6 +350,31 @@ pub fn crc16(data: &[u8], crc: u16) -> u16 {
         c = CRC_TABLE[(((c >> 8) ^ u16::from(b)) & 0xFF) as usize] ^ (c << 8);
     }
     c
+}
+
+/// Validate a sector as an Anchor Volume Descriptor Pointer: tag id 2,
+/// descriptor version 3, valid tag checksum and a matching descriptor CRC
+/// over the 16-byte body (AVDP size 32 − tag 16).
+///
+/// Used by the media layer to detect an already-formatted UdfRw volume
+/// (`__UDFRW_PLAN.md` §7.x rule 4).
+pub fn is_avdp(sector: &[u8]) -> bool {
+    if sector.len() < 32 {
+        return false;
+    }
+    if u16::from_le_bytes([sector[0], sector[1]]) != TAG_AVDP {
+        return false;
+    }
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&sector[..16]);
+    if sector[4] != tag_checksum(&tag) {
+        return false;
+    }
+    if u16::from_le_bytes([sector[10], sector[11]]) as usize != 32 - TAG_SIZE {
+        return false;
+    }
+    let crc = u16::from_le_bytes([sector[8], sector[9]]);
+    crc == crc16(&sector[16..32], 0)
 }
 
 /// Descriptor tag checksum: sum of the 16 tag bytes with byte 4 (the
@@ -1094,6 +1119,19 @@ mod tests {
                 assert_eq!(s[4], tag_checksum(&tag), "LBA {lba}: checksum");
             }
         }
+    }
+
+    #[test]
+    fn is_avdp_validates_generated_anchor() {
+        let l = layout_of(MIN_CAPACITY_SECTORS);
+        let mut s = sector();
+        gen_sector(&l, AVDP_LBA, &mut s);
+        assert!(is_avdp(&s));
+        // Corrupt the CRC → rejected.
+        s[8] ^= 0xFF;
+        assert!(!is_avdp(&s));
+        // Zero sector → rejected.
+        assert!(!is_avdp(&[0u8; 32]));
     }
 
     #[test]
