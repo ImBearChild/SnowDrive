@@ -286,7 +286,10 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             return Err(Error::WorkBufTooSmall);
         }
         let outcome = if let Some(cmd) = parse_spc(cdb) {
-            execute_spc(&mut self.common, cmd, data, dsl)
+            // Dispatch via `self` (not `self.common`) so MODE SENSE 0x2A
+            // reports the writable UdfRw capabilities, not the read-only
+            // CD-ROM page.
+            execute_spc(self, cmd, data, dsl)
         } else {
             let Some(op) = cdb_opcode(cdb) else {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
@@ -614,7 +617,7 @@ impl<B: BlockStorage> SpcDevice for UdfRwDevice<B> {
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {
-        crate::cdrom::common::cdrom_mode_page(page)
+        crate::cdrom::common::udfrw_mode_page(page)
     }
 
     fn sense(&self) -> &Sense {
@@ -1073,5 +1076,34 @@ mod tests {
             dev.do_cmd(&cdb, &mut w, 0).unwrap(),
             CommandOutcome::Status
         ));
+    }
+
+    #[test]
+    fn device_mode_sense_2a_reports_writable() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::MODE_SENSE_6;
+        cdb[2] = 0x2A;
+        cdb[4] = 64;
+        let mut buf = [0u8; 64];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 28); // 4 header + 24 page
+        assert_eq!(buf[4], 0x2A); // page code
+                                  // Byte 3 (as read by the kernel's sr driver): CD-R/CD-RW write,
+                                  // DVD-R write (0x10), DVD-RAM write (0x20).
+        assert_eq!(buf[7] & 0x01, 0x01, "CD-R write");
+        assert_eq!(buf[7] & 0x10, 0x10, "DVD-R write");
+        assert_eq!(buf[7] & 0x20, 0x20, "DVD-RAM write");
+        // Byte 2 bit 3: DVD read.
+        assert_eq!(buf[6] & 0x08, 0x08, "DVD read");
     }
 }

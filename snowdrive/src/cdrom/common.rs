@@ -281,6 +281,67 @@ pub const fn build_capabilities_page(caps: &CdromCapabilities) -> [u8; 24] {
 /// devices, built from the capability model rather than hardcoded bytes.
 const CDROM_CAPABILITIES: [u8; 24] = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
 
+/// MODE SENSE page 0x2A for the UdfRw device, laid out as the kernel's
+/// `sr` driver reads it (byte 2 bit 3 = DVD read; byte 3 bits 0/1/4/5 =
+/// CD-R / CD-RW / DVD-R / DVD-RAM write; byte 6 bits 7-5 = loading
+/// mechanism, bit 3 = eject). [`build_capabilities_page`] uses a different
+/// (SFF-8090) byte layout that `sr` ignores, so the writable device needs
+/// its own page — otherwise every capability reads as zero and the drive
+/// looks read-only to tooling.
+const UDFRW_CAPABILITIES: [u8; 24] = [
+    0x2A,
+    22,                        // page code, page length
+    0x02 | 0x08,               // CD-RW read | DVD read
+    0x01 | 0x02 | 0x10 | 0x20, // CD-R/CD-RW/DVD-R/DVD-RAM write
+    0x00,                      // XA/form2 read
+    0x00,                      // CD-DA
+    0x20 | 0x08,               // byte 6: loading mechanism tray | eject
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+];
+
+/// Total byte count of all UdfRw mode pages (for 0x3F sizing).
+pub(crate) const ALL_UDFRW_PAGES_LEN: usize = CACHING_PAGE.len()
+    + VENDOR_PAGE.len()
+    + CDROM_PARAMS.len()
+    + CDROM_AUDIO.len()
+    + UDFRW_CAPABILITIES.len();
+
+/// All UdfRw mode pages, in MODE SENSE page order (for `0x3F`).
+const ALL_UDFRW_PAGES: [u8; ALL_UDFRW_PAGES_LEN] = concat_pages(&[
+    &CACHING_PAGE,
+    &VENDOR_PAGE,
+    &CDROM_PARAMS,
+    &CDROM_AUDIO,
+    &UDFRW_CAPABILITIES,
+]);
+
+/// MODE SENSE page data for the UdfRw device (`0x3F` = all pages): the
+/// writable 0x2A page replaces the read-only one; everything else matches
+/// [`cdrom_mode_page`].
+pub(crate) fn udfrw_mode_page(page: u8) -> Option<&'static [u8]> {
+    match page {
+        0x2A => Some(&UDFRW_CAPABILITIES),
+        0x3F => Some(&ALL_UDFRW_PAGES),
+        _ => cdrom_mode_page(page),
+    }
+}
+
 /// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
     match page {
