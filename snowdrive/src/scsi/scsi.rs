@@ -30,6 +30,7 @@ pub mod op {
     pub const WRITE_12: u8 = 0xAA;
 
     // MMC-6 (CD/DVD) opcodes.
+    pub const READ_FORMAT_CAPACITIES: u8 = 0x23;
     pub const READ_TOC: u8 = 0x43;
     pub const GET_CONFIGURATION: u8 = 0x46;
     pub const READ_DISC_INFORMATION: u8 = 0x51;
@@ -283,6 +284,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::PREVENT_ALLOW => "PREVENT_ALLOW",
         op::START_STOP_UNIT => "START_STOP_UNIT",
         op::READ_TOC => "READ_TOC",
+        op::READ_FORMAT_CAPACITIES => "READ_FORMAT_CAPACITIES",
         op::GET_CONFIGURATION => "GET_CONFIGURATION",
         op::READ_DISC_INFORMATION => "READ_DISC_INFORMATION",
         op::READ_BUFFER_CAPACITY => "READ_BUFFER_CAPACITY",

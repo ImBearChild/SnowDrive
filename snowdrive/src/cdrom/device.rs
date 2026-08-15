@@ -392,6 +392,7 @@ impl<B: BlockStorage> CdromDevice<B> {
             rt,
             start,
             alloc,
+            0,
         )
     }
 }
@@ -720,7 +721,7 @@ mod tests {
         let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
         assert_eq!(n, 52);
         assert_eq!(buf[0], 0x32); // length
-        assert_eq!(buf[2], 0x32); // finalized, complete session, data CD
+        assert_eq!(buf[2], 0x0E); // finalized, complete session, data CD (Table 365)
         assert_eq!(buf[3], 1); // first track
         assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
                                   // 100 sectors → lead-out LBA 100 (0x00000064).

@@ -34,4 +34,4 @@ pub use device::CdromDevice;
 #[cfg(feature = "livefs")]
 pub use livefs::CdLiveFsDevice;
 #[cfg(feature = "udf_void")]
-pub use udfrw::{UdfRwError, UdfRwMedia};
+pub use udfrw::{UdfRwDevice, UdfRwError, UdfRwMedia};

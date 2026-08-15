@@ -40,6 +40,8 @@ pub enum CurrentProfile {
     CdR,
     /// 0x000A — CD-RW (Phase 4).
     CdRw,
+    /// 0x001A — DVD+RW (UdfRw random-writable media, plan commit 3).
+    DvdRw,
 }
 
 impl CurrentProfile {
@@ -50,6 +52,7 @@ impl CurrentProfile {
             Self::DvdRom => 0x0010,
             Self::CdR => 0x0009,
             Self::CdRw => 0x000A,
+            Self::DvdRw => 0x001A,
         }
     }
 
@@ -169,6 +172,12 @@ pub struct CdromCapabilities {
     pub read_cdr: bool,
     pub read_cdrw: bool,
     pub read_dvd_rom: bool,
+    /// Random Writable feature (0x0020): the drive presents a formatted
+    /// random-writable media. Set by the UdfRw device.
+    pub random_writable: bool,
+    /// DVD+RW feature (0x002A): write capable DVD+RW media. Set by the
+    /// UdfRw device.
+    pub dvd_plus_rw: bool,
     /// Write-side extras (Phase 3+ CD-R/CD-RW).
     pub write_cdr: bool,
     pub write_cdrw: bool,
@@ -196,6 +205,8 @@ impl CdromCapabilities {
             read_cdr: false,
             read_cdrw: false,
             read_dvd_rom: false,
+            random_writable: false,
+            dvd_plus_rw: false,
             write_cdr: false,
             write_cdrw: false,
             test_write: false,
@@ -210,6 +221,15 @@ impl CdromCapabilities {
 
 /// The capabilities of the read-only CD-ROM devices (flat / livefs).
 pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
+
+/// Capabilities of the UdfRw device: reads DVD media and presents a
+/// formatted, random-writable DVD+RW (features 0x0020 + 0x002A).
+pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
+    read_dvd_rom: true,
+    random_writable: true,
+    dvd_plus_rw: true,
+    ..CdromCapabilities::read_only_cd_rom()
+};
 
 /// `true` → 1 (const bit packing).
 const fn bit(b: bool) -> u8 {
@@ -311,7 +331,8 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 
 /// Build GET CONFIGURATION feature descriptors common to all CD-ROM
 /// devices (plan §8.2).  Writes into `buf[off..]` and returns the new
-/// offset.  `profile` is the current profile.
+/// offset.  `profile` is the current profile; `last_lba` feeds the Random
+/// Writable feature (ignored unless `caps.random_writable`).
 ///
 /// Features included (all current):
 /// - 0x0001 Core (version 2, persistent, additional length 8)
@@ -319,7 +340,9 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x0010 Random Readable (block size 2048)
 /// - 0x001D Multi-Read
 /// - 0x001E CD Read (version 2)
-/// - 0x001F DVD Read (only if profile is DVD-ROM)
+/// - 0x001F DVD Read (only for DVD profiles)
+/// - 0x0020 Random Writable (only if `caps.random_writable`)
+/// - 0x002A DVD+RW (only if `caps.dvd_plus_rw`)
 pub fn build_get_config_features(
     buf: &mut [u8],
     mut off: usize,
@@ -327,6 +350,7 @@ pub fn build_get_config_features(
     caps: &CdromCapabilities,
     rt: u8,
     start_feature: u16,
+    last_lba: u32,
 ) -> usize {
     let include = |code: u16| rt != 0x02 || code >= start_feature;
 
@@ -385,12 +409,39 @@ pub fn build_get_config_features(
         off += 8;
     }
 
-    // DVD Read (0x001F) — only for DVD-ROM profile
-    if matches!(profile, CurrentProfile::DvdRom) && include(0x001F) {
+    // DVD Read (0x001F) — only for DVD profiles
+    if matches!(profile, CurrentProfile::DvdRom | CurrentProfile::DvdRw) && include(0x001F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1F;
         buf[off + 2] = 0x01; // current
         off += 4;
+    }
+
+    // Random Writable (0x0020) — formatted random-writable media (UdfRw).
+    if caps.random_writable && include(0x0020) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x20;
+        buf[off + 2] = 0x05; // version 1 + current (sg3_utils convention)
+        buf[off + 3] = 0x0C; // additional length
+        buf[off + 4..off + 8].copy_from_slice(&last_lba.to_be_bytes());
+        buf[off + 8..off + 12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
+        buf[off + 12..off + 14].copy_from_slice(&1u16.to_be_bytes()); // blocking
+        buf[off + 14] = 0x00; // PP: no error recovery page
+        buf[off + 15] = 0x00;
+        off += 16;
+    }
+
+    // DVD+RW (0x002A) — write capable (UdfRw).
+    if caps.dvd_plus_rw && include(0x002A) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2A;
+        buf[off + 2] = 0x05; // version 1 + current
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x01; // Write
+        buf[off + 5] = 0x00; // Quick Start / Close Only clear
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
     }
 
     off
@@ -404,13 +455,16 @@ pub fn build_get_config_response<'a>(
     rt: u8,
     start_feature: u16,
     alloc: u16,
+    last_lba: u32,
 ) -> CommandOutcome<'a> {
-    let mut buf = [0u8; 64];
+    // Header (8) + all features: Core(12) Removable(8) RandomReadable(12)
+    // MultiRead(4) CDRead(8) DVDRead(4) RandomWritable(16) DVD+RW(8).
+    let mut buf = [0u8; 80];
     // Header: bytes 0-3 = data length (placeholder), 6-7 = current profile.
     buf[6] = (profile.code() >> 8) as u8;
     buf[7] = profile.code() as u8;
 
-    let off = build_get_config_features(&mut buf, 8, profile, caps, rt, start_feature);
+    let off = build_get_config_features(&mut buf, 8, profile, caps, rt, start_feature, last_lba);
 
     // Data length = bytes following the 4-byte data-length field itself.
     let data_len = (off - 4) as u32;
@@ -481,11 +535,11 @@ pub fn build_read_disc_info<'a>(
     // Standard block: Disc Information Length = 0x32 (+8×OPC tables, none).
     let mut buf = [0u8; 52];
     buf[0] = 0x32;
-    // Byte 2: Data Type 000b | State of last Session | Erasable | Disc
-    // Status (bits 7:6 | 5:4 | 3 | 1:0).
-    let state = (info.state_of_last_session & 0b11) << 4;
-    let erasable = u8::from(info.erasable) << 3;
-    buf[2] = state | erasable | (info.disc_status & 0b11);
+    // Byte 2: Disc Information Data Type 000b | Erasable | State of last
+    // Session | Disc Status (bits 7:5 | 4 | 3:2 | 1:0) — MMC-6 Table 365.
+    let state = (info.state_of_last_session & 0b11) << 2;
+    let erasable = u8::from(info.erasable) << 4;
+    buf[2] = erasable | state | (info.disc_status & 0b11);
     buf[3] = info.first_track;
     buf[4] = info.sessions;
     buf[5] = info.first_track;
@@ -684,7 +738,7 @@ mod tests {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
         let outcome =
-            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64);
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64, 0);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert!(n >= 8);
@@ -698,7 +752,7 @@ mod tests {
         let mut w = work();
         let profile = CurrentProfile::DvdRom;
         let outcome =
-            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64);
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 64, 0);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert!(n >= 8);
@@ -711,7 +765,7 @@ mod tests {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
         let outcome =
-            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 255);
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 255, 0);
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &mut buf);
         // Core (0x0001) at 8, Removable (0x0003, 8 bytes) at 20, Random
@@ -733,7 +787,7 @@ mod tests {
         let profile = CurrentProfile::CdRom;
         // RT=10b, start 0x0010 → Random Readable + Multi-Read + CD Read
         let outcome =
-            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x02, 0x0010, 255);
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x02, 0x0010, 255, 0);
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &mut buf);
         // Header (8) + Random Readable (12) + Multi-Read (4) + CD Read (8) = 32
@@ -749,7 +803,7 @@ mod tests {
         let profile = CurrentProfile::CdRom;
         // Very small alloc — only header returned
         let outcome =
-            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 8);
+            build_get_config_response(&mut w, profile, &READ_ONLY_CDROM_CAPS, 0x00, 0x0000, 8, 0);
         let mut buf = [0u8; 64];
         let n = data_in(outcome, &mut buf);
         assert_eq!(n, 8); // only header fits
@@ -780,9 +834,9 @@ mod tests {
         assert_eq!(n, 52);
         assert_eq!(buf[0], 0x32); // Disc Information Length (excludes itself)
         assert_eq!(buf[1], 0x00);
-        // Byte 2: Data Type 00b | State of last Session 11b | Erasable 0 |
-        // Disc Status 10b = 0b00110010.
-        assert_eq!(buf[2], 0x32);
+        // Byte 2: Erasable 0 | State of last Session 11b | Disc Status 10b
+        // = 0b00001110 (MMC-6 Table 365: erasable<<4 | state<<2 | status).
+        assert_eq!(buf[2], 0x0E);
         assert_eq!(buf[3], 1); // first track
         assert_eq!(buf[4], 1); // sessions LSB
         assert_eq!(buf[5], 1); // first track in last session
@@ -820,9 +874,9 @@ mod tests {
         let mut buf = [0u8; 52];
         let n = data_in(build_read_disc_info(&mut w, 52, &info), &mut buf);
         assert_eq!(n, 52);
-        // Byte 2: 00 (type) | 01 (incomplete session) | 1 (erasable) |
-        // 01 (incomplete disc) = 0b00011001.
-        assert_eq!(buf[2], 0x19);
+        // Byte 2: Erasable 1 | State of last Session 01b | Disc Status 01b
+        // = 0b00010101.
+        assert_eq!(buf[2], 0x15);
     }
 
     // ── Capabilities page (0x2A) ────────────────────────────────────
@@ -903,5 +957,55 @@ mod tests {
         assert_eq!(CurrentProfile::DvdRom.code(), 0x0010);
         assert_eq!(CurrentProfile::CdR.code(), 0x0009);
         assert_eq!(CurrentProfile::CdRw.code(), 0x000A);
+        assert_eq!(CurrentProfile::DvdRw.code(), 0x001A);
+    }
+
+    #[test]
+    fn get_config_dvd_rw_features() {
+        let mut w = work();
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::DvdRw,
+            &UDFRW_CAPS,
+            0x00,
+            0x0000,
+            255,
+            0x1234,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &mut buf);
+        assert!(n >= 8 + 12 + 8 + 12 + 4 + 8 + 4 + 16 + 8);
+        assert_eq!(buf[7], 0x1A); // current profile DVD+RW
+                                  // Walk the feature list and check codes + key fields.
+        let mut off = 8usize;
+        let mut saw_rw = false;
+        let mut saw_dvdrw = false;
+        while off + 4 <= n {
+            let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let add_len = buf[off + 3] as usize;
+            match code {
+                0x0020 => {
+                    saw_rw = true;
+                    assert_eq!(buf[off + 2], 0x05); // version 1 + current
+                    assert_eq!(add_len, 12);
+                    assert_eq!(&buf[off + 4..off + 8], &0x1234u32.to_be_bytes());
+                    assert_eq!(&buf[off + 8..off + 12], &2048u32.to_be_bytes());
+                    assert_eq!(&buf[off + 12..off + 14], &1u16.to_be_bytes());
+                }
+                0x002A => {
+                    saw_dvdrw = true;
+                    assert_eq!(add_len, 4);
+                    assert_eq!(buf[off + 4], 0x01); // Write
+                }
+                0x001F => {
+                    // DVD Read present for the DVD+RW profile.
+                    assert_eq!(add_len, 0);
+                }
+                _ => {}
+            }
+            off += 4 + add_len;
+        }
+        assert!(saw_rw, "Random Writable feature must be present");
+        assert!(saw_dvdrw, "DVD+RW feature must be present");
     }
 }

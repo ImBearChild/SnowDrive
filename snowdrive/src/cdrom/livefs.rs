@@ -536,6 +536,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             rt,
             start,
             alloc,
+            0,
         )
     }
 }
@@ -867,7 +868,7 @@ mod tests {
         let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
         assert_eq!(n, 52);
         assert_eq!(buf[0], 0x32); // length
-        assert_eq!(buf[2], 0x32); // finalized, complete session, data CD
+        assert_eq!(buf[2], 0x0E); // finalized, complete session, data CD (Table 365)
         assert_eq!(buf[3], 1); // first track
         assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
                                   // Lead-out = layout total (31 sectors for the sample tree).
