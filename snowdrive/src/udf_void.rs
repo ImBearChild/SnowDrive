@@ -476,13 +476,18 @@ fn charspec(out: &mut [u8], off: usize) {
     out[off + 1..off + 24].copy_from_slice(b"OSTA Compressed Unicode");
 }
 
-/// d-string: length byte + ASCII data, plus the udftools convention of
-/// storing `1 + length` in the field's last byte (used by udfinfo/wrudf for
-/// reading; the kernel reads only the leading length byte).
+/// d-string in OSTA CS0 8-bit form (mkudffs convention): byte 0 = **8** (the
+/// 8-bit compression code, not the length — both Linux `udf_name_from_CS0`
+/// and udftools `decode_string` only accept 8/16 here), then the ASCII
+/// bytes, and `1 + length` in the field's last byte (the dstring length
+/// both decoders derive the count from). An empty string stays all zeros.
 fn dstring(out: &mut [u8], off: usize, cap: usize, s: &str) {
     let data = s.as_bytes();
-    let n = data.len().min(cap - 1);
-    out[off] = n as u8;
+    let n = data.len().min(cap - 2); // room for the 8 code + the length byte
+    if n == 0 {
+        return;
+    }
+    out[off] = 8;
     out[off + 1..off + 1 + n].copy_from_slice(&data[..n]);
     out[off + cap - 1] = (n + 1) as u8;
 }
@@ -586,15 +591,18 @@ fn write_iuvd(out: &mut [u8], layout: &Layout, loc: u32) {
 /// (mkudffs `default_pd`).
 fn write_pd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 3); // volume descriptor sequence number
-    put_u16_le(out, 20, 0); // partition flags
+    put_u16_le(out, 20, 1); // partition flags: allocated
     put_u16_le(out, 22, 0); // partition number
-                            // Partition contents (oracle-verify: identifier string).
-    regid_udf(out, 24);
+                            // Partition contents "+NSR03" (mkudffs
+                            // PD_PARTITION_CONTENTS_NSR03); the kernel's
+                            // check_partition_desc requires an exact
+                            // NSR02/NSR03 match for a writable mount.
+    regid_ident(out, 24, b"+NSR03");
     let phd = 56;
     out[phd..phd + 8].copy_from_slice(&short_ad(USE_SIZE, 1)); // unalloc space table
     out[phd + 8..phd + 16].copy_from_slice(&short_ad(layout.sbd_num_bytes, 2)); // unalloc space bitmap
                                                                                 // part_integrity_table / freed tables must stay zero (UDF).
-    put_u32_le(out, 184, 3); // access type: rewritable
+    put_u32_le(out, 184, 4); // access type: overwritable (mkudffs)
     put_u32_le(out, 188, layout.partition_lba); // partition starting location
     put_u32_le(out, 192, layout.partition_len); // partition length
     finalize_tag(out, 0, TAG_PD, loc, 512);
@@ -750,22 +758,21 @@ fn write_root_icb(out: &mut [u8], layout: &Layout) {
     finalize_tag(out, 0, TAG_FE, root_icb_block, ROOT_FE_SIZE as usize);
 }
 
-/// Empty root directory: two File Identifier Descriptors (`.` and `..`),
-/// 40 bytes each.
-const ROOT_DIR_BYTES: u32 = 40 + 40;
+/// Empty root directory: a single File Identifier Descriptor with the
+/// DIRECTORY | PARENT characteristics and no identifier (mkudffs writes the
+/// same for the root — Linux synthesizes `.` and emits `..` from the
+/// PARENT flag, so no CS0 name is decoded).
+const ROOT_DIR_BYTES: u32 = 40;
 
 fn write_root_dir(out: &mut [u8], layout: &Layout) {
     let root_icb_block = layout.root_icb_lba - layout.partition_lba;
     // tagLocation is partition-relative (the root dir data block).
     let root_dir_block = layout.root_dir_lba - layout.partition_lba;
-    // "." — directory flag (oracle-verify: flag bits).
-    write_fid(out, 0, 0x02, b".", root_icb_block, root_dir_block);
-    // ".." — parent flag; root's parent is itself.
-    write_fid(out, 40, 0x08, b"..", root_icb_block, root_dir_block);
+    write_fid(out, 0, 0x02 | 0x08, b"", root_icb_block, root_dir_block);
 }
 
-/// File Identifier Descriptor (ECMA-167 4/14.4) with no implementation use;
-/// the identifier is padded to a 4-byte boundary.
+/// File Identifier Descriptor (ECMA-167 4/14.4) with no implementation use
+/// and no identifier; the record is padded to a 4-byte boundary.
 fn write_fid(
     out: &mut [u8],
     off: usize,
@@ -966,7 +973,7 @@ mod tests {
         let l = layout_of(MIN_CAPACITY_SECTORS);
         let mut s = sector();
         gen_sector(&l, l.vds_lba, &mut s);
-        assert_eq!(s[24], 4); // dstring length "TEST"
+        assert_eq!(s[24], 8, "CS0 8-bit compression code");
         assert_eq!(&s[25..29], b"TEST");
         assert_eq!(&s[201..224], b"OSTA Compressed Unicode");
     }
@@ -976,7 +983,8 @@ mod tests {
         let l = layout_of(MIN_CAPACITY_SECTORS);
         let mut s = sector();
         gen_sector(&l, l.vds_lba + 2, &mut s);
-        assert_eq!(u32::from_le_bytes(s[184..188].try_into().unwrap()), 3); // rewritable
+        assert_eq!(s[25..31], *b"+NSR03", "partition contents (writable)");
+        assert_eq!(u32::from_le_bytes(s[184..188].try_into().unwrap()), 4); // overwritable
         assert_eq!(
             u32::from_le_bytes(s[188..192].try_into().unwrap()),
             l.partition_lba
@@ -1143,20 +1151,19 @@ mod tests {
     }
 
     #[test]
-    fn root_dir_has_dot_and_dotdot() {
+    fn root_dir_single_parent_fid() {
         let l = layout_of(MIN_CAPACITY_SECTORS);
         let mut s = sector();
         gen_sector(&l, l.root_dir_lba, &mut s);
-        // "." FID at 0.
+        // Single FID: DIRECTORY | PARENT, no identifier (mkudffs-style).
         assert_eq!(u16::from_le_bytes([s[0], s[1]]), TAG_FID);
-        assert_eq!(s[18], 0x02);
-        assert_eq!(s[19], 1);
-        assert_eq!(&s[38..39], b".");
-        // ".." FID at 40.
-        assert_eq!(u16::from_le_bytes([s[40], s[41]]), TAG_FID);
-        assert_eq!(s[58], 0x08);
-        assert_eq!(s[59], 2);
-        assert_eq!(&s[78..80], b"..");
+        assert_eq!(s[18], 0x02 | 0x08);
+        assert_eq!(s[19], 0, "no identifier bytes");
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&s[..16]);
+        assert_eq!(s[4], tag_checksum(&tag));
+        // Nothing else in the root dir block.
+        assert!(s[40..].iter().all(|&b| b == 0));
     }
 
     #[test]

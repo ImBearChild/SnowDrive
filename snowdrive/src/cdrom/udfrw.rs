@@ -819,7 +819,7 @@ mod tests {
             let mut s = [0u8; 2048];
             let mut m = m;
             m.read_data(pvd_off, &mut s).unwrap();
-            assert_eq!(s[24], 4, "PVD dstring length");
+            assert_eq!(s[24], 8, "PVD CS0 8-bit compression code");
             assert_eq!(&s[25..29], b"TEST");
         }
     }
