@@ -599,7 +599,11 @@ fn write_pd(out: &mut [u8], layout: &Layout, loc: u32) {
                             // NSR02/NSR03 match for a writable mount.
     regid_ident(out, 24, b"+NSR03");
     let phd = 56;
-    out[phd..phd + 8].copy_from_slice(&short_ad(USE_SIZE, 1)); // unalloc space table
+    // The kernel's check_partition_desc rejects a PHD that has BOTH an
+    // unallocated-space table and bitmap set (mkudffs --space=unallocbitmap
+    // sets only the bitmap, leaving the table zeroed). The USE descriptor
+    // stays as a harmless orphan; the space bitmap is authoritative.
+    out[phd..phd + 8].copy_from_slice(&[0u8; 8]); // unalloc space table: none
     out[phd + 8..phd + 16].copy_from_slice(&short_ad(layout.sbd_num_bytes, 2)); // unalloc space bitmap
                                                                                 // part_integrity_table / freed tables must stay zero (UDF).
     put_u32_le(out, 184, 4); // access type: overwritable (mkudffs)
@@ -993,11 +997,10 @@ mod tests {
             u32::from_le_bytes(s[192..196].try_into().unwrap()),
             l.partition_len
         );
-        // PHD short_ads: USE at block 1, SBD at block 2.
+        // PHD short_ads: USE table must be zero (kernel rejects both), the
+        // space bitmap at partition block 2.
         let use_len = u32::from_le_bytes(s[56..60].try_into().unwrap());
-        let use_blk = u32::from_le_bytes(s[60..64].try_into().unwrap());
-        assert_eq!(use_len, USE_SIZE);
-        assert_eq!(use_blk, 1);
+        assert_eq!(use_len, 0, "no unallocated-space table (bitmap only)");
         let bm_len = u32::from_le_bytes(s[64..68].try_into().unwrap());
         let bm_blk = u32::from_le_bytes(s[68..72].try_into().unwrap());
         assert_eq!(bm_len, l.sbd_num_bytes);
