@@ -19,13 +19,19 @@
 //! ```text
 //! 16..19          VRS: BEA01 / NSR03 / TEA01
 //! 256             AVDP (main) → MVDS + RVDS extents
-//! 257..273        MVDS (16 sectors): PVD, IUVD, PD, LVD, USD, TD (+ zeros)
+//! 257..273        MVDS (16 sectors): PVD, LVD, PD, USD, IUVD, TD (+ zeros)
 //! 273..277        LVID extent (4 sectors, rewritable minimum 8 KB)
 //! 277..(N-272)    Partition (FSD@0, USE@1, SBD@2.., root FE, root dir, free)
 //! (N-272)..(N-256) RVDS (16 sectors: mirror of the VDS)
 //! N-256           AVDP (copy)
 //! N-255..N        unused
 //! ```
+//!
+//! The VDS on-disc order and Volume Descriptor Sequence Numbers match
+//! `mkudffs` (`defaults.c`): **PVD=1, LVD=2, PD=3, USD=4, IUVD=5** — the
+//! kernel records a descriptor only when its sequence number is ≥ the
+//! maximum seen so far, so the on-disc order must be non-decreasing in the
+//! sequence number (Linux `udf_process_sequence`).
 //!
 //! # Byte-layout sources
 //!
@@ -227,12 +233,15 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
             true
         }
         l if l >= layout.vds_lba && l < layout.vds_lba + VDS_SECTORS => {
+            // On-disc order must be non-decreasing in volDescSeqNum (the
+            // kernel keeps the last descriptor of each type): PVD(1), LVD(2),
+            // PD(3), USD(4), IUVD(5), TD.
             match l - layout.vds_lba {
                 0 => write_pvd(out, layout, l),
-                1 => write_iuvd(out, layout, l),
+                1 => write_lvd(out, layout, l),
                 2 => write_pd(out, layout, l),
-                3 => write_lvd(out, layout, l),
-                4 => write_usd(out, layout, l),
+                3 => write_usd(out, layout, l),
+                4 => write_iuvd(out, layout, l),
                 _ => write_td(out, l),
             }
             true
@@ -240,10 +249,10 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
         l if l >= layout.reserve_vds_lba && l < layout.reserve_vds_lba + VDS_SECTORS => {
             match l - layout.reserve_vds_lba {
                 0 => write_pvd(out, layout, l),
-                1 => write_iuvd(out, layout, l),
+                1 => write_lvd(out, layout, l),
                 2 => write_pd(out, layout, l),
-                3 => write_lvd(out, layout, l),
-                4 => write_usd(out, layout, l),
+                3 => write_usd(out, layout, l),
+                4 => write_iuvd(out, layout, l),
                 _ => write_td(out, l),
             }
             true
@@ -521,7 +530,8 @@ fn write_avdp(out: &mut [u8], layout: &Layout, loc: u32) {
     finalize_tag(out, 0, TAG_AVDP, loc, 32);
 }
 
-/// Primary Volume Descriptor (ECMA-167 3/10.1).
+/// Primary Volume Descriptor (ECMA-167 3/10.1). Volume Descriptor Sequence
+/// Number = 1 (mkudffs `default_pvd`).
 fn write_pvd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 1); // volume descriptor sequence number
     put_u32_le(out, 20, 1); // primary volume descriptor number
@@ -541,6 +551,7 @@ fn write_pvd(out: &mut [u8], layout: &Layout, loc: u32) {
 
 /// Implementation Use Volume Descriptor (ECMA-167 3/10.4) with the UDF
 /// logical-volume info (`udf_lv_info`) in its 460-byte implementation use.
+/// Volume Descriptor Sequence Number = 5 (mkudffs `default_iuvd`).
 fn write_iuvd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 5); // volume descriptor sequence number
     regid_udf(out, 20); // implementation identifier
@@ -554,9 +565,10 @@ fn write_iuvd(out: &mut [u8], layout: &Layout, loc: u32) {
 /// Partition Descriptor (ECMA-167 3/10.5). The partition-header descriptor
 /// (PHD) is embedded in the 128-byte contents-use: two `short_ad`s pointing
 /// at the Unallocated Space Entry (partition block 1) and the Space Bitmap
-/// Descriptor (partition block 2).
+/// Descriptor (partition block 2). Volume Descriptor Sequence Number = 3
+/// (mkudffs `default_pd`).
 fn write_pd(out: &mut [u8], layout: &Layout, loc: u32) {
-    put_u32_le(out, 16, 2); // volume descriptor sequence number
+    put_u32_le(out, 16, 3); // volume descriptor sequence number
     put_u16_le(out, 20, 0); // partition flags
     put_u16_le(out, 22, 0); // partition number
                             // Partition contents (oracle-verify: identifier string).
@@ -573,8 +585,9 @@ fn write_pd(out: &mut [u8], layout: &Layout, loc: u32) {
 
 /// Logical Volume Descriptor (ECMA-167 3/10.6) with one Type-1 partition
 /// map. `LogicalVolumeContentsUse` (16 B) holds the FSD `long_ad`.
+/// Volume Descriptor Sequence Number = 2 (mkudffs `default_lvd`).
 fn write_lvd(out: &mut [u8], layout: &Layout, loc: u32) {
-    put_u32_le(out, 16, 3); // volume descriptor sequence number
+    put_u32_le(out, 16, 2); // volume descriptor sequence number
     charspec(out, 20); // descriptor character set
     dstring(out, 84, 128, layout.label.as_str()); // logical volume id
     put_u32_le(out, 212, SECTOR_SIZE); // logical block size
@@ -592,7 +605,8 @@ fn write_lvd(out: &mut [u8], layout: &Layout, loc: u32) {
 
 /// Unallocated Space Descriptor (ECMA-167 3/10.8): one extent covering the
 /// unused tail after the second anchor (volume space outside the
-/// partition).
+/// partition). Volume Descriptor Sequence Number = 4 (mkudffs
+/// `default_usd`).
 fn write_usd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 4); // volume descriptor sequence number
     put_u32_le(out, 20, 1); // number of allocation descriptors
@@ -887,7 +901,9 @@ mod tests {
     #[test]
     fn vds_main_and_reserve_descriptors() {
         let l = layout_of(MIN_CAPACITY_SECTORS);
-        let ids = [TAG_PVD, TAG_IUVD, TAG_PD, TAG_LVD, TAG_USD, TAG_TD];
+        // mkudffs order: PVD, LVD, PD, USD, IUVD, TD (non-decreasing
+        // volDescSeqNum so the kernel's "latest wins" keeps every one).
+        let ids = [TAG_PVD, TAG_LVD, TAG_PD, TAG_USD, TAG_IUVD, TAG_TD];
         for (i, expect) in ids.iter().enumerate() {
             for base in [l.vds_lba, l.reserve_vds_lba] {
                 let mut s = sector();
@@ -896,6 +912,23 @@ mod tests {
                 let location = u32::from_le_bytes(s[12..16].try_into().unwrap());
                 assert_eq!(location, base + i as u32, "tag location = sector");
                 assert_eq!(s[4], tag_checksum(&s[..16].try_into().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn vds_seq_numbers_non_decreasing() {
+        let l = layout_of(MIN_CAPACITY_SECTORS);
+        // mkudffs defaults.c: PVD=1, LVD=2, PD=3, USD=4, IUVD=5. The kernel
+        // records a descriptor only when its seq number is >= the max seen,
+        // so these must be non-decreasing on disc.
+        let expect = [1u32, 2, 3, 4, 5];
+        for base in [l.vds_lba, l.reserve_vds_lba] {
+            for (i, &want) in expect.iter().enumerate() {
+                let mut s = sector();
+                gen_sector(&l, base + i as u32, &mut s);
+                let seq = u32::from_le_bytes(s[16..20].try_into().unwrap());
+                assert_eq!(seq, want, "VDS descriptor {i} seq number");
             }
         }
     }
@@ -939,7 +972,8 @@ mod tests {
     fn lvd_fsd_pointer_and_partition_map() {
         let l = layout_of(MIN_CAPACITY_SECTORS);
         let mut s = sector();
-        gen_sector(&l, l.vds_lba + 3, &mut s);
+        // LVD is the second VDS descriptor (mkudffs order).
+        gen_sector(&l, l.vds_lba + 1, &mut s);
         // FSD long_ad in LogicalVolumeContentsUse (offset 248).
         let len = u32::from_le_bytes(s[248..252].try_into().unwrap());
         let block = u32::from_le_bytes(s[252..256].try_into().unwrap());
@@ -955,7 +989,8 @@ mod tests {
     fn usd_describes_tail() {
         let l = layout_of(MIN_CAPACITY_SECTORS);
         let mut s = sector();
-        gen_sector(&l, l.vds_lba + 4, &mut s);
+        // USD is the fourth VDS descriptor (mkudffs order).
+        gen_sector(&l, l.vds_lba + 3, &mut s);
         let loc = u32::from_le_bytes(s[28..32].try_into().unwrap());
         assert_eq!(loc, l.avdp2_lba + 1);
     }
