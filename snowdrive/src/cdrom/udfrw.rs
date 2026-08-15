@@ -327,6 +327,9 @@ impl<B: BlockStorage> UdfRwDevice<B> {
                 op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
                 op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
                 op::READ_TRACK_INFORMATION => self.read_track_information_cmd(cdb, data),
+                op::GET_EVENT_STATUS_NOTIFICATION | op::GET_EVENT_STATUS_NOTIFICATION_12 => {
+                    self.gesn_cmd(cdb, data)
+                }
                 op::READ_DVD_STRUCTURE => self.read_dvd_structure_cmd(cdb, data),
                 op::READ_FORMAT_CAPACITIES => self.read_format_capacities_cmd(cdb, data),
                 op::SYNCHRONIZE_CACHE_10 => self.sync_cache_cmd(),
@@ -545,6 +548,42 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             lead_out_lba: self.lead_out_lba(),
         };
         build_read_disc_info(data, alloc, &info)
+    }
+
+    /// GET EVENT STATUS NOTIFICATION (0x4A / 0xAC): Windows polls the
+    /// Media class to confirm media presence; failing this (we previously
+    /// returned INVALID COMMAND) makes it treat the drive as unreliable.
+    /// Respond with a Media "No Change" event, media present.
+    fn gesn_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+        // 0x4A: class at byte 4, alloc at bytes 7-8.
+        // 0xAC: class at byte 4, alloc at bytes 8-9.
+        let is_12 = cdb[0] == op::GET_EVENT_STATUS_NOTIFICATION_12;
+        let class = cdb[4];
+        let alloc = if is_12 {
+            (u16::from(cdb[8]) << 8) | u16::from(cdb[9])
+        } else {
+            (u16::from(cdb[7]) << 8) | u16::from(cdb[8])
+        };
+        // Event Status Notification Response (MMC-6 Table 264/265) with a
+        // Media class descriptor: no change, media present, tray closed.
+        let mut buf = [0u8; 8];
+        buf[0..2].copy_from_slice(&4u16.to_be_bytes()); // descriptor length
+        if class & 0x10 != 0 {
+            buf[2] = 0x80 | 0x04; // NEA=0, Notification Class = Media (100b)
+            buf[3] = 0x10; // supported event classes: Media
+        } else {
+            buf[2] = 0x80; // NEA=1, no requested class supported
+        }
+        // Event descriptor: Event Code 0 (NoChg), Media Present (bit 1).
+        buf[4] = 0x00;
+        buf[5] = 0x02;
+        let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
     }
 
     /// READ TRACK INFORMATION (0x42): a single, complete, non-blank data
@@ -1276,5 +1315,40 @@ mod tests {
         let nwa = u32::from_be_bytes(buf[12..16].try_into().unwrap());
         let free = u32::from_be_bytes(buf[16..20].try_into().unwrap());
         assert!(nwa > 0 && free > 0);
+    }
+
+    #[test]
+    fn device_gesn_media_present() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::GET_EVENT_STATUS_NOTIFICATION;
+        cdb[1] = 0x01; // polled
+        cdb[4] = 0x10; // Media class
+        cdb[8] = 8;
+        let mut buf = [0u8; 16];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(&buf[0..2], &[0x00, 0x04]); // descriptor length
+        assert_eq!(buf[2] & 0x80, 0x80, "NEA=0");
+        assert_eq!(buf[2] & 0x07, 0x04, "Media class");
+        assert_eq!(buf[3], 0x10, "supported: Media");
+        assert_eq!(buf[5] & 0x02, 0x02, "media present");
+        // 12-byte form (0xAC) uses alloc at bytes 8-9.
+        let mut cdb12 = [0u8; 12];
+        cdb12[0] = op::GET_EVENT_STATUS_NOTIFICATION_12;
+        cdb12[4] = 0x10;
+        cdb12[9] = 8;
+        let n = do_device_data_in(&mut dev, &cdb12, &mut w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(buf[5] & 0x02, 0x02, "12-byte media present");
     }
 }
