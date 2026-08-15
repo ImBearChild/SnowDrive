@@ -35,7 +35,7 @@ pub mod op {
     pub const GET_CONFIGURATION: u8 = 0x46;
     pub const READ_DISC_INFORMATION: u8 = 0x51;
     pub const READ_BUFFER_CAPACITY: u8 = 0x5C;
-    pub const READ_TRACK_INFORMATION: u8 = 0x42;
+    pub const READ_TRACK_INFORMATION: u8 = 0x52;
     pub const READ_DVD_STRUCTURE: u8 = 0xAD;
 }
 

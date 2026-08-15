@@ -557,9 +557,12 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         data: &'a mut [u8],
     ) -> CommandOutcome<'a> {
         let type_code = cdb[1] & 0x0F;
-        let track_no = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
-        if type_code != 0 || track_no != 1 {
+        // Track Number Type (MMC-6 Table 492): 0=track, 1=session,
+        // 2=track (extended), 3=session (extended). Tools query by session
+        // (dvd+rw-mediainfo sends type 1) or by track; every form maps to
+        // our single complete track, so only reject reserved types.
+        if type_code > 3 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let layout = self.media.layout();

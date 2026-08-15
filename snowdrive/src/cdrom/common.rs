@@ -188,6 +188,11 @@ pub struct CdromCapabilities {
     /// `cdrom_probe_write_features()` masks `CDC_MRW_W` without it, and
     /// `register_cdrom()` then marks the whole disk read-only.
     pub mrw_write: bool,
+    /// Write Protect feature (0x0004): reports the media write-protect
+    /// state. Windows treats a drive without this feature as write
+    /// protected; the UdfRw drive reports it with all protection bits
+    /// clear (not write-protected).
+    pub write_protect: bool,
     /// Write-side extras (Phase 3+ CD-R/CD-RW).
     pub write_cdr: bool,
     pub write_cdrw: bool,
@@ -218,6 +223,7 @@ impl CdromCapabilities {
             random_writable: false,
             dvd_plus_rw: false,
             mrw_write: false,
+            write_protect: false,
             write_cdr: false,
             write_cdrw: false,
             test_write: false,
@@ -240,6 +246,7 @@ pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     random_writable: true,
     dvd_plus_rw: true,
     mrw_write: true,
+    write_protect: true,
     ..CdromCapabilities::read_only_cd_rom()
 };
 
@@ -415,6 +422,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// Features included (all current):
 /// - 0x0001 Core (version 2, persistent, additional length 8)
 /// - 0x0003 Removable Medium (tray type)
+/// - 0x0004 Write Protect (only if `caps.write_protect`)
 /// - 0x0010 Random Readable (block size 2048)
 /// - 0x001D Multi-Read
 /// - 0x001E CD Read (version 2)
@@ -462,6 +470,19 @@ pub fn build_get_config_features(
             | (bit(caps.load) << 4)
             | (bit(caps.eject) << 3)
             | bit(caps.lock);
+        off += 8;
+    }
+
+    // Write Protect (0x0004) — reports the media write-protect state.
+    // Windows expects this feature; without it the disc is treated as
+    // write-protected. All protection bits are clear (not protected); the
+    // Current bit is 0 like real drives that cannot change the state.
+    if caps.write_protect && include(0x0004) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x04;
+        buf[off + 2] = 0x08; // version 2, current clear
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4..off + 8].copy_from_slice(&[0, 0, 0, 0]);
         off += 8;
     }
 
@@ -555,9 +576,10 @@ pub fn build_get_config_response<'a>(
     alloc: u16,
     last_lba: u32,
 ) -> CommandOutcome<'a> {
-    // Header (8) + all features: Core(12) Removable(8) RandomReadable(12)
-    // MultiRead(4) CDRead(8) DVDRead(4) RandomWritable(16) MRW(8) DVD+RW(8).
-    let mut buf = [0u8; 88];
+    // Header (8) + all features: Core(12) Removable(8) WriteProtect(8)
+    // RandomReadable(12) MultiRead(4) CDRead(8) DVDRead(4) RandomWritable(16)
+    // MRW(8) DVD+RW(8).
+    let mut buf = [0u8; 96];
     // Header: bytes 0-3 = data length (placeholder), 6-7 = current profile.
     buf[6] = (profile.code() >> 8) as u8;
     buf[7] = profile.code() as u8;
@@ -911,6 +933,31 @@ mod tests {
         // DVD+RW (0x002A).
         assert_eq!(buf[32], 0x00);
         assert_eq!(buf[33], 0x2A);
+    }
+
+    #[test]
+    fn cdrom_get_config_udfrw_write_protect_clear() {
+        let mut w = work();
+        let profile = CurrentProfile::DvdRw;
+        let outcome =
+            build_get_config_response(&mut w, profile, &UDFRW_CAPS, 0x02, 0x0000, 255, 0x2800);
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &mut buf);
+        // Find the Write Protect (0x0004) feature descriptor.
+        let mut off = 8;
+        let mut found = false;
+        while off + 4 <= n {
+            let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let add_len = buf[off + 3] as usize;
+            if code == 0x0004 {
+                found = true;
+                // All write-protect bits clear (not protected).
+                assert_eq!(buf[off + 4], 0x00, "write protect bits clear");
+                break;
+            }
+            off += 4 + add_len;
+        }
+        assert!(found, "Write Protect feature must be present for Windows");
     }
 
     #[test]
