@@ -737,7 +737,7 @@ const ROOT_FE_SIZE: u32 = 184;
 fn write_root_icb(out: &mut [u8], layout: &Layout) {
     put_u16_le(out, 20, 4); // icb strategy type
     out[27] = 4; // icb file type: directory
-    put_u32_le(out, 44, 0x3CA5); // rwxr-xr-x (mkudffs --mode=0755 encoding)
+    put_u32_le(out, 44, 0x1CE7); // rwxrwxrwx (UDF encoding of 0777)
     put_u16_le(out, 48, 1); // link count
     put_u64_le(out, 56, ROOT_DIR_BYTES as u64); // information length
     put_u64_le(out, 64, 1); // logical blocks recorded
@@ -1128,6 +1128,11 @@ mod tests {
         gen_sector(&l, l.root_icb_lba, &mut s);
         assert_eq!(u16::from_le_bytes([s[0], s[1]]), TAG_FE);
         assert_eq!(s[27], 4); // file type: directory
+        assert_eq!(
+            u32::from_le_bytes(s[44..48].try_into().unwrap()),
+            0x1CE7,
+            "root dir permissions rwxrwxrwx"
+        );
         assert_eq!(
             u64::from_le_bytes(s[56..64].try_into().unwrap()),
             ROOT_DIR_BYTES as u64
