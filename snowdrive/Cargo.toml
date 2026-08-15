@@ -7,7 +7,7 @@ description = "SnowDrive — unified SCSI / iSCSI / ISO9660 toolkit (lib + CLI)"
 
 [features]
 # Default: desktop PC environment — all commonly used features + the CLI.
-default = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "cli"]
+default = ["std", "scsi", "iscsi", "iso9660", "udf_void", "cdrom", "livefs", "cli"]
 
 # Platform feature.
 std = ["embedded-io/std"]
@@ -15,6 +15,7 @@ std = ["embedded-io/std"]
 # Core features (independent).
 scsi = []
 iso9660 = []
+udf_void = []
 
 # Composite features (depend on others).
 iscsi = ["scsi"]

@@ -45,6 +45,8 @@ pub mod iscsi;
 pub mod iso9660;
 #[cfg(feature = "scsi")]
 pub mod scsi;
+#[cfg(feature = "udf_void")]
+pub mod udf_void;
 #[cfg(feature = "usb")]
 pub mod usb;
 
