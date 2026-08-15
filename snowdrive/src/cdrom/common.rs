@@ -151,6 +151,12 @@ const CDROM_AUDIO: [u8; 16] = [
     0x00, 0x00, // output port 1: volume = 0
 ];
 
+/// MRW (Mount Rainier) mode page (0x03): probed by the kernel's
+/// `cdrom_mrw_probe_pc()` as part of `cdrom_probe_write_features()`.  The
+/// contents are not validated — the page merely has to be returned — but
+/// this mirrors a minimal page-length-6 MRW page.
+const MRW_PAGE: [u8; 8] = [0x03, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
 /// Device-declared capability set — the single model every
 /// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
 /// 0x2A page) is built from (plan §5.3). Devices feed their capabilities;
@@ -178,6 +184,10 @@ pub struct CdromCapabilities {
     /// DVD+RW feature (0x002A): write capable DVD+RW media. Set by the
     /// UdfRw device.
     pub dvd_plus_rw: bool,
+    /// MRW feature (0x0028) with the write bit: the kernel's
+    /// `cdrom_probe_write_features()` masks `CDC_MRW_W` without it, and
+    /// `register_cdrom()` then marks the whole disk read-only.
+    pub mrw_write: bool,
     /// Write-side extras (Phase 3+ CD-R/CD-RW).
     pub write_cdr: bool,
     pub write_cdrw: bool,
@@ -207,6 +217,7 @@ impl CdromCapabilities {
             read_dvd_rom: false,
             random_writable: false,
             dvd_plus_rw: false,
+            mrw_write: false,
             write_cdr: false,
             write_cdrw: false,
             test_write: false,
@@ -228,6 +239,7 @@ pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     read_dvd_rom: true,
     random_writable: true,
     dvd_plus_rw: true,
+    mrw_write: true,
     ..CdromCapabilities::read_only_cd_rom()
 };
 
@@ -320,12 +332,14 @@ pub(crate) const ALL_UDFRW_PAGES_LEN: usize = CACHING_PAGE.len()
     + VENDOR_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
+    + MRW_PAGE.len()
     + UDFRW_CAPABILITIES.len();
 
 /// All UdfRw mode pages, in MODE SENSE page order (for `0x3F`).
 const ALL_UDFRW_PAGES: [u8; ALL_UDFRW_PAGES_LEN] = concat_pages(&[
-    &CACHING_PAGE,
     &VENDOR_PAGE,
+    &MRW_PAGE,
+    &CACHING_PAGE,
     &CDROM_PARAMS,
     &CDROM_AUDIO,
     &UDFRW_CAPABILITIES,
@@ -347,6 +361,7 @@ pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
     match page {
         0x08 => Some(&CACHING_PAGE),
         0x00 => Some(&VENDOR_PAGE),
+        0x03 => Some(&MRW_PAGE),
         0x0D => Some(&CDROM_PARAMS),
         0x0E => Some(&CDROM_AUDIO),
         0x2A => Some(&CDROM_CAPABILITIES),
@@ -360,6 +375,7 @@ pub(crate) const ALL_CDROM_PAGES_LEN: usize = CACHING_PAGE.len()
     + VENDOR_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
+    + MRW_PAGE.len()
     + CDROM_CAPABILITIES.len();
 
 /// Concatenate `parts` into a `[u8; N]` (const, for building 0x3F).
@@ -381,8 +397,9 @@ const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
 
 /// All CD-ROM mode pages, in MODE SENSE page order (for `0x3F`).
 const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
-    &CACHING_PAGE,
     &VENDOR_PAGE,
+    &MRW_PAGE,
+    &CACHING_PAGE,
     &CDROM_PARAMS,
     &CDROM_AUDIO,
     &CDROM_CAPABILITIES,
@@ -403,6 +420,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x001E CD Read (version 2)
 /// - 0x001F DVD Read (only for DVD profiles)
 /// - 0x0020 Random Writable (only if `caps.random_writable`)
+/// - 0x0028 MRW write (only if `caps.mrw_write`)
 /// - 0x002A DVD+RW (only if `caps.dvd_plus_rw`)
 pub fn build_get_config_features(
     buf: &mut [u8],
@@ -492,6 +510,19 @@ pub fn build_get_config_features(
         off += 16;
     }
 
+    // MRW (Mount Rainier, 0x0028) — reported with the write bit so the
+    // kernel's cdrom_probe_write_features() does not mask CDC_MRW_W (which
+    // would make register_cdrom() mark the disk read-only).
+    if caps.mrw_write && include(0x0028) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x28;
+        buf[off + 2] = 0x05; // version 1 + current
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x01; // write
+        buf[off + 5..off + 8].copy_from_slice(&[0, 0, 0]);
+        off += 8;
+    }
+
     // DVD+RW (0x002A) — write capable (UdfRw).
     if caps.dvd_plus_rw && include(0x002A) {
         buf[off] = 0x00;
@@ -519,8 +550,8 @@ pub fn build_get_config_response<'a>(
     last_lba: u32,
 ) -> CommandOutcome<'a> {
     // Header (8) + all features: Core(12) Removable(8) RandomReadable(12)
-    // MultiRead(4) CDRead(8) DVDRead(4) RandomWritable(16) DVD+RW(8).
-    let mut buf = [0u8; 80];
+    // MultiRead(4) CDRead(8) DVDRead(4) RandomWritable(16) MRW(8) DVD+RW(8).
+    let mut buf = [0u8; 88];
     // Header: bytes 0-3 = data length (placeholder), 6-7 = current profile.
     buf[6] = (profile.code() >> 8) as u8;
     buf[7] = profile.code() as u8;
@@ -763,18 +794,20 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::MODE_SENSE_10;
         cdb[2] = 0x3F;
-        cdb[8] = 80;
-        let mut buf = [0u8; 80];
+        cdb[8] = 90;
+        let mut buf = [0u8; 90];
         let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + 68 pages */
+        assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + 76 pages */
         assert_eq!(buf[0], ((n - 2) >> 8) as u8);
         assert_eq!(buf[1], (n - 2) as u8); /* mode data length */
-        // Page codes in order: 0x08 (caching), 0x00, 0x0D, 0x0E, 0x2A.
-        assert_eq!(buf[8] & 0x3F, 0x08);
-        assert_eq!(buf[28] & 0x3F, 0x00);
-        assert_eq!(buf[32] & 0x3F, 0x0D);
-        assert_eq!(buf[36] & 0x3F, 0x0E);
-        assert_eq!(buf[52] & 0x3F, 0x2A);
+        // Page codes in order: 0x00, 0x03 (mrw), 0x08 (caching), 0x0D,
+        // 0x0E, 0x2A.
+        assert_eq!(buf[8] & 0x3F, 0x00);
+        assert_eq!(buf[12] & 0x3F, 0x03);
+        assert_eq!(buf[20] & 0x3F, 0x08);
+        assert_eq!(buf[40] & 0x3F, 0x0D);
+        assert_eq!(buf[44] & 0x3F, 0x0E);
+        assert_eq!(buf[60] & 0x3F, 0x2A);
     }
 
     #[test]
@@ -789,7 +822,7 @@ mod tests {
             codes.push(all[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x08, 0x00, 0x0D, 0x0E, 0x2A]);
+        assert_eq!(codes, vec![0x00, 0x03, 0x08, 0x0D, 0x0E, 0x2A]);
     }
 
     // ── GET CONFIGURATION common features ───────────────────────────
@@ -840,6 +873,31 @@ mod tests {
         assert_eq!(buf[24], 0x20);
         assert_eq!(buf[28], 0x00);
         assert_eq!(buf[29], 0x10);
+    }
+
+    #[test]
+    fn cdrom_get_config_udfrw_features_include_mrw_write() {
+        let mut w = work();
+        let profile = CurrentProfile::DvdRw;
+        let outcome =
+            build_get_config_response(&mut w, profile, &UDFRW_CAPS, 0x02, 0x0020, 255, 0x2800);
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &mut buf);
+        // RT=10b, start 0x0020 → Random Writable (16) + MRW (8) + DVD+RW (8).
+        assert!(n >= 8 + 16 + 8 + 8);
+        // Random Writable (0x0020): current, write-capable.
+        assert_eq!(buf[8], 0x00);
+        assert_eq!(buf[9], 0x20);
+        // MRW (0x0028): current + write bit set (byte 4 bit 0). This is what
+        // keeps the kernel's cdrom_probe_write_features() from masking
+        // CDC_MRW_W and letting register_cdrom() mark the disk read-only.
+        assert_eq!(buf[24], 0x00);
+        assert_eq!(buf[25], 0x28);
+        assert_eq!(buf[27], 0x04, "MRW additional length");
+        assert_eq!(buf[28] & 0x01, 0x01, "MRW write bit");
+        // DVD+RW (0x002A).
+        assert_eq!(buf[32], 0x00);
+        assert_eq!(buf[33], 0x2A);
     }
 
     #[test]
