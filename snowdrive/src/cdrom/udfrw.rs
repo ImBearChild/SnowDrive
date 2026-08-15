@@ -326,6 +326,8 @@ impl<B: BlockStorage> UdfRwDevice<B> {
                 op::READ_TOC => self.read_toc_cmd(cdb, data),
                 op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
                 op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
+                op::READ_TRACK_INFORMATION => self.read_track_information_cmd(cdb, data),
+                op::READ_DVD_STRUCTURE => self.read_dvd_structure_cmd(cdb, data),
                 op::READ_FORMAT_CAPACITIES => self.read_format_capacities_cmd(cdb, data),
                 op::SYNCHRONIZE_CACHE_10 => self.sync_cache_cmd(),
                 _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND),
@@ -543,6 +545,82 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             lead_out_lba: self.lead_out_lba(),
         };
         build_read_disc_info(data, alloc, &info)
+    }
+
+    /// READ TRACK INFORMATION (0x42): a single, complete, non-blank data
+    /// track (MMC-6 §6.26, Table 494). Windows' optical stack queries this
+    /// to determine media state; an INVALID COMMAND reply makes it fall
+    /// back to read-only handling.
+    fn read_track_information_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        data: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        let type_code = cdb[1] & 0x0F;
+        let track_no = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+        if type_code != 0 || track_no != 1 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let layout = self.media.layout();
+        let capacity = self.lead_out_lba();
+        let free_from = layout.free_from_block;
+        let free = layout.partition_len.saturating_sub(free_from);
+        // Track Information Block, 38 bytes (Data Length = 0x24).
+        let mut buf = [0u8; 38];
+        buf[0..2].copy_from_slice(&0x0024u16.to_be_bytes()); // data length
+        buf[2] = 1; // logical track number (LSB)
+        buf[3] = 1; // session number (LSB)
+                    // Byte 5: LJRS/Damage/Copy clear, Track Mode 0.
+                    // Byte 6: RT clear | Blank clear | Packet/Inc=1 | FP=1 | Data Mode 0.
+        buf[6] = 0x30; // Packet/Inc (0x20) + Fixed Packet (0x10)
+        buf[7] = 0x03; // LRA_V | NWA_V
+        buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // track start LBA
+        buf[12..16].copy_from_slice(&free_from.to_be_bytes()); // NWA
+        buf[16..20].copy_from_slice(&free.to_be_bytes()); // free blocks
+        buf[20..24].copy_from_slice(&1u32.to_be_bytes()); // blocking factor
+        buf[24..28].copy_from_slice(&capacity.to_be_bytes()); // track size
+        buf[28..32].copy_from_slice(&(free_from.saturating_sub(1)).to_be_bytes()); // LRA
+        buf[32] = 0; // track number MSB
+        buf[33] = 0; // session number MSB
+        let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
+    }
+
+    /// READ DVD STRUCTURE (0xAD), format 0 (Physical Format Information,
+    /// MMC-6 §6.22.3.2.1, Table 398): a single-layer rewritable DVD+RW.
+    /// Windows uses the Disk Category / Layer Type here to decide whether
+    /// the medium is writable.
+    fn read_dvd_structure_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+        let media_type = cdb[1] & 0x3F;
+        let layer = cdb[6] & 0x0F;
+        let format = cdb[7];
+        let alloc = (u16::from(cdb[8]) << 8) | u16::from(cdb[9]);
+        if media_type != 0 || layer != 0 || format != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let capacity = self.lead_out_lba();
+        let start = 0x0003_0000u32; // DVD data area start (physical sector)
+        let end = start + capacity;
+        let mut buf = [0u8; 28];
+        buf[0..2].copy_from_slice(&0x0018u16.to_be_bytes()); // structure data length
+        buf[4] = 0x91; // Disk Category 1001b (DVD+RW) | Part Version 1
+        buf[6] = 0x04; // single layer, rewritable (Layer Type bit 2)
+        buf[9..13].copy_from_slice(&start.to_be_bytes());
+        buf[13..17].copy_from_slice(&end.to_be_bytes());
+        buf[17..21].copy_from_slice(&end.to_be_bytes());
+        let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
     }
 
     /// READ FORMAT CAPACITIES (0x23): formatted media, random-writable —
@@ -1135,5 +1213,65 @@ mod tests {
         assert_eq!(buf[7] & 0x03, 0x03, "MRW formatting complete");
         // Erasable bit (byte 2 bit 4).
         assert_eq!(buf[2] & 0x10, 0x10, "erasable");
+    }
+
+    #[test]
+    fn device_read_dvd_structure_physical_format() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::READ_DVD_STRUCTURE;
+        cdb[7] = 0; // format 0 = physical format information
+        cdb[8] = 0;
+        cdb[9] = 28;
+        let mut buf = [0u8; 64];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 28);
+        // Structure data length 0x18, Disk Category DVD+RW (0x9) | version 1.
+        assert_eq!(&buf[0..2], &[0x00, 0x18]);
+        assert_eq!(buf[4] >> 4, 0x9, "Disk Category = DVD+RW");
+        // Layer Type rewritable (bit 2).
+        assert_eq!(buf[6] & 0x04, 0x04, "rewritable layer");
+    }
+
+    #[test]
+    fn device_read_track_information_complete() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_TRACK_INFORMATION;
+        cdb[2] = 0;
+        cdb[3] = 1; // track 1
+        cdb[7] = 0;
+        cdb[8] = 38;
+        let mut buf = [0u8; 64];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 38);
+        // Track 1, session 1, non-blank packet-writable data track.
+        assert_eq!(buf[2], 1);
+        assert_eq!(buf[3], 1);
+        assert_eq!(buf[6] & 0x20, 0x20, "Packet/Inc");
+        assert_eq!(buf[6] & 0x10, 0x10, "Fixed Packet");
+        assert_eq!(buf[6] & 0x40, 0, "not blank");
+        // NWA (bytes 12-15) and free blocks (bytes 16-19) are nonzero.
+        let nwa = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        let free = u32::from_be_bytes(buf[16..20].try_into().unwrap());
+        assert!(nwa > 0 && free > 0);
     }
 }

@@ -35,6 +35,8 @@ pub mod op {
     pub const GET_CONFIGURATION: u8 = 0x46;
     pub const READ_DISC_INFORMATION: u8 = 0x51;
     pub const READ_BUFFER_CAPACITY: u8 = 0x5C;
+    pub const READ_TRACK_INFORMATION: u8 = 0x42;
+    pub const READ_DVD_STRUCTURE: u8 = 0xAD;
 }
 
 /// Additional sense codes (SPC-4 §4.5.6).
