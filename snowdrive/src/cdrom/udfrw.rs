@@ -111,8 +111,9 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         for lba in layout.reserve_vds_lba..layout.reserve_vds_lba + 6 {
             write_sector(&mut backend, &layout, lba, &mut sector)?;
         }
-        // Second anchor.
-        write_sector(&mut backend, &layout, layout.avdp2_lba, &mut sector)?;
+        // Second + third anchors (N-257, N-1).
+        write_sector(&mut backend, &layout, layout.anchor2_lba, &mut sector)?;
+        write_sector(&mut backend, &layout, layout.anchor3_lba, &mut sector)?;
         // Partition: FSD, USE, SBD (with the real CRC), root FE, root dir.
         write_sector(&mut backend, &layout, layout.fsd_lba, &mut sector)?;
         write_sector(&mut backend, &layout, layout.use_lba, &mut sector)?;
@@ -735,11 +736,13 @@ mod tests {
         assert_eq!(&s[1..6], b"BEA01");
         m.read_data(17 * 2048, &mut s).unwrap();
         assert_eq!(&s[1..6], b"NSR03");
-        // Second anchor at N-256 has a valid AVDP.
+        // Second + third anchors (N-257, N-1) have valid AVDPs.
         let n = m.layout().capacity_sectors;
-        let mut s = [0u8; 2048];
-        m.read_data(u64::from(n - 256) * 2048, &mut s).unwrap();
-        assert!(is_avdp(&s));
+        for anchor in [n - 257, n - 1] {
+            let mut s = [0u8; 2048];
+            m.read_data(u64::from(anchor) * 2048, &mut s).unwrap();
+            assert!(is_avdp(&s), "anchor at {anchor}");
+        }
     }
 
     #[test]

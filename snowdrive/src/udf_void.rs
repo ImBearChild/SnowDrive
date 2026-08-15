@@ -121,8 +121,10 @@ pub struct Layout {
     pub sbd_sectors: u32,
     /// Reserve volume descriptor sequence start (16 sectors from here).
     pub reserve_vds_lba: u32,
-    /// Second anchor (N-256).
-    pub avdp2_lba: u32,
+    /// Second anchor (N-257, mkudffs "End-Of-Volume − 256").
+    pub anchor2_lba: u32,
+    /// Third anchor (N-1, last addressable sector).
+    pub anchor3_lba: u32,
     /// File Set Descriptor (partition block 0).
     pub fsd_lba: u32,
     /// Unallocated Space Entry (partition block 1).
@@ -144,9 +146,9 @@ pub struct Layout {
 /// Compute the layout of an empty UDF void volume of `capacity_sectors`
 /// sectors. `label` is truncated to 31 ASCII chars (blank → "SNOWDRIVE").
 ///
-/// The geometry is deterministic: for any capacity ≥
-/// [`MIN_CAPACITY_SECTORS`] the volume head sits at 16..277 and the
-/// reserve VDS / second anchor float against the tail (`N-272`, `N-256`).
+/// The geometry is deterministic and mirrors `mkudffs` for a DVD: volume
+/// head at 16..277, anchors at 256 / N-257 / N-1, reserve VDS at N-160,
+/// partition ending before the second anchor (gap of 6 blocks).
 pub fn compute_layout(capacity_sectors: u32, label: &str) -> Result<Layout, UdfError> {
     if capacity_sectors < MIN_CAPACITY_SECTORS {
         return Err(UdfError::CapacityTooSmall);
@@ -154,8 +156,10 @@ pub fn compute_layout(capacity_sectors: u32, label: &str) -> Result<Layout, UdfE
     let vds_lba = AVDP_LBA + 1;
     let lvid_lba = vds_lba + VDS_SECTORS;
     let partition_lba = lvid_lba + LVID_SECTORS;
-    let reserve_vds_lba = capacity_sectors - AVDP_LBA - VDS_SECTORS;
-    let partition_len = reserve_vds_lba - partition_lba;
+    let reserve_vds_lba = capacity_sectors - 160;
+    let anchor2_lba = capacity_sectors - 257;
+    // Leave a 6-block gap before the second anchor (mkudffs ~7).
+    let partition_len = anchor2_lba - 6 - partition_lba;
 
     let sbd_num_bits = partition_len;
     let sbd_num_bytes = sbd_num_bits.div_ceil(8);
@@ -189,7 +193,8 @@ pub fn compute_layout(capacity_sectors: u32, label: &str) -> Result<Layout, UdfE
         sbd_num_bytes,
         sbd_sectors,
         reserve_vds_lba,
-        avdp2_lba: capacity_sectors - AVDP_LBA,
+        anchor2_lba,
+        anchor3_lba: capacity_sectors - 1,
         fsd_lba,
         use_lba,
         sbd_lba,
@@ -228,7 +233,7 @@ pub fn gen_sector(layout: &Layout, lba: u32, out: &mut [u8]) -> bool {
             write_vrs(out, b"TEA01");
             true
         }
-        l if l == AVDP_LBA || l == layout.avdp2_lba => {
+        l if l == AVDP_LBA || l == layout.anchor2_lba || l == layout.anchor3_lba => {
             write_avdp(out, layout, l);
             true
         }
@@ -471,18 +476,28 @@ fn charspec(out: &mut [u8], off: usize) {
     out[off + 1..off + 24].copy_from_slice(b"OSTA Compressed Unicode");
 }
 
-/// d-string: length byte + ASCII data (rest stays zero).
+/// d-string: length byte + ASCII data, plus the udftools convention of
+/// storing `1 + length` in the field's last byte (used by udfinfo/wrudf for
+/// reading; the kernel reads only the leading length byte).
 fn dstring(out: &mut [u8], off: usize, cap: usize, s: &str) {
     let data = s.as_bytes();
     let n = data.len().min(cap - 1);
     out[off] = n as u8;
     out[off + 1..off + 1 + n].copy_from_slice(&data[..n]);
+    out[off + cap - 1] = (n + 1) as u8;
 }
 
 /// `*OSTA UDF Compliant` entity ID with the UDF revision in the suffix.
 fn regid_udf(out: &mut [u8], off: usize) {
+    regid_ident(out, off, OSTA_COMPLIANT);
+}
+
+/// Entity ID with a fixed 23-byte identifier and the UDF revision in the
+/// suffix.
+fn regid_ident(out: &mut [u8], off: usize, ident: &[u8]) {
     out[off] = 0;
-    out[off + 1..off + 1 + OSTA_COMPLIANT.len()].copy_from_slice(OSTA_COMPLIANT);
+    let n = ident.len().min(23);
+    out[off + 1..off + 1 + n].copy_from_slice(&ident[..n]);
     out[off + 24..off + 26].copy_from_slice(&UDF_REV.to_le_bytes());
 }
 
@@ -554,7 +569,9 @@ fn write_pvd(out: &mut [u8], layout: &Layout, loc: u32) {
 /// Volume Descriptor Sequence Number = 5 (mkudffs `default_iuvd`).
 fn write_iuvd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 5); // volume descriptor sequence number
-    regid_udf(out, 20); // implementation identifier
+                            // Implementation Identifier "*UDF LV Info" (mkudffs default_iuvd); the
+                            // udf_info scanner only accepts this identifier.
+    regid_ident(out, 20, b"*UDF LV Info");
     let iu = 52;
     charspec(out, iu); // LV info charset
     dstring(out, iu + 64, 128, layout.label.as_str()); // logical volume id
@@ -604,14 +621,14 @@ fn write_lvd(out: &mut [u8], layout: &Layout, loc: u32) {
 }
 
 /// Unallocated Space Descriptor (ECMA-167 3/10.8): one extent covering the
-/// unused tail after the second anchor (volume space outside the
-/// partition). Volume Descriptor Sequence Number = 4 (mkudffs
-/// `default_usd`).
+/// unused volume space between the reserve VDS and the third anchor.
+/// Volume Descriptor Sequence Number = 4 (mkudffs `default_usd`).
 fn write_usd(out: &mut [u8], layout: &Layout, loc: u32) {
     put_u32_le(out, 16, 4); // volume descriptor sequence number
     put_u32_le(out, 20, 1); // number of allocation descriptors
-    let tail_len = (layout.capacity_sectors - layout.avdp2_lba - 1) * SECTOR_SIZE;
-    out[24..32].copy_from_slice(&extent_ad(layout.avdp2_lba + 1, tail_len));
+    let gap_start = layout.reserve_vds_lba + VDS_SECTORS;
+    let tail_len = (layout.anchor3_lba - gap_start) * SECTOR_SIZE;
+    out[24..32].copy_from_slice(&extent_ad(gap_start, tail_len));
     finalize_tag(out, 0, TAG_USD, loc, 32);
 }
 
@@ -660,7 +677,10 @@ fn write_fsd(out: &mut [u8], layout: &Layout) {
     let root_icb_block = layout.root_icb_lba - layout.partition_lba;
     out[400..416].copy_from_slice(&long_ad(ROOT_FE_SIZE, root_icb_block, 0));
     regid_udf(out, 416); // domain identifier
-    finalize_tag(out, 0, TAG_FSD, layout.fsd_lba, 512);
+                         // tagLocation is partition-relative (the FSD lives in PSPACE, mkudffs
+                         // query_tag): the kernel reads it via udf_read_ptagged which passes
+                         // location = logicalBlockNum = 0.
+    finalize_tag(out, 0, TAG_FSD, 0, 512);
 }
 
 /// Unallocated Space Entry (ECMA-167 4/14.12): one short_ad covering all
@@ -675,7 +695,8 @@ fn write_use(out: &mut [u8], layout: &Layout) {
     // Extent flag (oracle-verify): top 2 bits = FREE (2<<30).
     put_u32_le(out, 40, free_bytes | (2 << 30));
     put_u32_le(out, 44, layout.free_from_block);
-    finalize_tag(out, 0, TAG_USE, layout.use_lba, USE_SIZE as usize);
+    // tagLocation is partition-relative (partition block 1).
+    finalize_tag(out, 0, TAG_USE, 1, USE_SIZE as usize);
 }
 
 /// Space Bitmap Descriptor (ECMA-167 4/14.13). Multi-sector: the tag lives
@@ -693,7 +714,8 @@ fn write_sbd(layout: &Layout, lba: u32, out: &mut [u8]) {
         // capped at the u16 field.
         let crc_len = 8u32.saturating_add(layout.sbd_num_bytes).min(0xFFFF);
         put_u16_le(out, 10, crc_len as u16);
-        put_u32_le(out, 12, lba);
+        // tagLocation is partition-relative (partition block 2).
+        put_u32_le(out, 12, layout.sbd_lba - layout.partition_lba);
         put_u32_le(out, 16, layout.sbd_num_bits);
         put_u32_le(out, 20, layout.sbd_num_bytes);
         let mut tag = [0u8; 16];
@@ -722,7 +744,9 @@ fn write_root_icb(out: &mut [u8], layout: &Layout) {
     put_u32_le(out, 172, 8); // allocation descriptor length
     let root_dir_block = layout.root_dir_lba - layout.partition_lba;
     out[176..184].copy_from_slice(&short_ad(ROOT_DIR_BYTES, root_dir_block));
-    finalize_tag(out, 0, TAG_FE, layout.root_icb_lba, ROOT_FE_SIZE as usize);
+    // tagLocation is partition-relative (the FE lives in PSPACE).
+    let root_icb_block = layout.root_icb_lba - layout.partition_lba;
+    finalize_tag(out, 0, TAG_FE, root_icb_block, ROOT_FE_SIZE as usize);
 }
 
 /// Empty root directory: two File Identifier Descriptors (`.` and `..`),
@@ -731,10 +755,12 @@ const ROOT_DIR_BYTES: u32 = 40 + 40;
 
 fn write_root_dir(out: &mut [u8], layout: &Layout) {
     let root_icb_block = layout.root_icb_lba - layout.partition_lba;
+    // tagLocation is partition-relative (the root dir data block).
+    let root_dir_block = layout.root_dir_lba - layout.partition_lba;
     // "." — directory flag (oracle-verify: flag bits).
-    write_fid(out, 0, 0x02, b".", root_icb_block, layout.root_dir_lba);
+    write_fid(out, 0, 0x02, b".", root_icb_block, root_dir_block);
     // ".." — parent flag; root's parent is itself.
-    write_fid(out, 40, 0x08, b"..", root_icb_block, layout.root_dir_lba);
+    write_fid(out, 40, 0x08, b"..", root_icb_block, root_dir_block);
 }
 
 /// File Identifier Descriptor (ECMA-167 4/14.4) with no implementation use;
@@ -820,14 +846,15 @@ mod tests {
         assert_eq!(l.vds_lba, 257);
         assert_eq!(l.lvid_lba, 273);
         assert_eq!(l.partition_lba, 277);
-        assert_eq!(l.avdp2_lba, MIN_CAPACITY_SECTORS - 256);
-        assert_eq!(l.reserve_vds_lba, MIN_CAPACITY_SECTORS - 272);
+        assert_eq!(l.anchor2_lba, MIN_CAPACITY_SECTORS - 257);
+        assert_eq!(l.anchor3_lba, MIN_CAPACITY_SECTORS - 1);
+        assert_eq!(l.reserve_vds_lba, MIN_CAPACITY_SECTORS - 160);
         assert_eq!(
             l.partition_len,
-            MIN_CAPACITY_SECTORS - 549,
-            "partition covers head..reserve VDS"
+            MIN_CAPACITY_SECTORS - 540,
+            "partition ends 6 blocks before the second anchor"
         );
-        assert_eq!(l.sbd_num_bytes, 1499u32.div_ceil(8));
+        assert_eq!(l.sbd_num_bytes, 1508u32.div_ceil(8));
         assert_eq!(l.sbd_sectors, 1);
         assert_eq!(l.free_from_block, 5);
         assert_eq!(l.fsd_lba, 277);
@@ -883,7 +910,7 @@ mod tests {
     #[test]
     fn anchors_point_at_vds_extents() {
         let l = layout_of(MIN_CAPACITY_SECTORS);
-        for loc in [AVDP_LBA, l.avdp2_lba] {
+        for loc in [AVDP_LBA, l.anchor2_lba, l.anchor3_lba] {
             let mut s = sector();
             gen_sector(&l, loc, &mut s);
             assert_eq!(u16::from_le_bytes([s[0], s[1]]), TAG_AVDP);
@@ -992,7 +1019,7 @@ mod tests {
         // USD is the fourth VDS descriptor (mkudffs order).
         gen_sector(&l, l.vds_lba + 3, &mut s);
         let loc = u32::from_le_bytes(s[28..32].try_into().unwrap());
-        assert_eq!(loc, l.avdp2_lba + 1);
+        assert_eq!(loc, l.reserve_vds_lba + VDS_SECTORS);
     }
 
     #[test]
@@ -1133,7 +1160,7 @@ mod tests {
         // A free block inside the partition.
         assert!(!gen_sector(&l, l.free_from_block + l.partition_lba, &mut s));
         // The 255-sector tail after the second anchor.
-        assert!(!gen_sector(&l, l.avdp2_lba + 1, &mut s));
+        assert!(!gen_sector(&l, l.reserve_vds_lba + VDS_SECTORS, &mut s));
         // LBA 0 (system area) is not part of the structure.
         assert!(!gen_sector(&l, 0, &mut s));
     }
@@ -1148,7 +1175,18 @@ mod tests {
                 let id = u16::from_le_bytes([s[0], s[1]]);
                 assert!(id != 0, "LBA {lba}: tag id must be set");
                 let location = u32::from_le_bytes(s[12..16].try_into().unwrap());
-                assert_eq!(location, lba, "LBA {lba}: tag location");
+                // Partition-internal descriptors (FSD/USE/SBD/root FE/FID)
+                // carry a partition-relative tagLocation (mkudffs query_tag
+                // for PSPACE); everything else is absolute.
+                let expected = match lba {
+                    x if x == l.fsd_lba => l.fsd_lba - l.partition_lba,
+                    x if x == l.use_lba => l.use_lba - l.partition_lba,
+                    x if x == l.sbd_lba => l.sbd_lba - l.partition_lba,
+                    x if x == l.root_icb_lba => l.root_icb_lba - l.partition_lba,
+                    x if x == l.root_dir_lba => l.root_dir_lba - l.partition_lba,
+                    x => x,
+                };
+                assert_eq!(location, expected, "LBA {lba}: tag location");
                 let mut tag = [0u8; 16];
                 tag.copy_from_slice(&s[..16]);
                 assert_eq!(s[4], tag_checksum(&tag), "LBA {lba}: checksum");
