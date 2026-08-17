@@ -727,6 +727,16 @@ struct FfsBot {
     pending: bool,
 }
 
+/// Errno values that mean the USB host disconnected: FunctionFS disables the
+/// endpoints on unplug, failing the pending transfers with `ESHUTDOWN`
+/// (108), `ENOTCONN` (107), `ECONNRESET` (104), `ECONNABORTED` (103) or
+/// `EPIPE` (32). Unlike other I/O failures these are expected and
+/// recoverable — the serve loop resets the session and re-arms.
+#[cfg(target_os = "linux")]
+fn is_link_down_err(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(32 | 103 | 104 | 107 | 108))
+}
+
 #[cfg(target_os = "linux")]
 impl FfsBot {
     fn new(out: EndpointReceiver, in_: EndpointSender) -> Self {
@@ -758,23 +768,25 @@ impl FfsBot {
     /// `Some(t)` waits up to `t`), then copy the received bytes out.
     fn recv_impl(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, BotIoErr> {
         self.ensure_read(buf.len())?;
-        let d = match timeout {
-            Some(t) => match self.out.fetch_timeout(t) {
-                Ok(Some(d)) => d,
-                Ok(None) => return Err(BotIoErr::WouldBlock),
-                Err(e) => {
-                    log::error!("aio fetch failed: {e} (buf.len={})", buf.len());
-                    return Err(BotIoErr::Io);
+        let fetch = |out: &mut EndpointReceiver| match timeout {
+            Some(t) => out.fetch_timeout(t),
+            None => out.fetch(),
+        };
+        let d = match fetch(&mut self.out) {
+            Ok(Some(d)) => d,
+            Ok(None) => return Err(BotIoErr::WouldBlock),
+            // The completion was consumed on error, so no read is in flight
+            // anymore: clear `pending` or the next receive would wait forever
+            // for a completion that never comes.
+            Err(e) => {
+                self.pending = false;
+                if is_link_down_err(&e) {
+                    log::info!("USB link down: {e} (buf.len={})", buf.len());
+                    return Err(BotIoErr::Disconnected);
                 }
-            },
-            None => match self.out.fetch() {
-                Ok(Some(d)) => d,
-                Ok(None) => return Err(BotIoErr::WouldBlock),
-                Err(e) => {
-                    log::error!("aio fetch failed: {e} (buf.len={})", buf.len());
-                    return Err(BotIoErr::Io);
-                }
-            },
+                log::error!("aio fetch failed: {e} (buf.len={})", buf.len());
+                return Err(BotIoErr::Io);
+            }
         };
         self.pending = false;
         let n = d.len().min(buf.len());
@@ -796,7 +808,15 @@ impl BotIo for FfsBot {
     fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
         self.in_
             .send(bytes::Bytes::copy_from_slice(buf))
-            .map_err(|_| BotIoErr::Io)
+            .map_err(|e| {
+                if is_link_down_err(&e) {
+                    log::info!("USB link down: {e}");
+                    BotIoErr::Disconnected
+                } else {
+                    log::error!("bulk IN send failed: {e}");
+                    BotIoErr::Io
+                }
+            })
     }
 
     fn stall_both(&mut self) -> Result<(), ()> {
@@ -958,6 +978,15 @@ fn serve_bot(
                             }
                         }
                     }
+                    Err(BotIoErr::Disconnected) => {
+                        // Host unplug / VM migration: reset and keep serving.
+                        // The next NeedOut re-arms the read (pending was
+                        // cleared by FfsBot); a re-attach is announced by
+                        // FunctionFS Bind/Enable events.
+                        log::info!("USB host disconnected; resetting session");
+                        session.reset();
+                        stalled = false;
+                    }
                     Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
                 }
             }
@@ -966,9 +995,19 @@ fn serve_bot(
                 if data.len() != len {
                     return Err("internal: out_slice length mismatch".to_string());
                 }
-                ffs_bot
-                    .send_in(data)
-                    .map_err(|_| "bulk IN send failed".to_string())?;
+                match ffs_bot.send_in(data) {
+                    Ok(()) => {}
+                    Err(BotIoErr::Disconnected) => {
+                        log::info!("USB host disconnected; resetting session");
+                        session.reset();
+                        stalled = false;
+                        continue;
+                    }
+                    Err(BotIoErr::Io) => return Err("bulk IN send failed".to_string()),
+                    Err(BotIoErr::WouldBlock) => {
+                        return Err("unexpected WouldBlock on bulk IN send".to_string());
+                    }
+                }
                 let step = session.poll(BotEvent::InSent, work, devs);
                 if let BotStep::Done(r) = step {
                     handle_done(r, &mut stalled, ffs_bot)?;
@@ -1410,6 +1449,25 @@ fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_down_errno_classification() {
+        use std::io::ErrorKind;
+        // ESHUTDOWN (the VM-migration failure), ENOTCONN, ECONNRESET,
+        // ECONNABORTED, EPIPE.
+        for errno in [108, 107, 104, 103, 32] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(is_link_down_err(&e), "errno {errno} must be link-down");
+        }
+        // Genuine failures are not treated as a disconnect.
+        for e in [
+            std::io::Error::from_raw_os_error(22), // EINVAL
+            std::io::Error::new(ErrorKind::TimedOut, "timeout"),
+        ] {
+            assert!(!is_link_down_err(&e), "{e:?} must not be link-down");
+        }
+    }
 
     #[test]
     fn parse_size_plain_and_suffixes() {

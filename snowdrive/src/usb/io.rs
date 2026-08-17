@@ -10,6 +10,9 @@
 //!
 //! Like [`crate::iscsi::conn::Conn`], error kinds are deliberately coarse:
 //! any real I/O failure means the link is dead and the driver should stop.
+//! The one exception is [`BotIoErr::Disconnected`]: a USB gadget is a
+//! persistent physical port, so a host unplug (VM migration / device detach)
+//! is expected and recoverable — the driver resets the BOT session and re-arms.
 
 use core::time::Duration;
 
@@ -20,6 +23,11 @@ pub enum BotIoErr {
     WouldBlock,
     /// Transport failure (details logged by the transport).
     Io,
+    /// The USB link went down (host disconnect / unplug / VM migration).
+    /// Unlike [`Self::Io`] this is expected and recoverable: the driver
+    /// should reset the BOT session and re-arm the endpoints; I/O resumes
+    /// when the host re-attaches (FunctionFS `Bind`/`Enable` events).
+    Disconnected,
 }
 
 impl core::fmt::Display for BotIoErr {
@@ -27,6 +35,7 @@ impl core::fmt::Display for BotIoErr {
         match self {
             Self::WouldBlock => write!(f, "bulk receive would block"),
             Self::Io => write!(f, "bulk I/O failure"),
+            Self::Disconnected => write!(f, "USB link disconnected"),
         }
     }
 }
@@ -208,5 +217,6 @@ mod tests {
     fn io_err_display() {
         assert_eq!(BotIoErr::WouldBlock.to_string(), "bulk receive would block");
         assert_eq!(BotIoErr::Io.to_string(), "bulk I/O failure");
+        assert_eq!(BotIoErr::Disconnected.to_string(), "USB link disconnected");
     }
 }
