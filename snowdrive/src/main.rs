@@ -66,7 +66,7 @@ use usb_gadget::function::custom::{
     EndpointSender, Event, Interface,
 };
 #[cfg(target_os = "linux")]
-use usb_gadget::{default_udc, udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
+use usb_gadget::{udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
 
 /// Default work buffer size (256 KiB).
 const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
@@ -126,13 +126,17 @@ struct ServeArgs {
 
     /// Serve the devices over USB Mass Storage (Bulk-Only Transport) by
     /// binding a FunctionFS gadget to a UDC (Linux only). Mutually
-    /// exclusive with `--iscsi`.
-    #[arg(long = "usb", group = "transport")]
-    usb: bool,
-
-    /// UDC name to bind the USB gadget to (default: the first UDC).
-    #[arg(long = "udc", value_name = "NAME")]
-    udc: Option<String>,
+    /// exclusive with `--iscsi`. Optional UDC selector: `auto` (default —
+    /// prefer a real controller over the test-only `dummy_udc`), `dummy`
+    /// (auto-load `dummy_hcd`, ensure configfs and bind `dummy_udc.0`), a
+    /// UDC name, or a driver prefix.
+    #[arg(
+        long = "usb",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        group = "transport"
+    )]
+    usb: Option<String>,
 
     /// USB vendor ID (hex).
     #[arg(long = "vid", value_name = "VID", default_value = "1209", value_parser = parse_hex_u16)]
@@ -199,10 +203,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if args.usb {
+    if let Some(selector) = args.usb.as_deref() {
         #[cfg(target_os = "linux")]
         {
-            return run_serve_usb(&args, &mut devices, work_size);
+            return run_serve_usb(&args, &mut devices, work_size, selector);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -620,7 +624,12 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 /// `snowdrive serve --usb`: assemble the MSC FunctionFS gadget, bind it to a
 /// UDC and run the BOT poll loop (§6).
-fn run_serve_usb(args: &ServeArgs, devices: &mut [Device<'_>], work_size: usize) -> ExitCode {
+fn run_serve_usb(
+    args: &ServeArgs,
+    devices: &mut [Device<'_>],
+    work_size: usize,
+    selector: &str,
+) -> ExitCode {
     // Gadget assembly (§6.1): a single MSC interface (class 08/06/50) with
     // one bulk OUT + one bulk IN endpoint.
     let (ep_out, out_dir) = EndpointDirection::host_to_device();
@@ -634,13 +643,14 @@ fn run_serve_usb(args: &ServeArgs, devices: &mut [Device<'_>], work_size: usize)
         )
         .build();
 
-    let udc = match select_udc(args.udc.as_deref()) {
-        Ok(u) => u,
+    let choice = match resolve_udc(selector) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("snowdrive: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let UdcChoice { udc, owns_configfs } = choice;
     log::info!("binding USB gadget to UDC {:?}", udc.name());
     let reg = match UsbGadget::new(
         Class::INTERFACE_SPECIFIC,
@@ -686,24 +696,160 @@ fn run_serve_usb(args: &ServeArgs, devices: &mut [Device<'_>], work_size: usize)
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush backends, then unregister the gadget (RAII).
+    // Graceful exit: flush backends, unregister the gadget (RAII), then
+    // unmount configfs again if the `dummy` auto-config mounted it.
     sync_devices(devices);
     drop(reg);
+    release_configfs(owns_configfs);
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
 
 #[cfg(target_os = "linux")]
-/// Pick the UDC to bind: `--udc NAME` or the system default.
-fn select_udc(name: Option<&str>) -> Result<Udc, String> {
-    match name {
-        None => default_udc()
-            .map_err(|e| format!("no USB device controller (is dummy_hcd loaded?): {e}")),
-        Some(n) => udcs()
-            .map_err(|e| format!("failed to enumerate UDCs: {e}"))?
-            .into_iter()
-            .find(|u| u.name().to_str() == Some(n))
-            .ok_or_else(|| format!("UDC not found: {n}")),
+/// The result of [`resolve_udc`]: the selected controller plus the configfs
+/// mount ownership recorded by the `dummy` auto-config path.
+struct UdcChoice {
+    udc: Udc,
+    /// True when `resolve_udc("dummy")` mounted configfs — the caller must
+    /// unmount it again via [`release_configfs`] on exit.
+    owns_configfs: bool,
+}
+
+#[cfg(target_os = "linux")]
+/// Pick the UDC to bind from the `--usb` selector: `auto` (default — prefer
+/// a real controller over the test-only `dummy_udc`), `dummy` (auto-load
+/// `dummy_hcd` + `libcomposite`, ensure configfs and bind `dummy_udc.0`), a
+/// UDC name, or a driver prefix.
+fn resolve_udc(selector: &str) -> Result<UdcChoice, String> {
+    match selector {
+        "dummy" => ensure_dummy_udc(),
+        "auto" => {
+            let all = udcs().map_err(|e| format!("failed to enumerate UDCs: {e}"))?;
+            let chosen = all
+                .iter()
+                .find(|u| is_real_udc(u))
+                .or_else(|| all.first())
+                .ok_or_else(|| {
+                    "no USB device controller (UDC) available; load dummy_hcd or pass `--usb dummy`"
+                        .to_string()
+                })?;
+            if all.len() > 1 {
+                log::info!(
+                    "auto-selected UDC {:?} (available: {})",
+                    chosen.name(),
+                    describe_udcs(&all)
+                );
+            }
+            Ok(UdcChoice {
+                udc: chosen.clone(),
+                owns_configfs: false,
+            })
+        }
+        sel => {
+            let all = udcs().map_err(|e| format!("failed to enumerate UDCs: {e}"))?;
+            all.into_iter()
+                .find(|u| udc_matches(u, sel))
+                .map(|u| UdcChoice {
+                    udc: u,
+                    owns_configfs: false,
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "UDC not found: {sel} (available: {})",
+                        describe_udcs(&udcs().unwrap_or_default())
+                    )
+                })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// `auto` heuristic: a controller with a real kernel driver, not the
+/// test-only `dummy_hcd`'s `dummy_udc`.
+fn is_real_udc(u: &Udc) -> bool {
+    u.driver()
+        .map(|d| d.to_string_lossy() != "dummy_udc")
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "linux")]
+/// Selector match: exact UDC name, exact driver name, or UDC name prefix
+/// (`--usb dwc2` matches `dwc2.0`).
+fn udc_matches(u: &Udc, sel: &str) -> bool {
+    let name = u.name().to_string_lossy();
+    name == sel
+        || name.starts_with(sel)
+        || u.driver()
+            .map(|d| d.to_string_lossy() == sel)
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+/// `name (driver)` for each controller, for error / log messages.
+fn describe_udcs(all: &[Udc]) -> String {
+    all.iter()
+        .map(|u| format!("{:?} ({:?})", u.name(), u.driver().ok()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(target_os = "linux")]
+/// The `--usb dummy` auto-config: modprobe `dummy_hcd` + `libcomposite`
+/// (idempotent; never unloaded — the module may be a shared resource),
+/// ensure configfs is mounted, and return `dummy_udc.0` with the configfs
+/// mount ownership flag.
+fn ensure_dummy_udc() -> Result<UdcChoice, String> {
+    for module in ["dummy_hcd", "libcomposite"] {
+        match std::process::Command::new("modprobe").arg(module).status() {
+            Ok(s) if s.success() => {}
+            _ => {
+                return Err(format!(
+                    "failed to load kernel module '{module}' \
+                     (is modprobe available and are you root?)"
+                ));
+            }
+        }
+    }
+    let owns_configfs = ensure_configfs()?;
+    let udc = udcs()
+        .map_err(|e| format!("failed to enumerate UDCs: {e}"))?
+        .into_iter()
+        .find(|u| u.name().to_str() == Some("dummy_udc.0"))
+        .ok_or_else(|| "dummy_udc.0 not available after loading dummy_hcd".to_string())?;
+    Ok(UdcChoice { udc, owns_configfs })
+}
+
+#[cfg(target_os = "linux")]
+/// Ensure configfs is mounted at `/sys/kernel/config` (most distros do not
+/// mount it by default; `libcomposite` registers `/sys/kernel/config/
+/// usb_gadget` when loaded). Returns `true` when this call mounted it — the
+/// caller must unmount it again via [`release_configfs`].
+fn ensure_configfs() -> Result<bool, String> {
+    if Path::new("/sys/kernel/config/usb_gadget").is_dir() {
+        return Ok(false);
+    }
+    let _ = std::fs::create_dir_all("/sys/kernel/config");
+    match std::process::Command::new("mount")
+        .args(["-t", "configfs", "none", "/sys/kernel/config"])
+        .status()
+    {
+        Ok(s) if s.success() => Ok(true),
+        // Lost a race: someone else mounted configfs while we tried.
+        _ if Path::new("/sys/kernel/config/usb_gadget").is_dir() => Ok(false),
+        _ => Err("failed to mount configfs at /sys/kernel/config \
+             (is 'mount' available and are you root?)"
+            .to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Unmount configfs again after the serve loop, but only when this process
+/// mounted it (never touch a pre-existing mount).
+fn release_configfs(owned: bool) {
+    if owned {
+        let _ = std::process::Command::new("umount")
+            .arg("/sys/kernel/config")
+            .status();
     }
 }
 
@@ -1816,12 +1962,12 @@ mod tests {
     fn cli_usb_transport_parses() {
         match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--disk", "ram=1M"]).unwrap() {
             Cli::Serve(a) => {
-                assert!(a.usb);
+                // `--usb` without a value defaults to the `auto` selector.
+                assert_eq!(a.usb.as_deref(), Some("auto"));
                 assert_eq!(a.iscsi, None);
                 assert_eq!(a.vid, 0x1209);
                 assert_eq!(a.pid, 0x0001);
                 assert_eq!(a.serial, "SNOWSCSI");
-                assert_eq!(a.udc, None);
             }
             other => panic!("expected Serve, got {other:?}"),
         }
@@ -1848,7 +1994,6 @@ mod tests {
             "snowdrive",
             "serve",
             "--usb",
-            "--udc",
             "dummy_udc.0",
             "--vid",
             "1d6b",
@@ -1860,8 +2005,7 @@ mod tests {
         .unwrap()
         {
             Cli::Serve(a) => {
-                assert!(a.usb);
-                assert_eq!(a.udc.as_deref(), Some("dummy_udc.0"));
+                assert_eq!(a.usb.as_deref(), Some("dummy_udc.0"));
                 assert_eq!(a.vid, 0x1d6b);
                 assert_eq!(a.pid, 0x0105);
                 assert_eq!(a.serial, "SNOWSCSI-1");
