@@ -212,7 +212,6 @@ fn write_sector<B: BlockStorage>(
 pub struct UdfRwDevice<B: BlockStorage> {
     common: CdromDeviceCommon,
     media: UdfRwMedia<B>,
-    format_started: bool,
 }
 
 impl<B: BlockStorage> UdfRwDevice<B> {
@@ -228,7 +227,6 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         Ok(Self {
             common: CdromDeviceCommon::new(CurrentProfile::DvdRw),
             media,
-            format_started: false,
         })
     }
 
@@ -386,9 +384,11 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         Ok(outcome)
     }
 
-    /// FORMAT UNIT (0x04) for the DVD+RW Basic Format descriptor. The target
-    /// still drains the host's 12-byte parameter list when FmtData=1, but the
-    /// payload is intentionally sent to a sink rather than the data plane.
+    /// FORMAT UNIT (0x04) for the DVD+RW Basic Format descriptor. Windows
+    /// sends the 12-byte descriptor for this media even with FmtData clear
+    /// (the captured command is `04 11 ...`). Accept that data phase as a
+    /// compatibility behavior; a zero-length BOT transaction still completes
+    /// immediately.
     ///
     /// CDB byte 1 bit layout (MMC-6 §6.4):
     /// - bit 7 (FmtData): 1 = parameter list follows, 0 = no parameter list
@@ -404,17 +404,13 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         if self.media.clear().is_err() {
             return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
         }
-        self.format_started = true;
-        if cdb[1] & 0x80 != 0 {
-            // FmtData=1: parameter list follows
-            CommandOutcome::DataOut {
-                transfer_len: 12,
-                byte_offset: u64::MAX,
-                immediate: &[],
-            }
-        } else {
-            // FmtData=0: no parameter list, complete immediately
-            CommandOutcome::Status
+        // The Windows optical formatter supplies the Basic Format Descriptor
+        // despite clearing FmtData. Consume it either way so BOT reports zero
+        // residue instead of treating the host payload as an overrun.
+        CommandOutcome::DataOut {
+            transfer_len: 12,
+            byte_offset: u64::MAX,
+            immediate: &[],
         }
     }
 
@@ -620,12 +616,9 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         buf[4] = 1; // number of sessions
         buf[5] = 1; // first track in last session
         buf[6] = 1; // last track in last session
-        buf[7] = if self.format_started {
-            0x22 // URU=1 (unrestricted) | MRW=10b (background format active,
-                  // disc is write-accessible during background format)
-        } else {
-            0x23 // URU=1 | MRW=11b (background format complete)
-        };
+        // FORMAT UNIT is synchronous in this emulation, so report background
+        // formatting complete rather than leaving Windows in MRW active state.
+        buf[7] = 0x23; // URU=1 | MRW=11b (background format complete)
         buf[8] = 0x00; // Disc Type is defined only for CD media (Table 365)
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
@@ -1476,7 +1469,7 @@ mod tests {
         let n = do_device_data_in(&mut dev, &info_cdb, &mut w, &mut info);
         assert_eq!(n, 34);
         assert_eq!(info[2], 0x1E);
-        assert_eq!(info[7], 0x22, "URU=1 | background format active");
+        assert_eq!(info[7], 0x23, "URU=1 | background format complete");
         assert_eq!(info[8], 0x00, "DVD media has no CD disc type");
 
         let tur = [op::TEST_UNIT_READY; 6];
@@ -1487,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn device_format_unit_without_param_list_returns_status() {
+    fn device_format_unit_with_windows_param_list_returns_data_out() {
         let mut img = ram(2048 * 4096);
         let mut scratch = [0u8; 256];
         let mut dev = UdfRwDevice::open_or_materialize(
@@ -1498,11 +1491,16 @@ mod tests {
         )
         .unwrap();
         let mut w = work();
-        // FmtData=0 (bit7), DCRT=1 (bit4), DefectListFormat=1 (bits2:0) = 0x11
+        // Windows uses FmtData=0 (bit7 clear), DCRT=1 and DefectListFormat=1
+        // (bits2:0) = 0x11, while still sending the 12-byte descriptor.
         let format = [0x04, 0x11, 0, 0, 0, 0];
         assert!(matches!(
             dev.do_cmd(&format, &mut w, 0).unwrap(),
-            CommandOutcome::Status
+            CommandOutcome::DataOut {
+                transfer_len: 12,
+                byte_offset: u64::MAX,
+                ..
+            }
         ));
     }
 
