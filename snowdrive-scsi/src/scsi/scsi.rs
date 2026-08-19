@@ -59,7 +59,16 @@ pub mod asc {
     /// ASC 29h — POWER ON, RESET, OR BUS DEVICE RESET OCCURRED (SPC-4
     /// §4.5.6), injected as a unit attention after a device reset.
     pub const POWER_ON_RESET: u8 = 0x29;
+    /// ASC 28h — NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED
+    /// (SPC-4 §4.5.6).  Injected as unit attention after media load/eject
+    /// (plan §6.2).
+    pub const MEDIUM_MAY_HAVE_CHANGED: u8 = 0x28;
     pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
+    /// ASCQ 01h for [`MEDIUM_NOT_PRESENT`]: tray is closed but no media
+    /// is present (plan §6.1).
+    pub const MEDIUM_NOT_PRESENT_TRAY_CLOSED: u8 = 0x01;
+    /// ASCQ 02h for [`MEDIUM_NOT_PRESENT`]: tray is open (plan §6.1).
+    pub const MEDIUM_NOT_PRESENT_TRAY_OPEN: u8 = 0x02;
     pub const MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
     /// ASCQ for [`MEDIUM_REMOVAL_PREVENTED`]. ASC 53h/02h is MEDIUM
     /// REMOVAL PREVENTED; 53h/00h decodes as MEDIA LOAD OR EJECT FAILED.

@@ -24,6 +24,7 @@ pub mod common;
 pub mod device;
 #[cfg(feature = "livefs")]
 pub mod livefs;
+pub mod media;
 #[cfg(feature = "udf_void")]
 pub mod udfrw;
 
@@ -33,5 +34,6 @@ pub use common::{
 pub use device::CdromDevice;
 #[cfg(feature = "livefs")]
 pub use livefs::CdLiveFsDevice;
+pub use media::{CdMedia, MediaError};
 #[cfg(feature = "udf_void")]
 pub use udfrw::{UdfRwDevice, UdfRwError, UdfRwMedia};
