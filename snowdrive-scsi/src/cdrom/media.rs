@@ -1,17 +1,25 @@
-//! CD-ROM media types and geometry (plan §3.3 / M1).
+//! CD-ROM media types, geometry and media-layer methods (plan §3.3 / M1–M2).
 //!
-//! This module hoists the shared type definitions that all media variants
-//! (`FlatMedia`, `LiveData`, `BundleMedia`, `UdfRwMedia`) will produce
-//! and the drive layer will consume.  **M1 is a pure type-definition step** —
-//! no device-model changes, no behaviour modifications.
+//! M1: Type definitions (Track, SessionInfo, DiscState, DiscType, …).
+//! M2: `CdMedia` gains inherent methods that `CdromDrive` delegates to;
+//!     `UdfRw` variant is concrete; `MediaEventStatus` for GESN.
 //!
 //! Types defined here:
 //! - Geometry constants (`MAX_TRACKS`, `SECTOR_SIZE_DATA`, …)
 //! - `TrackKind`, `TrackStatus`, `RecordingMode`, `DiscState`, `DiscType`
 //! - `TrackFile`, `Track`, `SessionInfo`
 //! - `MediaError` (write-path error model, plan §3.2 A1)
-//! - `CdMedia` enum (media slot — plan §2.2; variants added incrementally
-//!   as `FlatMedia`/`LiveData`/`BundleMedia`/`UdfRwMedia` land)
+//! - `MediaEventStatus` (GESN media class response)
+//! - `CdMedia` enum with inherent methods for the drive layer
+
+#[cfg(feature = "udf_void")]
+use crate::cdrom::common::CurrentProfile;
+#[cfg(feature = "udf_void")]
+use crate::cdrom::udfrw::UdfRwMedia;
+#[cfg(feature = "udf_void")]
+use crate::scsi::backend::BlockBackend;
+#[cfg(feature = "udf_void")]
+use crate::scsi::backend::BlockStorageError;
 
 // ── Geometry constants (plan §3.3) ─────────────────────────────────
 
@@ -35,6 +43,9 @@ pub const PREGAP_SECTORS: u32 = 150;
 
 /// Default CD capacity for 80 minutes of audio (360 000 sectors).
 pub const DEFAULT_CD_CAPACITY: u32 = 360_000;
+
+/// Sector size in bytes (module-level alias for `SECTOR_SIZE_DATA`).
+pub const SECTOR_SIZE: u32 = 2048;
 
 // ── Track / Session / Disc enums (plan §3.3) ──────────────────────
 
@@ -178,39 +189,174 @@ pub enum MediaError {
     Io,
 }
 
+// ── GESN media event status (plan §2.3 / MMC-6 §6.5) ─────────────
+
+/// Media event status for GET EVENT STATUS NOTIFICATION (MMC-6 Table 265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaEventStatus {
+    /// No change since last poll.
+    NoChange,
+    /// Media was removed.
+    MediaRemoved,
+    /// New media was inserted.
+    MediaInserted,
+}
+
 // ── CdMedia enum (plan §2.2) ──────────────────────────────────────
 
-/// The media slot inside a [`CdromDrive`](super::device::CdromDrive).
+/// The media slot inside a [`CdromDrive`](super::drive::CdromDrive).
 ///
 /// `None` means the tray is empty (plan §6.1).  Each variant wraps a
 /// concrete media type that provides geometry and a data plane.
 ///
-/// Variants are added incrementally as the media types land:
+/// Variants are added incrementally:
+/// - **M2**: `UdfRw(…)` (migrated from standalone `UdfRwDevice`)
 /// - **M3**: `Flat(…)` and `Live(…)`
 /// - **M7**: `Bundle(…)`
-/// - **M2**: `UdfRw(…)` (migrated from the standalone `UdfRwDevice`)
-///
-/// Until the concrete types exist, this enum is defined but not yet
-/// constructed anywhere — M1 is purely a type-hoisting step.
 pub enum CdMedia<'a> {
-    /// Flat ISO/RAM read-only image (plan §5.1).
-    /// `FlatMedia<FlatData=BlockBackend<'a>>`
+    /// Flat ISO/RAM read-only image (plan §5.1, M3).
     Flat(/* FlatMedia<BlockBackend<'a>> — M3 */),
 
-    /// Live ISO9660 from a host directory (plan §5.2).
-    /// `FlatMedia<FlatData=LiveData<FsBackend>>`
+    /// Live ISO9660 from a host directory (plan §5.2, M3).
     Live(/* FlatMedia<LiveData<FsBackend>> — M3 */),
 
-    /// Bundle: multi-track, multi-session disc package (plan §7.1).
-    /// `BundleMedia<FsBackend>`
+    /// Bundle: multi-track, multi-session disc package (plan §7.1, M7).
     Bundle(/* BundleMedia<FsBackend> — M7 */),
 
-    /// UDF random-writable DVD+RW (plan §5.4, migrated from UdfRwDevice).
-    /// `UdfRwMedia<BlockBackend<'a>>`
-    UdfRw(/* UdfRwMedia<BlockBackend<'a>> — M2 */),
+    /// UDF random-writable DVD+RW (plan §5.4, M2).
+    #[cfg(feature = "udf_void")]
+    UdfRw(UdfRwMedia<BlockBackend<'a>>),
 
-    /// Marker for lifetime usage.
+    /// Marker for lifetime usage when all other variants are `cfg`-gated.
     _Phantom(core::marker::PhantomData<&'a ()>),
+}
+
+#[cfg(feature = "udf_void")]
+impl<'a> CdMedia<'a> {
+    // ── Profile (plan §3.2) ────────────────────────────────────────
+
+    /// Current Profile for GET CONFIGURATION (plan §3.2).
+    pub fn profile(&self) -> CurrentProfile {
+        match self {
+            Self::UdfRw(_) => CurrentProfile::DvdRw,
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    // ── Geometry (plan §3.2) ───────────────────────────────────────
+
+    /// Largest readable LBA (plan §3.2 `max_lba`).
+    pub fn max_lba(&self) -> u64 {
+        match self {
+            Self::UdfRw(m) => m.max_lba(),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    /// Lead-out start LBA = number of data sectors (plan §3.2).
+    pub fn lead_out_lba(&self) -> u32 {
+        match self {
+            Self::UdfRw(m) => m.lead_out_lba(),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    /// Media capacity in bytes.
+    pub fn capacity(&self) -> u64 {
+        match self {
+            Self::UdfRw(m) => m.capacity(),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    // ── Data plane (plan §3.2) ─────────────────────────────────────
+
+    /// Read data from the medium (target data path).
+    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        match self {
+            Self::UdfRw(m) => m.read_data(offset, buf),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    /// Write data to the medium (target data path).
+    pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), MediaError> {
+        match self {
+            Self::UdfRw(m) => m.write_data(offset, buf).map_err(|e| match e {
+                BlockStorageError::OutOfBounds => MediaError::OutOfBounds,
+                BlockStorageError::NotWritable => MediaError::WriteProtected,
+                BlockStorageError::Io(_) => MediaError::Io,
+            }),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    /// Flush the medium (SYNCHRONIZE CACHE).
+    pub fn sync(&mut self) -> Result<(), MediaError> {
+        match self {
+            Self::UdfRw(m) => m.sync().map_err(|_| MediaError::Io),
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    // ── GESN (plan §2.3, M2 unified) ──────────────────────────────
+
+    /// Media event status for GET EVENT STATUS NOTIFICATION.
+    pub fn event_status(&self) -> MediaEventStatus {
+        match self {
+            // UDFRW always has media present, no change events.
+            Self::UdfRw(_) => MediaEventStatus::NoChange,
+            _ => {
+                unreachable!("variant not yet implemented")
+            }
+        }
+    }
+
+    // ── READ DVD STRUCTURE (M2 unified) ────────────────────────────
+
+    /// Physical format information for READ DVD STRUCTURE format 0.
+    pub fn dvd_physical_format(&self) -> Option<DvdPhysicalFormat> {
+        match self {
+            Self::UdfRw(m) => Some(DvdPhysicalFormat {
+                disk_category_part_version: 0x91, // DVD+RW
+                layer_type: 0x04,                 // single-layer, rewritable
+                data_start: 0x0003_0000,
+                data_end: 0x0003_0000 + m.lead_out_lba(),
+                next_writable: 0x0003_0000 + m.lead_out_lba(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this media type supports the given READ DVD STRUCTURE format.
+    pub fn supports_dvd_structure_format(&self, format: u8) -> bool {
+        matches!(self, Self::UdfRw(_)) && matches!(format, 0 | 0x30 | 0xC0)
+    }
+}
+
+/// Physical format information for READ DVD STRUCTURE format 0
+/// (MMC-6 §6.22.3.2.1, Table 398).
+#[derive(Debug, Clone, Copy)]
+pub struct DvdPhysicalFormat {
+    pub disk_category_part_version: u8,
+    pub layer_type: u8,
+    pub data_start: u32,
+    pub data_end: u32,
+    pub next_writable: u32,
 }
 
 #[cfg(test)]
@@ -221,6 +367,7 @@ mod tests {
     fn sector_size_constants() {
         assert_eq!(SECTOR_SIZE_DATA, 2048);
         assert_eq!(SECTOR_SIZE_AUDIO, 2352);
+        assert_eq!(SECTOR_SIZE, 2048);
     }
 
     #[test]
