@@ -6,6 +6,7 @@
 /// SCSI operation codes (SPC-4 §7.3, SBC-3 §5).
 pub mod op {
     pub const TEST_UNIT_READY: u8 = 0x00;
+    pub const FORMAT_UNIT: u8 = 0x04;
     pub const REQUEST_SENSE: u8 = 0x03;
     pub const READ_6: u8 = 0x08;
     pub const WRITE_6: u8 = 0x0A;
@@ -18,10 +19,12 @@ pub mod op {
     pub const PREVENT_ALLOW: u8 = 0x1E;
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
+    pub const SEND_OPC_INFORMATION: u8 = 0x54;
     pub const WRITE_10: u8 = 0x2A;
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
     pub const MODE_SELECT_10: u8 = 0x55;
     pub const MODE_SENSE_10: u8 = 0x5A;
+    pub const CLOSE_TRACK: u8 = 0x5B;
     pub const READ_16: u8 = 0x88;
     pub const WRITE_16: u8 = 0x8A;
     pub const SERVICE_ACTION_IN: u8 = 0x9E;
@@ -37,8 +40,10 @@ pub mod op {
     pub const READ_BUFFER_CAPACITY: u8 = 0x5C;
     pub const READ_TRACK_INFORMATION: u8 = 0x52;
     pub const GET_EVENT_STATUS_NOTIFICATION: u8 = 0x4A;
-    pub const GET_EVENT_STATUS_NOTIFICATION_12: u8 = 0xAC;
+    pub const GET_PERFORMANCE: u8 = 0xAC;
     pub const READ_DVD_STRUCTURE: u8 = 0xAD;
+    pub const SET_CD_SPEED: u8 = 0xBB;
+    pub const SET_STREAMING: u8 = 0xB6;
 }
 
 /// Additional sense codes (SPC-4 §4.5.6).
@@ -271,6 +276,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::INQUIRY => "INQUIRY",
         op::READ_CAPACITY_10 => "READ_CAPACITY_10",
         op::READ_10 => "READ_10",
+        op::SEND_OPC_INFORMATION => "SEND_OPC_INFORMATION",
         op::WRITE_10 => "WRITE_10",
         op::READ_16 => "READ_16",
         op::WRITE_16 => "WRITE_16",
@@ -282,6 +288,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::MODE_SELECT_6 => "MODE_SELECT_6",
         op::MODE_SELECT_10 => "MODE_SELECT_10",
         op::SYNCHRONIZE_CACHE_10 => "SYNCHRONIZE_CACHE_10",
+        op::CLOSE_TRACK => "CLOSE_TRACK",
         op::SEND_DIAGNOSTIC => "SEND_DIAGNOSTIC",
         op::RECEIVE_DIAGNOSTIC => "RECEIVE_DIAGNOSTIC",
         op::REPORT_LUNS => "REPORT_LUNS",
@@ -292,6 +299,9 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::GET_CONFIGURATION => "GET_CONFIGURATION",
         op::READ_DISC_INFORMATION => "READ_DISC_INFORMATION",
         op::READ_BUFFER_CAPACITY => "READ_BUFFER_CAPACITY",
+        op::GET_PERFORMANCE => "GET_PERFORMANCE",
+        op::SET_STREAMING => "SET_STREAMING",
+        op::SET_CD_SPEED => "SET_CD_SPEED",
         _ => "UNKNOWN",
     }
 }

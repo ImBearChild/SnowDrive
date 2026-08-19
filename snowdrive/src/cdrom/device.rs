@@ -721,7 +721,7 @@ mod tests {
         let mut buf = [0u8; 52];
         let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
         assert_eq!(n, 52);
-        assert_eq!(buf[0], 0x32); // length
+        assert_eq!(&buf[0..2], &[0x00, 0x32]); // length
         assert_eq!(buf[2], 0x0E); // finalized, complete session, data CD (Table 365)
         assert_eq!(buf[3], 1); // first track
         assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
@@ -744,7 +744,7 @@ mod tests {
         let mut buf = [0u8; 2];
         let n = do_data_in(&mut dev, &cdb, &mut w, &mut buf);
         assert_eq!(n, 2);
-        assert_eq!(buf, [0x32, 0x00]);
+        assert_eq!(buf, [0x00, 0x32]);
 
         // Track Resources / POW / reserved Data Types → INVALID FIELD.
         let mut cdb = [0u8; 10];

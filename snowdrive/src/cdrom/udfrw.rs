@@ -22,8 +22,7 @@
 //! writes it later. This layer never parses UDF contents.
 
 use crate::cdrom::common::{
-    build_get_config_response, build_read_disc_info, CdromDeviceCommon, CurrentProfile, DiscInfo,
-    SECTOR_SIZE, UDFRW_CAPS,
+    build_get_config_response, CdromDeviceCommon, CurrentProfile, SECTOR_SIZE, UDFRW_CAPS,
 };
 use crate::scsi::backend::{BlockStorage, BlockStorageError};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
@@ -171,6 +170,20 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     pub fn sync(&mut self) -> Result<(), BlockStorageError> {
         self.backend.sync()
     }
+
+    /// Clear the logical medium as the destructive part of FORMAT UNIT.
+    /// Formatting is completed logically by the command handler; the host
+    /// writes the filesystem structures afterwards.
+    fn clear(&mut self) -> Result<(), BlockStorageError> {
+        let zeroes = [0u8; 8192];
+        let mut offset = 0u64;
+        while offset < self.capacity() {
+            let len = (self.capacity() - offset).min(zeroes.len() as u64) as usize;
+            self.backend.write(offset, &zeroes[..len])?;
+            offset += len as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Floor `capacity` to whole 2048-byte sectors, rejecting volumes that do
@@ -199,6 +212,7 @@ fn write_sector<B: BlockStorage>(
 pub struct UdfRwDevice<B: BlockStorage> {
     common: CdromDeviceCommon,
     media: UdfRwMedia<B>,
+    format_started: bool,
 }
 
 impl<B: BlockStorage> UdfRwDevice<B> {
@@ -214,6 +228,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         Ok(Self {
             common: CdromDeviceCommon::new(CurrentProfile::DvdRw),
             media,
+            format_started: false,
         })
     }
 
@@ -264,6 +279,11 @@ impl<B: BlockStorage> UdfRwDevice<B> {
 
     /// Write to the byte plane (target data path).
     pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        if offset == u64::MAX {
+            // FORMAT UNIT's parameter list is consumed by the transport, not
+            // written into the emulated medium.
+            return Ok(());
+        }
         match self.media.write_data(offset, buf) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -298,6 +318,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
             }
             match op {
+                op::FORMAT_UNIT => self.format_unit_cmd(cdb),
                 op::READ_6 | op::READ_10 | op::READ_12 | op::READ_16 => {
                     let Some((lba, count)) = cdb_read_args(op, cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
@@ -327,9 +348,32 @@ impl<B: BlockStorage> UdfRwDevice<B> {
                 op::GET_CONFIGURATION => self.get_configuration_cmd(cdb, data),
                 op::READ_DISC_INFORMATION => self.read_disc_info_cmd(cdb, data),
                 op::READ_TRACK_INFORMATION => self.read_track_information_cmd(cdb, data),
-                op::GET_EVENT_STATUS_NOTIFICATION | op::GET_EVENT_STATUS_NOTIFICATION_12 => {
-                    self.gesn_cmd(cdb, data)
+                op::CLOSE_TRACK => CommandOutcome::Status,
+                op::SEND_OPC_INFORMATION => {
+                    // DoOpc=1 performs drive-side calibration and carries no
+                    // parameter data. The virtual medium has no OPC step.
+                    if cdb[1] & 0x01 != 0 || cdb[7] == 0 && cdb[8] == 0 {
+                        CommandOutcome::Status
+                    } else {
+                        // Consume a supplied OPC list without modifying the
+                        // logical byte plane.
+                        CommandOutcome::DataOut {
+                            transfer_len: 0,
+                            byte_offset: 0,
+                            immediate: &[],
+                        }
+                    }
                 }
+                op::SET_STREAMING => CommandOutcome::DataOut {
+                    // Performance hints are accepted and discarded. Returning
+                    // DataOut with zero writes still drains the host payload.
+                    transfer_len: 0,
+                    byte_offset: 0,
+                    immediate: &[],
+                },
+                op::SET_CD_SPEED => CommandOutcome::Status,
+                op::GET_EVENT_STATUS_NOTIFICATION => self.gesn_cmd(cdb, data),
+                op::GET_PERFORMANCE => self.get_performance_cmd(cdb, data),
                 op::READ_DVD_STRUCTURE => self.read_dvd_structure_cmd(cdb, data),
                 op::READ_FORMAT_CAPACITIES => self.read_format_capacities_cmd(cdb, data),
                 op::SYNCHRONIZE_CACHE_10 => self.sync_cache_cmd(),
@@ -340,6 +384,38 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             self.common.sense = Sense::clear();
         }
         Ok(outcome)
+    }
+
+    /// FORMAT UNIT (0x04) for the DVD+RW Basic Format descriptor. The target
+    /// still drains the host's 12-byte parameter list when FmtData=1, but the
+    /// payload is intentionally sent to a sink rather than the data plane.
+    ///
+    /// CDB byte 1 bit layout (MMC-6 §6.4):
+    /// - bit 7 (FmtData): 1 = parameter list follows, 0 = no parameter list
+    /// - bit 4 (DCRT): Disable Certification — must be 1
+    /// - bit 3 (Immediate): 0 = format completes before status, 1 = status
+    ///   returned immediately. Both are accepted here since the virtual
+    ///   medium clears synchronously either way.
+    /// - bits 2:0: Defect List Format — must be 1 (format descriptor)
+    fn format_unit_cmd<'a>(&mut self, cdb: &[u8]) -> CommandOutcome<'a> {
+        if cdb[1] & 0x10 == 0 || cdb[1] & 0x07 != 1 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        if self.media.clear().is_err() {
+            return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
+        }
+        self.format_started = true;
+        if cdb[1] & 0x80 != 0 {
+            // FmtData=1: parameter list follows
+            CommandOutcome::DataOut {
+                transfer_len: 12,
+                byte_offset: u64::MAX,
+                immediate: &[],
+            }
+        } else {
+            // FmtData=0: no parameter list, complete immediately
+            CommandOutcome::Status
+        }
     }
 
     /// Shared READ(6/10/12/16) handler (2048-byte sectors).
@@ -526,44 +602,47 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         )
     }
 
-    /// READ DISC INFORMATION (0x51): a finalized, erasable (rewritable)
+    /// READ DISC INFORMATION (0x51): an appendable, erasable (rewritable)
     /// single-session data disc.
     fn read_disc_info_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         if cdb[1] & 0x07 != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
-        let info = DiscInfo {
-            disc_status: 2,           // finalized
-            state_of_last_session: 3, // complete
-            erasable: true,           // rewritable
-            sessions: 1,
-            first_track: 1,
-            last_track: 1,
-            disc_type: 0x00, // oracle-verify: DVD media disc type
-            // MRW formatting complete: the kernel's cdrom_mrw_open_write()
-            // refuses a writable open while mrw_status is 0 ('not mrw'),
-            // which made mount -o rw fail with EROFS.
-            mrw_status: 3,
-            lead_out_lba: self.lead_out_lba(),
+        // DVD+RW uses the short 32-byte disc-information body. This is a
+        // formatted, erasable disc with one complete session. This logical
+        // UDF medium is already prepared, so report completed formatting and
+        // unrestricted write use.
+        let mut buf = [0u8; 34];
+        buf[0..2].copy_from_slice(&0x0020u16.to_be_bytes());
+        buf[2] = 0x1E; // erasable | complete session | non-sequential disc
+        buf[3] = 1; // first track
+        buf[4] = 1; // number of sessions
+        buf[5] = 1; // first track in last session
+        buf[6] = 1; // last track in last session
+        buf[7] = if self.format_started {
+            0x22 // URU=1 (unrestricted) | MRW=10b (background format active,
+                  // disc is write-accessible during background format)
+        } else {
+            0x23 // URU=1 | MRW=11b (background format complete)
         };
-        build_read_disc_info(data, alloc, &info)
+        buf[8] = 0x00; // Disc Type is defined only for CD media (Table 365)
+        let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
     }
 
-    /// GET EVENT STATUS NOTIFICATION (0x4A / 0xAC): Windows polls the
-    /// Media class to confirm media presence; failing this (we previously
-    /// returned INVALID COMMAND) makes it treat the drive as unreliable.
+    /// GET EVENT STATUS NOTIFICATION (0x4A): Windows polls the Media class
+    /// to confirm media presence; failing this makes it treat the drive as
+    /// unreliable.
     /// Respond with a Media "No Change" event, media present.
     fn gesn_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
-        // 0x4A: class at byte 4, alloc at bytes 7-8.
-        // 0xAC: class at byte 4, alloc at bytes 8-9.
-        let is_12 = cdb[0] == op::GET_EVENT_STATUS_NOTIFICATION_12;
         let class = cdb[4];
-        let alloc = if is_12 {
-            (u16::from(cdb[8]) << 8) | u16::from(cdb[9])
-        } else {
-            (u16::from(cdb[7]) << 8) | u16::from(cdb[8])
-        };
+        let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
         // Event Status Notification Response (MMC-6 Table 264/265) with a
         // Media class descriptor: no change, media present, tray closed.
         let mut buf = [0u8; 8];
@@ -586,10 +665,41 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         }
     }
 
-    /// READ TRACK INFORMATION (0x42): a single, complete, non-blank data
-    /// track (MMC-6 §6.26, Table 494). Windows' optical stack queries this
-    /// to determine media state; an INVALID COMMAND reply makes it fall
-    /// back to read-only handling.
+    /// GET PERFORMANCE (0xAC): return one conservative read/write speed
+    /// descriptor. Hosts commonly use this as a capability probe; a short
+    /// valid descriptor list is preferable to treating 0xAC as GESN.
+    fn get_performance_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+        let max_descriptors = (u16::from(cdb[8]) << 8) | u16::from(cdb[9]);
+        if max_descriptors == 0 {
+            data[0..4].copy_from_slice(&0u32.to_be_bytes());
+            return CommandOutcome::DataIn {
+                transfer_len: 4,
+                byte_offset: 0,
+                immediate: &data[..4],
+            };
+        }
+
+        // Descriptor: start LBA, end LBA, read speed, write speed.
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&16u32.to_be_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_be_bytes());
+        buf[8..12].copy_from_slice(&(self.max_lba().min(u32::MAX as u64) as u32).to_be_bytes());
+        let speed = 1_385u32; // 1x DVD, in kB/s
+        buf[12..16].copy_from_slice(&speed.to_be_bytes());
+        buf[16..20].copy_from_slice(&speed.to_be_bytes());
+        let n = buf.len().min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
+    }
+
+    /// READ TRACK INFORMATION (0x52): a formatted DVD+RW data track
+    /// (MMC-6 §6.26, Table 494). Windows' optical stack queries this to
+    /// determine media state; an INVALID COMMAND reply makes it fall back to
+    /// read-only handling.
     fn read_track_information_cmd<'a>(
         &mut self,
         cdb: &[u8],
@@ -604,27 +714,20 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         if type_code > 3 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let layout = self.media.layout();
         let capacity = self.lead_out_lba();
-        let free_from = layout.free_from_block;
-        let free = layout.partition_len.saturating_sub(free_from);
-        // Track Information Block, 38 bytes (Data Length = 0x24).
-        let mut buf = [0u8; 38];
-        buf[0..2].copy_from_slice(&0x0024u16.to_be_bytes()); // data length
+        // Track Information Block, 48 bytes (Data Length = 0x2E).
+        let mut buf = [0u8; 48];
+        buf[0..2].copy_from_slice(&0x002Eu16.to_be_bytes()); // data length
         buf[2] = 1; // logical track number (LSB)
         buf[3] = 1; // session number (LSB)
-                    // Byte 5: LJRS/Damage/Copy clear, Track Mode 0.
-                    // Byte 6: RT clear | Blank clear | Packet/Inc=1 | FP=1 | Data Mode 0.
-        buf[6] = 0x30; // Packet/Inc (0x20) + Fixed Packet (0x10)
-        buf[7] = 0x03; // LRA_V | NWA_V
+        buf[6] = 0x04; // uninterrupted Mode-1 data track
+        buf[7] = 0x21; // Packet/Inc + Mode 1; LRA_V/NWA_V clear
         buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // track start LBA
-        buf[12..16].copy_from_slice(&free_from.to_be_bytes()); // NWA
-        buf[16..20].copy_from_slice(&free.to_be_bytes()); // free blocks
-        buf[20..24].copy_from_slice(&1u32.to_be_bytes()); // blocking factor
+        buf[12..16].copy_from_slice(&0u32.to_be_bytes()); // NWA
+        buf[16..20].copy_from_slice(&0u32.to_be_bytes()); // free blocks
+        buf[20..24].copy_from_slice(&16u32.to_be_bytes()); // fixed packet size
         buf[24..28].copy_from_slice(&capacity.to_be_bytes()); // track size
-        buf[28..32].copy_from_slice(&(free_from.saturating_sub(1)).to_be_bytes()); // LRA
-        buf[32] = 0; // track number MSB
-        buf[33] = 0; // session number MSB
+        buf[28..32].copy_from_slice(&0u32.to_be_bytes()); // LRA
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
@@ -634,28 +737,92 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         }
     }
 
-    /// READ DVD STRUCTURE (0xAD), format 0 (Physical Format Information,
-    /// MMC-6 §6.22.3.2.1, Table 398): a single-layer rewritable DVD+RW.
-    /// Windows uses the Disk Category / Layer Type here to decide whether
-    /// the medium is writable.
+    /// READ DVD STRUCTURE (0xAD): format 0 (Physical Format Information,
+    /// MMC-6 §6.22.3.2.1, Table 398) and format 30h (Disc Control Blocks,
+    /// MMC-6 §6.22.3.2.25). Format 0 reports a single-layer rewritable
+    /// DVD+RW (Windows uses the Disk Category / Layer Type to decide whether
+    /// the medium is writable); format 30h returns the Write Inhibit DCB
+    /// (WDCB) whose Write Protect Actions field carries the media
+    /// write-protect state — the authoritative channel for DVD+RW.
     fn read_dvd_structure_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
         let media_type = cdb[1] & 0x3F;
         let layer = cdb[6] & 0x0F;
         let format = cdb[7];
         let alloc = (u16::from(cdb[8]) << 8) | u16::from(cdb[9]);
-        if media_type != 0 || layer != 0 || format != 0 {
+        if media_type != 0 || layer != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let capacity = self.lead_out_lba();
-        let start = 0x0003_0000u32; // DVD data area start (physical sector)
-        let end = start + capacity;
-        let mut buf = [0u8; 28];
-        buf[0..2].copy_from_slice(&0x0018u16.to_be_bytes()); // structure data length
-        buf[4] = 0x91; // Disk Category 1001b (DVD+RW) | Part Version 1
-        buf[6] = 0x04; // single layer, rewritable (Layer Type bit 2)
-        buf[9..13].copy_from_slice(&start.to_be_bytes());
-        buf[13..17].copy_from_slice(&end.to_be_bytes());
-        buf[17..21].copy_from_slice(&end.to_be_bytes());
+        match format {
+            0 => {
+                let capacity = self.lead_out_lba();
+                let start = 0x0003_0000u32; // DVD data area start (physical sector)
+                let end = start + capacity;
+                let mut buf = [0u8; 28];
+                buf[0..2].copy_from_slice(&0x0018u16.to_be_bytes()); // structure data length
+                buf[4] = 0x91; // Disk Category 1001b (DVD+RW) | Part Version 1
+                buf[6] = 0x04; // single layer, rewritable (Layer Type bit 2)
+                buf[9..13].copy_from_slice(&start.to_be_bytes());
+                buf[13..17].copy_from_slice(&end.to_be_bytes());
+                buf[17..21].copy_from_slice(&end.to_be_bytes());
+                let n = buf.len().min(alloc as usize).min(data.len());
+                data[..n].copy_from_slice(&buf[..n]);
+                CommandOutcome::DataIn {
+                    transfer_len: n as u64,
+                    byte_offset: 0,
+                    immediate: &data[..n],
+                }
+            }
+            0x30 => self.read_wdcb_cmd(cdb, alloc, data),
+            0xC0 => self.read_write_protect_status_cmd(alloc, data),
+            _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
+        }
+    }
+
+    /// READ DISC STRUCTURE format C0h: report aggregate write protection.
+    fn read_write_protect_status_cmd<'a>(
+        &mut self,
+        alloc: u16,
+        data: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        let mut buf = [0u8; 8];
+        buf[0..2].copy_from_slice(&4u16.to_be_bytes());
+        let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
+    }
+
+    /// READ DVD STRUCTURE format 30h: return the Write Inhibit DCB (WDCB,
+    /// Content Descriptor 57444300h, MMC-6 Table 435) with Write Protect
+    /// Actions = 00b (media fully write enabled). The address field carries
+    /// the requested Content Descriptor; only the WDCB is present on this
+    /// drive.
+    fn read_wdcb_cmd<'a>(
+        &mut self,
+        cdb: &[u8],
+        alloc: u16,
+        data: &'a mut [u8],
+    ) -> CommandOutcome<'a> {
+        let address = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        if address != 0x5744_4300 && address != 0xFFFF_FFFF {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        // Response: 2-byte structure data length + 2 reserved + the 32 KiB
+        // DCB (padded with zeros per §6.22.3.2.25.1).
+        const DCB_SIZE: usize = 32768;
+        let mut buf = [0u8; 4 + DCB_SIZE];
+        buf[0..2].copy_from_slice(&(DCB_SIZE as u16).to_be_bytes());
+        // DCB header (Table 432): Content Descriptor + Unknown Actions +
+        // Vendor ID.
+        buf[4..8].copy_from_slice(&0x5744_4300u32.to_be_bytes());
+        // Vendor ID: 32 bytes (Table 432 bytes 8-39).
+        buf[12..44].copy_from_slice(b"SnowSCSI Virtual UDF RW\0\0\0\0\0\0\0\0\0");
+        // WDCB (Table 435): Update Count (0) and Write Protect Actions (0 =
+        // fully write enabled) at bytes 40/44 of the DCB; the password area
+        // is zero-filled on read. All already zero.
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
@@ -678,13 +845,19 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         }
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
         let partition_len = self.media.layout().partition_len;
-        let mut buf = [0u8; 12];
-        buf[3] = 8; // Capacity List Length: one descriptor
+        let mut buf = [0u8; 20];
+        buf[3] = 16; // current descriptor + DVD+RW formattable descriptor
         buf[4..8].copy_from_slice(&partition_len.to_be_bytes());
         buf[8] = 0x02; // Descriptor Type: formatted media
         buf[9] = 0x00;
         buf[10] = 0x08; // Block Length 2048 (24-bit)
         buf[11] = 0x00;
+        // MMC-6 Table 469: Format Type 26h is the mandatory DVD+RW full
+        // format. The type-dependent parameter is zero for DVD+RW.
+        buf[12..16].copy_from_slice(&partition_len.to_be_bytes());
+        // Format Type occupies bits 7..2 of this byte (MMC-6 Table 468), so
+        // DVD+RW Format Type 26h is transferred as 98h.
+        buf[16] = 0x26 << 2;
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
@@ -730,6 +903,10 @@ fn cdb_write_args(op: u8, cdb: &[u8]) -> Option<(u64, u32)> {
 impl<B: BlockStorage> SpcDevice for UdfRwDevice<B> {
     fn device_type(&self) -> DeviceType {
         DeviceType::Cdrom
+    }
+
+    fn medium_type(&self) -> u8 {
+        0x41
     }
 
     fn identity(&self) -> &DeviceIdentity {
@@ -1124,15 +1301,17 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 12];
         cdb[0] = op::READ_FORMAT_CAPACITIES;
-        cdb[8] = 12;
-        let mut buf = [0u8; 12];
+        cdb[8] = 20;
+        let mut buf = [0u8; 20];
         let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 12);
-        assert_eq!(buf[3], 8, "capacity list length: one descriptor");
+        assert_eq!(n, 20);
+        assert_eq!(buf[3], 16, "capacity list length: two descriptors");
         let plen = dev.media().layout().partition_len;
         assert_eq!(&buf[4..8], &plen.to_be_bytes(), "formatted capacity");
         assert_eq!(buf[8], 0x02, "descriptor type: formatted");
         assert_eq!(&buf[9..12], &[0x00, 0x08, 0x00], "block length 2048");
+        assert_eq!(&buf[12..16], &plen.to_be_bytes(), "DVD+RW format capacity");
+        assert_eq!(buf[16], 0x98, "DVD+RW full format (26h in bits 7..2)");
     }
 
     #[test]
@@ -1152,9 +1331,12 @@ mod tests {
         cdb[8] = 52;
         let mut buf = [0u8; 52];
         let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 52);
-        // Erasable 1 | State 11b | Disc Status 10b = 0b00011110.
+        assert_eq!(n, 34);
+        // Erasable 1 | State 11b | Disc Status 11b (non-sequential).
         assert_eq!(buf[2], 0x1E);
+        assert_eq!(buf[8], 0x00, "DVD media has no CD disc type");
+        // URU=1 and background format complete.
+        assert_eq!(buf[7], 0x23);
         assert_eq!(buf[3], 1); // first track
     }
 
@@ -1203,6 +1385,128 @@ mod tests {
     }
 
     #[test]
+    fn device_close_track_is_accepted() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::CLOSE_TRACK;
+        assert!(matches!(
+            dev.do_cmd(&cdb, &mut w, 0).unwrap(),
+            CommandOutcome::Status
+        ));
+    }
+
+    #[test]
+    fn device_accepts_formatting_setup_commands() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+
+        let mut opc = [0u8; 10];
+        opc[0] = op::SEND_OPC_INFORMATION;
+        opc[1] = 0x01; // DoOpc=1
+        assert!(matches!(
+            dev.do_cmd(&opc, &mut w, 0).unwrap(),
+            CommandOutcome::Status
+        ));
+
+        let mut streaming = [0u8; 12];
+        streaming[0] = op::SET_STREAMING;
+        streaming[10] = 28;
+        assert!(matches!(
+            dev.do_cmd(&streaming, &mut w, 0).unwrap(),
+            CommandOutcome::DataOut {
+                transfer_len: 0,
+                ..
+            }
+        ));
+
+        let mut speed = [0u8; 12];
+        speed[0] = op::SET_CD_SPEED;
+        assert!(matches!(
+            dev.do_cmd(&speed, &mut w, 0).unwrap(),
+            CommandOutcome::Status
+        ));
+    }
+
+    #[test]
+    fn device_accepts_dvd_rw_format_unit_with_param_list() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        // FmtData=1 (bit7), DCRT=1 (bit4), DefectListFormat=1 (bits2:0) = 0x91
+        let format = [0x04, 0x91, 0, 0, 0, 0];
+        assert!(matches!(
+            dev.do_cmd(&format, &mut w, 0).unwrap(),
+            CommandOutcome::DataOut {
+                transfer_len: 12,
+                byte_offset: u64::MAX,
+                ..
+            }
+        ));
+        assert!(dev.write_data(u64::MAX, &[0u8; 12]).is_ok());
+        assert!(!UdfRwMedia::formatted(dev.media().backend()));
+
+        let mut info_cdb = [0u8; 10];
+        info_cdb[0] = op::READ_DISC_INFORMATION;
+        info_cdb[8] = 52;
+        let mut info = [0u8; 52];
+        let n = do_device_data_in(&mut dev, &info_cdb, &mut w, &mut info);
+        assert_eq!(n, 34);
+        assert_eq!(info[2], 0x1E);
+        assert_eq!(info[7], 0x22, "URU=1 | background format active");
+        assert_eq!(info[8], 0x00, "DVD media has no CD disc type");
+
+        let tur = [op::TEST_UNIT_READY; 6];
+        assert!(matches!(
+            dev.do_cmd(&tur, &mut w, 0).unwrap(),
+            CommandOutcome::Status
+        ));
+    }
+
+    #[test]
+    fn device_format_unit_without_param_list_returns_status() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        // FmtData=0 (bit7), DCRT=1 (bit4), DefectListFormat=1 (bits2:0) = 0x11
+        let format = [0x04, 0x11, 0, 0, 0, 0];
+        assert!(matches!(
+            dev.do_cmd(&format, &mut w, 0).unwrap(),
+            CommandOutcome::Status
+        ));
+    }
+
+    #[test]
     fn device_mode_sense_2a_reports_writable() {
         let mut img = ram(2048 * 4096);
         let mut scratch = [0u8; 256];
@@ -1220,19 +1524,22 @@ mod tests {
         cdb[4] = 64;
         let mut buf = [0u8; 64];
         let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 28); // 4 header + 24 page
+        assert_eq!(n, 60); // 4 header + 56-byte page
+        assert_eq!(buf[0], 0x3B, "mode data length");
+        assert_eq!(buf[1], 0x41, "DVD+RW medium type");
         assert_eq!(buf[4], 0x2A); // page code
-                                  // Byte 3 (as read by the kernel's sr driver): CD-R/CD-RW write,
-                                  // DVD-R write (0x10), DVD-RAM write (0x20).
-        assert_eq!(buf[7] & 0x01, 0x01, "CD-R write");
-        assert_eq!(buf[7] & 0x10, 0x10, "DVD-R write");
-        assert_eq!(buf[7] & 0x20, 0x20, "DVD-RAM write");
-        // Byte 2 bit 3: DVD read.
-        assert_eq!(buf[6] & 0x08, 0x08, "DVD read");
+        // Page byte 2 (buf[6]): CD-R/CD-RW read, Mode 2, Multi-Session, CD-DA.
+        assert_eq!(buf[6] & 0x40, 0x40, "CD-R read");
+        assert_eq!(buf[6] & 0x80, 0x80, "CD-RW read");
+        // Page byte 3 (buf[7]): DVD read.
+        assert_eq!(buf[7] & 0x08, 0x08, "DVD read");
+        // Page byte 4 (buf[8]): CD-R write, CD-RW write, Test Write, BurnProof.
+        assert_eq!(buf[8] & 0x40, 0x40, "CD-R write");
+        assert_eq!(buf[8] & 0x80, 0x80, "CD-RW write");
     }
 
     #[test]
-    fn device_read_disc_info_reports_mrw_complete() {
+    fn device_read_disc_info_not_mrw() {
         let mut img = ram(2048 * 4096);
         let mut scratch = [0u8; 256];
         let mut dev = UdfRwDevice::open_or_materialize(
@@ -1248,11 +1555,9 @@ mod tests {
         cdb[8] = 52;
         let mut buf = [0u8; 64];
         let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
-        assert_eq!(n, 52);
-        // Byte 7 bits 1:0 = MRW status. The kernel's
-        // cdrom_mrw_open_write() requires a nonzero value to allow a
-        // writable open.
-        assert_eq!(buf[7] & 0x03, 0x03, "MRW formatting complete");
+        assert_eq!(n, 34);
+        // URU=1 and background format complete; this is not MRW status.
+        assert_eq!(buf[7], 0x23);
         // Erasable bit (byte 2 bit 4).
         assert_eq!(buf[2] & 0x10, 0x10, "erasable");
     }
@@ -1285,6 +1590,69 @@ mod tests {
     }
 
     #[test]
+    fn device_read_dvd_structure_write_inhibit_dcb() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::READ_DVD_STRUCTURE;
+        cdb[2] = 0x57; // address = Content Descriptor 57444300h (WDCB)
+        cdb[3] = 0x44;
+        cdb[4] = 0x43;
+        cdb[5] = 0x00;
+        cdb[7] = 0x30; // format 30h = Disc Control Blocks
+        cdb[8] = 0x00;
+        cdb[9] = 0x80; // alloc 128
+        let mut buf = [0u8; 8192];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 128);
+        // Disc Structure Data Length = 32768 (the full DCB), then reserved.
+        assert_eq!(&buf[0..2], &[0x80, 0x00]);
+        // DCB header Content Descriptor = "WDC\0".
+        assert_eq!(&buf[4..8], &[0x57, 0x44, 0x43, 0x00]);
+        // WDCB Write Protect Actions (DCB bytes 44..48) = 0 → fully write
+        // enabled.
+        assert_eq!(&buf[48..52], &[0, 0, 0, 0], "media not write protected");
+
+        // An unknown Content Descriptor is rejected.
+        let mut cdb2 = cdb;
+        cdb2[5] = 0x01;
+        let outcome = dev.do_cmd(&cdb2, &mut w, 0).unwrap();
+        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
+    }
+
+    #[test]
+    fn device_read_dvd_structure_write_protect_status_clear() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::READ_DVD_STRUCTURE;
+        cdb[7] = 0xC0;
+        cdb[8] = 0;
+        cdb[9] = 8;
+        let mut buf = [0u8; 8];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(&buf[0..2], &[0, 4]);
+        assert_eq!(buf[4], 0, "no write protection is active");
+    }
+
+    #[test]
     fn device_read_track_information_complete() {
         let mut img = ram(2048 * 4096);
         let mut scratch = [0u8; 256];
@@ -1305,16 +1673,17 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
         assert_eq!(n, 38);
-        // Track 1, session 1, non-blank packet-writable data track.
+        // Track 1, session 1, formatted DVD+RW data track.
         assert_eq!(buf[2], 1);
         assert_eq!(buf[3], 1);
-        assert_eq!(buf[6] & 0x20, 0x20, "Packet/Inc");
-        assert_eq!(buf[6] & 0x10, 0x10, "Fixed Packet");
-        assert_eq!(buf[6] & 0x40, 0, "not blank");
-        // NWA (bytes 12-15) and free blocks (bytes 16-19) are nonzero.
+        assert_eq!(buf[6], 0x04, "Mode-1 data track");
+        assert_eq!(buf[7], 0x21, "Packet/Inc, LRA/NWA invalid");
+        assert_eq!(&buf[20..24], &16u32.to_be_bytes(), "fixed packet size");
+        // Formatted DVD+RW reports no sequential NWA/free-space fields.
         let nwa = u32::from_be_bytes(buf[12..16].try_into().unwrap());
         let free = u32::from_be_bytes(buf[16..20].try_into().unwrap());
-        assert!(nwa > 0 && free > 0);
+        assert_eq!(nwa, 0);
+        assert_eq!(free, 0);
     }
 
     #[test]
@@ -1342,13 +1711,28 @@ mod tests {
         assert_eq!(buf[2] & 0x07, 0x04, "Media class");
         assert_eq!(buf[3], 0x10, "supported: Media");
         assert_eq!(buf[5] & 0x02, 0x02, "media present");
-        // 12-byte form (0xAC) uses alloc at bytes 8-9.
-        let mut cdb12 = [0u8; 12];
-        cdb12[0] = op::GET_EVENT_STATUS_NOTIFICATION_12;
-        cdb12[4] = 0x10;
-        cdb12[9] = 8;
-        let n = do_device_data_in(&mut dev, &cdb12, &mut w, &mut buf);
-        assert_eq!(n, 8);
-        assert_eq!(buf[5] & 0x02, 0x02, "12-byte media present");
+    }
+
+    #[test]
+    fn device_get_performance_is_not_gesn() {
+        let mut img = ram(2048 * 4096);
+        let mut scratch = [0u8; 256];
+        let mut dev = UdfRwDevice::open_or_materialize(
+            RamBackend::new(&mut img),
+            "TEST",
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut w = work();
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::GET_PERFORMANCE;
+        cdb[8] = 0;
+        cdb[9] = 1;
+        let mut buf = [0u8; 32];
+        let n = do_device_data_in(&mut dev, &cdb, &mut w, &mut buf);
+        assert_eq!(n, 20);
+        assert_eq!(&buf[0..4], &16u32.to_be_bytes());
+        assert_eq!(&buf[12..16], &1_385u32.to_be_bytes());
     }
 }

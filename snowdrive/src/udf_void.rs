@@ -371,7 +371,9 @@ pub fn crc16(data: &[u8], crc: u16) -> u16 {
 /// over the 16-byte body (AVDP size 32 − tag 16).
 ///
 /// Used by the media layer to detect an already-formatted UdfRw volume
-/// (`__UDFRW_PLAN.md` §7.x rule 4).
+/// (`__UDFRW_PLAN.md` §7.x rule 4). Accepts any valid AVDP: the compact
+/// UdfRw anchor (crc_len = 16, CRC over the two extents) or a standard
+/// full-sector anchor (crc_len = 496, CRC over the rest of the sector).
 pub fn is_avdp(sector: &[u8]) -> bool {
     if sector.len() < 32 {
         return false;
@@ -384,11 +386,14 @@ pub fn is_avdp(sector: &[u8]) -> bool {
     if sector[4] != tag_checksum(&tag) {
         return false;
     }
-    if u16::from_le_bytes([sector[10], sector[11]]) as usize != 32 - TAG_SIZE {
+    // CRC covers the descriptor body after the 16-byte tag: at least the
+    // two extent descriptors (16 bytes), at most the rest of the sector.
+    let crc_len = usize::from(u16::from_le_bytes([sector[10], sector[11]]));
+    if crc_len < 32 - TAG_SIZE || 16 + crc_len > sector.len() {
         return false;
     }
     let crc = u16::from_le_bytes([sector[8], sector[9]]);
-    crc == crc16(&sector[16..32], 0)
+    crc == crc16(&sector[16..16 + crc_len], 0)
 }
 
 /// Descriptor tag checksum: sum of the 16 tag bytes with byte 4 (the

@@ -165,6 +165,11 @@ pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
 pub trait SpcDevice {
     fn device_type(&self) -> DeviceType;
     fn identity(&self) -> &DeviceIdentity;
+    /// Medium type byte returned in MODE SENSE parameter headers.
+    /// Multimedia devices may use this to identify the mounted medium.
+    fn medium_type(&self) -> u8 {
+        0
+    }
     /// Capacity-derived identifier used for VPD 0x80 (unit serial) and VPD
     /// 0x83 (NAA-3) synthesis.
     fn id(&self) -> u64;
@@ -219,6 +224,11 @@ pub fn execute_spc<'a, D: SpcDevice>(
                 buf[1] = mode_len as u8;
             } else {
                 buf[0] = mode_len as u8;
+            }
+            if long {
+                buf[2] = dev.medium_type();
+            } else {
+                buf[1] = dev.medium_type();
             }
             buf[header_len..total].copy_from_slice(page_bytes);
             let n = total.min(alloc as usize);
