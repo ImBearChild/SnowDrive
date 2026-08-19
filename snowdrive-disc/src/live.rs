@@ -184,6 +184,8 @@ pub struct DirTree {
 pub struct Layout {
     /// Volume label (ASCII, up to 16 chars).
     pub label: String<MAX_LABEL_LEN>,
+    /// Volume metadata (PVD/SVD identifiers, dates).
+    pub vol: VolumeMetadata,
     /// PVD directory tree (ISO-9660 8.3 identifiers).
     pub pvd: DirTree,
     /// SVD / Joliet directory tree (UCS-2BE identifiers).
@@ -194,6 +196,101 @@ pub struct Layout {
     pub first_file_lba: u32,
     /// Total number of sectors in the image.
     pub total: u32,
+    /// Whether Joliet SVD is included (affects geometry).
+    pub joliet_enabled: bool,
+}
+
+/// Volume metadata for PVD/SVD identifiers (ECMA-119 §8.4.4).
+///
+/// String fields are space-padded ASCII (ECMA-119 a-characters).
+/// Lengths match the PVD byte ranges:
+/// - `system_id`: 32 bytes (BP 9-40)
+/// - `volume_set_id`: 128 bytes (BP 191-318)
+/// - `publisher`: 128 bytes (BP 319-446)
+/// - `data_preparer`: 128 bytes (BP 447-574)
+/// - `application_id`: 128 bytes (BP 575-702)
+#[derive(Debug, Clone)]
+pub struct VolumeMetadata {
+    pub system_id: String<32>,
+    pub volume_set_id: String<128>,
+    pub publisher: String<128>,
+    pub data_preparer: String<128>,
+    pub application_id: String<128>,
+}
+
+impl Default for VolumeMetadata {
+    fn default() -> Self {
+        Self {
+            system_id: String::new(),
+            volume_set_id: String::new(),
+            publisher: String::new(),
+            data_preparer: String::new(),
+            application_id: String::new(),
+        }
+    }
+}
+
+/// ISO9660 generation options (typed newtype fields, structurally valid).
+///
+/// `IsoOptions` carries the configurable volume metadata and format
+/// switches for `compute_layout_opts`.  Validation (length checks,
+/// character set) happens at construction via `TryFrom<&str>`.
+///
+/// The `label` field is mandatory (non-empty after validation).
+/// All other fields default to empty/sentinel values.
+#[derive(Debug, Clone)]
+pub struct IsoOptions {
+    /// Volume label (mandatory, 1-16 ASCII chars).
+    pub label: String<MAX_LABEL_LEN>,
+    /// System identifier (ECMA-119 §8.4.4 BP 9-40, 32 bytes max).
+    pub system_id: String<32>,
+    /// Volume set identifier (BP 191-318, 128 bytes max).
+    pub volume_set_id: String<128>,
+    /// Publisher identifier (BP 319-446, 128 bytes max).
+    pub publisher: String<128>,
+    /// Data preparer identifier (BP 447-574, 128 bytes max).
+    pub data_preparer: String<128>,
+    /// Application identifier (BP 575-702, 128 bytes max).
+    pub application_id: String<128>,
+    /// Whether to include Joliet SVD (UCS-2BE tree).  Default: `true`.
+    pub joliet: bool,
+}
+
+impl IsoOptions {
+    /// Create options with a label and all other fields at defaults.
+    /// Empty or invalid labels default to "SNOWDRIVE".
+    pub fn with_label(label: &str) -> Result<Self, IsoError> {
+        let mut lbl = String::<MAX_LABEL_LEN>::new();
+        for ch in label.chars().take(MAX_LABEL_LEN) {
+            if ch.is_ascii() && !ch.is_control() {
+                let _ = lbl.push(ch);
+            }
+        }
+        if lbl.is_empty() {
+            let _ = lbl.push_str("SNOWDRIVE");
+        }
+        Ok(Self {
+            label: lbl,
+            system_id: String::new(),
+            volume_set_id: String::new(),
+            publisher: String::new(),
+            data_preparer: String::new(),
+            application_id: String::new(),
+            joliet: true,
+        })
+    }
+}
+
+impl From<&IsoOptions> for VolumeMetadata {
+    fn from(opts: &IsoOptions) -> Self {
+        Self {
+            system_id: opts.system_id.clone(),
+            volume_set_id: opts.volume_set_id.clone(),
+            publisher: opts.publisher.clone(),
+            data_preparer: opts.data_preparer.clone(),
+            application_id: opts.application_id.clone(),
+        }
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -432,25 +529,29 @@ fn unique_83(
 /// Files must be provided in DFS pre-order: a directory entry before its
 /// children, children before the next sibling.  The label is truncated to
 /// 16 ASCII characters.  The directory hierarchy is preserved: every
-/// sub-directory gets its own extent and a Path Table record.  Two
-/// independent directory trees are produced (PVD 8.3 + Joliet UCS-2BE),
-/// each with its own Path Table and directory extents; both share the
-/// file-data extents.
+/// sub-directory gets its own extent and a Path Table record.
+/// Path table order (ECMA-119 §6.9.1): ascending level, then parent
+/// directory number, then identifier.  `use_pvd` selects the PVD 8.3
+/// identifiers vs the Joliet UCS-2BE ones (each tree sorts independently).
+/// Returns `(order, number_of)` — `order` is registry indices in path
+/// table order, `number_of` maps registry index → path table number.
 pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoError> {
+    let opts = IsoOptions::with_label(label)?;
+    compute_layout_opts(files, &opts)
+}
+
+/// Compute the LBA layout with explicit options.
+///
+/// `compute_layout` is a convenience wrapper that calls this with default
+/// options.  The options' `label` overrides the `label` parameter when
+/// calling through `compute_layout`; here the label comes from `opts`.
+pub fn compute_layout_opts(files: &[FileEntry], opts: &IsoOptions) -> Result<Layout, IsoError> {
     if files.len() > MAX_FILES {
         return Err(IsoError::TooManyFiles);
     }
 
-    // Truncate label to MAX_LABEL_LEN ASCII chars.
-    let mut lbl = String::<MAX_LABEL_LEN>::new();
-    for ch in label.chars().take(MAX_LABEL_LEN) {
-        if ch.is_ascii() && !ch.is_control() {
-            let _ = lbl.push(ch);
-        }
-    }
-    if lbl.is_empty() {
-        let _ = lbl.push_str("SNOWDRIVE");
-    }
+    // Use opts.label as the layout label.
+    let lbl = opts.label.clone();
 
     // ── 1. Build the directory registry (root + every dir entry) ─────
     // The input is DFS pre-order, so the parent of each entry is the top
@@ -641,6 +742,7 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
 
     Ok(Layout {
         label: lbl,
+        vol: VolumeMetadata::from(opts),
         pvd: DirTree {
             path_table_lba: pvd_pt_lba,
             path_table_sectors: pvd_pt_sectors,
@@ -660,6 +762,7 @@ pub fn compute_layout(files: &[FileEntry], label: &str) -> Result<Layout, IsoErr
         extents,
         first_file_lba,
         total,
+        joliet_enabled: opts.joliet,
     })
 }
 
@@ -815,6 +918,9 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     for i in 0..32 {
         out[8 + i] = b' ';
     }
+    let sys_id = layout.vol.system_id.as_bytes();
+    let sys_len = sys_id.len().min(32);
+    out[8..8 + sys_len].copy_from_slice(&sys_id[..sys_len]);
 
     // Volume Identifier (BP 41-72 → bytes 40-71): label padded with spaces.
     for i in 0..32 {
@@ -828,25 +934,42 @@ fn write_pvd(layout: &Layout, out: &mut [u8]) {
     for i in 0..128 {
         out[190 + i] = b' ';
     }
+    let vs_id = layout.vol.volume_set_id.as_bytes();
+    let vs_len = vs_id.len().min(128);
+    out[190..190 + vs_len].copy_from_slice(&vs_id[..vs_len]);
 
     // Publisher Identifier (BP 319-446 → bytes 318-445): 128 bytes.
-    let pub_id = b"SnowDrive";
+    let pub_id = if layout.vol.publisher.is_empty() {
+        b"SnowDrive"
+    } else {
+        layout.vol.publisher.as_bytes()
+    };
     for i in 0..128 {
         out[318 + i] = b' ';
     }
-    out[318..318 + pub_id.len()].copy_from_slice(pub_id);
+    out[318..318 + pub_id.len().min(128)].copy_from_slice(&pub_id[..pub_id.len().min(128)]);
 
     // Data Preparer Identifier (BP 447-574 → bytes 446-573): 128 bytes.
+    let dp_id = if layout.vol.data_preparer.is_empty() {
+        pub_id
+    } else {
+        layout.vol.data_preparer.as_bytes()
+    };
     for i in 0..128 {
         out[446 + i] = b' ';
     }
-    out[446..446 + pub_id.len()].copy_from_slice(pub_id);
+    out[446..446 + dp_id.len().min(128)].copy_from_slice(&dp_id[..dp_id.len().min(128)]);
 
     // Application Identifier (BP 575-702 → bytes 574-701): 128 bytes.
+    let app_id = if layout.vol.application_id.is_empty() {
+        b"snowdrive"
+    } else {
+        layout.vol.application_id.as_bytes()
+    };
     for i in 0..128 {
         out[574 + i] = b' ';
     }
-    out[574..574 + pub_id.len()].copy_from_slice(pub_id);
+    out[574..574 + app_id.len().min(128)].copy_from_slice(&app_id[..app_id.len().min(128)]);
 
     // Volume date fields (17 bytes each, BP 814-830 / 831-847 / 848-864 /
     // 865-881 → bytes 813-829 / 830-846 / 847-863 / 864-880): 16 ASCII
@@ -1150,12 +1273,15 @@ fn write_dir_record_root_pvd(out: &mut [u8], offset: usize, root_lba: u32, root_
 pub enum IsoError {
     /// Too many files for the layout (exceeds MAX_FILES).
     TooManyFiles,
+    /// Volume label is empty or contains only non-ASCII/control chars.
+    InvalidLabel,
 }
 
 impl core::fmt::Display for IsoError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TooManyFiles => write!(f, "too many files for ISO9660 layout"),
+            Self::InvalidLabel => write!(f, "volume label is empty or invalid"),
         }
     }
 }

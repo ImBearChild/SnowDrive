@@ -12,7 +12,6 @@ use crate::cdrom::common::{
     build_get_config_response, build_read_buffer_capacity, build_read_disc_info, cdrom_mode_page,
     CdromCapabilities, CurrentProfile, DiscInfo, CDROM_IDENTITY, SECTOR_SIZE,
 };
-#[cfg(feature = "udf_void")]
 use crate::cdrom::media::CdMedia;
 use crate::scsi::device::{CommandOutcome, DeviceType};
 use crate::scsi::scsi::{
@@ -39,7 +38,6 @@ pub struct CdromDrive<'a> {
     /// INQUIRY identity.
     pub(crate) identity: DeviceIdentity,
     /// Media slot: `None` = empty tray.
-    #[cfg(feature = "udf_void")]
     pub(crate) media: Option<CdMedia<'a>>,
     /// Tray state: `true` = open (plan  ASCQ).
     pub(crate) tray_open: bool,
@@ -77,8 +75,7 @@ impl<'a> CdromDrive<'a> {
 
     // ── Media slot ─────────────────────────────────────
 
-    /// Load media into the drive.
-    #[cfg(feature = "udf_void")]
+    /// Load media into the drive (sets UNIT ATTENTION).
     pub fn load(&mut self, media: CdMedia<'a>) {
         self.media = Some(media);
         self.pending_ua = Some(Sense::new(
@@ -88,8 +85,12 @@ impl<'a> CdromDrive<'a> {
         ));
     }
 
-    /// Eject the media (plan /).
-    #[cfg(feature = "udf_void")]
+    /// Load media without setting UNIT ATTENTION (for test setup / initial load).
+    pub fn load_quiet(&mut self, media: CdMedia<'a>) {
+        self.media = Some(media);
+    }
+
+    /// Eject the media.
     pub fn eject(&mut self) {
         self.media = None;
         self.tray_open = true;
@@ -101,7 +102,6 @@ impl<'a> CdromDrive<'a> {
     }
 
     /// Whether media is present.
-    #[cfg(feature = "udf_void")]
     pub fn is_media_present(&self) -> bool {
         self.media.is_some()
     }
@@ -136,7 +136,6 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn lead_out_lba(&self) -> u32 {
-        #[cfg(feature = "udf_void")]
         if let Some(ref m) = self.media {
             return m.lead_out_lba();
         }
@@ -144,16 +143,14 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn max_lba(&self) -> u64 {
-        #[cfg(feature = "udf_void")]
         if let Some(ref m) = self.media {
             return m.max_lba();
         }
         0
     }
 
-    #[allow(dead_code)] // used when media types other than UdfRw are added
+    #[allow(dead_code)] // used when MEDIA commands need profile per-media
     fn media_profile(&self) -> CurrentProfile {
-        #[cfg(feature = "udf_void")]
         if let Some(ref m) = self.media {
             return m.profile();
         }
@@ -162,7 +159,6 @@ impl<'a> CdromDrive<'a> {
 
     /// Current GET CONFIGURATION profile: 0000h when tray is empty.
     fn current_profile_code(&self) -> u16 {
-        #[cfg(feature = "udf_void")]
         if let Some(ref m) = self.media {
             return m.profile().code();
         }
@@ -259,14 +255,9 @@ impl<'a> CdromDrive<'a> {
 
                 // ── WRITE(6/10/12/16) ───────────────────────────
                 op::WRITE_6 | op::WRITE_10 | op::WRITE_12 | op::WRITE_16 => {
-                    #[cfg(feature = "udf_void")]
-                    if self.media.is_some() {
-                        return Ok(self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED));
-                    }
-                    #[cfg(not(feature = "udf_void"))]
-                    {
-                        let _ = (cdb, data);
-                    }
+                    // For now, all write commands return DATA PROTECT.
+                    // The UDFRW write path (DataOut + write_data) will be
+                    // added when the write command parser is ported.
                     self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
                 }
 
@@ -730,8 +721,16 @@ impl<'a> CdromDrive<'a> {
 
     // ── SYNCHRONIZE CACHE ────────────────────────────────────────────
 
-    fn sync_cache_cmd(&mut self) -> CommandOutcome<'static> {
-        #[cfg(feature = "udf_void")]
+    /// Flush the media (SYNCHRONIZE CACHE equivalent).
+    pub fn sync_media(&mut self) -> bool {
+        if let Some(ref mut m) = self.media {
+            m.sync().is_err()
+        } else {
+            false
+        }
+    }
+
+    pub fn sync_cache_cmd(&mut self) -> CommandOutcome<'static> {
         if let Some(ref mut m) = self.media {
             if m.sync().is_err() {
                 return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
@@ -779,15 +778,10 @@ impl SpcDevice for CdromDrive<'_> {
             if self.prevent_removal {
                 return SpcEffect::RemovalPrevented;
             }
-            #[cfg(feature = "udf_void")]
             self.eject();
-            #[cfg(not(feature = "udf_void"))]
-            {
-                self.tray_open = true;
-            }
             SpcEffect::Good
         } else if loej && load {
-            // Load on empty tray → media_requested (plan /).
+            // Load on empty tray → media_requested.
             if self.media.is_none() {
                 self.tray_open = false;
                 self.media_requested = true;
@@ -820,7 +814,6 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
         byte_offset: u64,
         buf: &mut [u8],
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        #[cfg(feature = "udf_void")]
         if let Some(ref mut m) = self.media {
             return m.read_data(byte_offset, buf);
         }
@@ -829,9 +822,23 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
 
     fn write_data(
         &mut self,
-        _byte_offset: u64,
-        _buf: &[u8],
+        byte_offset: u64,
+        buf: &[u8],
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
+        if let Some(ref mut m) = self.media {
+            return m.write_data(byte_offset, buf).map_err(|e| match e {
+                crate::cdrom::media::MediaError::OutOfBounds => {
+                    crate::scsi::backend::BlockStorageError::OutOfBounds
+                }
+                crate::cdrom::media::MediaError::WriteProtected => {
+                    crate::scsi::backend::BlockStorageError::NotWritable
+                }
+                crate::cdrom::media::MediaError::Io => {
+                    crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other)
+                }
+                _ => crate::scsi::backend::BlockStorageError::NotWritable,
+            });
+        }
         Err(crate::scsi::backend::BlockStorageError::NotWritable)
     }
 
@@ -897,7 +904,6 @@ impl CdromDriveBuilder {
             caps: self.caps,
             drive_id: self.drive_id,
             identity: self.identity,
-            #[cfg(feature = "udf_void")]
             media: None,
             tray_open: false,
             mode_page_05: [0u8; 16],

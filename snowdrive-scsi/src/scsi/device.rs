@@ -2,17 +2,11 @@
 //! seam, and the borrowed type-erased container that targets drive.
 
 #[cfg(feature = "cdrom")]
-use crate::cdrom::device::CdromDevice;
-#[cfg(all(feature = "livefs", feature = "std"))]
-use crate::cdrom::livefs::CdLiveFsDevice;
-#[cfg(all(feature = "cdrom", feature = "udf_void"))]
-use crate::cdrom::udfrw::UdfRwDevice;
+use crate::cdrom::drive::CdromDrive;
 use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
-#[cfg(all(feature = "livefs", feature = "std"))]
-use crate::scsi::fs_backend::StdFsBackend;
 use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
@@ -137,15 +131,9 @@ pub enum Device<'a> {
     Block(BlockDevice<BlockBackend<'a>>),
     #[cfg(feature = "std")]
     CdBlock(CDBlockDevice),
-    /// Flat ISO/RAM CD-ROM.
+    /// Unified CD-ROM device with swappable media.
     #[cfg(feature = "cdrom")]
-    CdFlat(CdromDevice<BlockBackend<'a>>),
-    /// Random-writable DVD+RW (UdfRw, plan commit 4).
-    #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-    UdfRw(UdfRwDevice<BlockBackend<'a>>),
-    /// Live ISO9660 CD-ROM over a host directory.
-    #[cfg(all(feature = "livefs", feature = "std"))]
-    CdLiveFs(CdLiveFsDevice<StdFsBackend>),
+    Cdrom(CdromDrive<'a>),
 }
 
 impl ScsiDevice for Device<'_> {
@@ -160,11 +148,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.do_cmd(cdb, data, dsl),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => dev.do_cmd(cdb, data, dsl),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Self::UdfRw(dev) => dev.do_cmd(cdb, data, dsl),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => dev.do_cmd(cdb, data, dsl),
+            Self::Cdrom(dev) => dev.do_cmd(cdb, data, dsl),
         }
     }
 
@@ -174,11 +158,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.read_data(byte_offset, buf),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => dev.read_data(byte_offset, buf),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Self::UdfRw(dev) => dev.read_data(byte_offset, buf),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => dev.read_data(byte_offset, buf),
+            Self::Cdrom(dev) => dev.read_data(byte_offset, buf),
         }
     }
 
@@ -188,11 +168,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.write_data(byte_offset, buf),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => dev.write_data(byte_offset, buf),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Self::UdfRw(dev) => dev.write_data(byte_offset, buf),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => dev.write_data(byte_offset, buf),
+            Self::Cdrom(dev) => dev.write_data(byte_offset, buf),
         }
     }
 
@@ -202,11 +178,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => dev.sense(),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => dev.sense(),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Self::UdfRw(dev) => dev.sense(),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => dev.sense(),
+            Self::Cdrom(dev) => dev.sense(),
         }
     }
 
@@ -216,11 +188,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(feature = "std")]
             Self::CdBlock(dev) => <CDBlockDevice as ScsiDevice>::device_type(dev),
             #[cfg(feature = "cdrom")]
-            Self::CdFlat(dev) => <CdromDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Self::UdfRw(dev) => <UdfRwDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => <CdLiveFsDevice<StdFsBackend> as ScsiDevice>::device_type(dev),
+            Self::Cdrom(dev) => <CdromDrive<'_> as ScsiDevice>::device_type(dev),
         }
     }
 }
@@ -288,13 +256,16 @@ mod tests {
 
     #[cfg(feature = "cdrom")]
     #[test]
-    fn device_enum_cdflat_dispatch() {
-        use crate::cdrom::device::CdromDevice;
+    fn device_enum_cdrom_dispatch() {
+        use crate::cdrom::drive::CdromDrive;
+        use crate::cdrom::media::{CdMedia, FlatMedia};
+        use crate::scsi::backend::RamBackend;
         let mut img = vec![0xAAu8; 2048 * 100];
-        let dev = Device::CdFlat(CdromDevice::new(BlockBackend::Ram(RamBackend::new(
-            &mut img,
-        ))));
-        let mut dev = dev;
+        let backend = BlockBackend::Ram(RamBackend::new(&mut img));
+        let flat = FlatMedia::new(backend, crate::cdrom::common::CurrentProfile::CdRom);
+        let mut drive = CdromDrive::new();
+        drive.load(CdMedia::Flat(flat));
+        let mut dev = Device::Cdrom(drive);
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
         assert_eq!(dev.device_type(), DeviceType::Cdrom);
@@ -311,7 +282,8 @@ mod tests {
     #[cfg(all(feature = "livefs", feature = "std"))]
     #[test]
     fn device_enum_cdlivefs_dispatch() {
-        use crate::cdrom::livefs::CdLiveFsDevice;
+        use crate::cdrom::drive::CdromDrive;
+        use crate::cdrom::media::{CdMedia, FlatMedia, LiveData};
         use crate::scsi::fs_backend::StdFsBackend;
         let dir =
             std::env::temp_dir().join(format!("snowscsi_device_livefs_{}", std::process::id()));
@@ -319,15 +291,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
         let fs = StdFsBackend::new(&dir.to_str().unwrap());
-        let dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
-        let mut dev = Device::CdLiveFs(dev);
+        let live = LiveData::new(fs, "TEST").unwrap();
+        let flat = FlatMedia::new(live, crate::cdrom::common::CurrentProfile::CdRom);
+        let mut drive = CdromDrive::new();
+        drive.load(CdMedia::Live(Box::new(flat)));
+        let mut dev = Device::Cdrom(drive);
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
         assert_eq!(dev.device_type(), DeviceType::Cdrom);
         // File data is reachable through the virtual disc (first file extent).
         let first = match &mut dev {
-            Device::CdLiveFs(inner) => inner.layout().extents.first().expect("DATA.BIN extent").lba,
-            _ => unreachable!("CdLiveFs variant"),
+            Device::Cdrom(inner) => {
+                if let Some(crate::cdrom::media::CdMedia::Live(ref mut m)) = inner.media {
+                    m.data()
+                        .layout()
+                        .extents
+                        .first()
+                        .expect("DATA.BIN extent")
+                        .lba
+                } else {
+                    unreachable!("expected Live variant")
+                }
+            }
+            _ => unreachable!("Cdrom variant"),
         };
         let mut buf = [0u8; 2048];
         dev.read_data(u64::from(first) * 2048, &mut buf).unwrap();

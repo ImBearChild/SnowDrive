@@ -43,10 +43,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser};
-use snowdrive_scsi::cdrom::CdLiveFsDevice;
-use snowdrive_scsi::cdrom::CdromDevice;
+use snowdrive_scsi::cdrom::drive::CdromDrive;
+use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
 #[cfg(feature = "udf_void")]
-use snowdrive_scsi::cdrom::{UdfRwDevice, UdfRwMedia};
+use snowdrive_scsi::cdrom::udfrw::UdfRwMedia;
 use snowdrive_scsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowdrive_scsi::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowdrive_scsi::scsi::block::BlockDevice;
@@ -285,10 +285,7 @@ fn sync_devices(devices: &mut [Device<'_>]) {
         let failed = match dev {
             Device::Block(d) => d.backend().sync().is_err(),
             Device::CdBlock(d) => d.backend().sync().is_err(),
-            Device::CdFlat(d) => d.backend().sync().is_err(),
-            #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Device::UdfRw(d) => d.media().sync().is_err(),
-            Device::CdLiveFs(d) => d.sync().is_err(),
+            Device::Cdrom(d) => d.sync_media(),
         };
         if failed {
             eprintln!("snowdrive: sync failed for LUN {i}");
@@ -473,12 +470,15 @@ fn build_devices<'a>(
                         return Err(());
                     }
                 };
-                let mut dev = CdromDevice::new(backend);
-                log::debug!(
-                    "LUN {lun}: {path} flat CD-ROM ({} bytes)",
-                    dev.backend().capacity()
+                let cap = backend.capacity();
+                let flat = FlatMedia::new(
+                    backend,
+                    snowdrive_scsi::cdrom::CurrentProfile::from_capacity(cap),
                 );
-                devices.push(Device::CdFlat(dev));
+                let mut drive = CdromDrive::new();
+                drive.load(CdMedia::Flat(flat));
+                log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)",);
+                devices.push(Device::Cdrom(drive));
             }
             CdromSpec::Live { dir } => {
                 let fs = StdFsBackend::new(dir);
@@ -486,13 +486,19 @@ fn build_devices<'a>(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("SNOWDRIVE");
-                match CdLiveFsDevice::new(fs, label) {
-                    Ok(dev) => {
-                        log::debug!(
-                            "LUN {lun}: {dir} live ISO9660 CD-ROM ({} sectors)",
-                            dev.layout().total
+                match LiveData::new(fs, label) {
+                    Ok(live) => {
+                        let total = live.layout().total;
+                        let flat = FlatMedia::new(
+                            live,
+                            snowdrive_scsi::cdrom::CurrentProfile::from_capacity(
+                                u64::from(total) * 2048,
+                            ),
                         );
-                        devices.push(Device::CdLiveFs(dev));
+                        let mut drive = CdromDrive::new();
+                        drive.load(CdMedia::Live(Box::new(flat)));
+                        log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)",);
+                        devices.push(Device::Cdrom(drive));
                     }
                     Err(e) => {
                         eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
@@ -531,7 +537,7 @@ fn build_udfrw<'a>(
     };
     let mut scratch = [0u8; 256];
 
-    let dev = if let Some(path) = path {
+    let media = if let Some(path) = path {
         let existed = Path::new(path).exists();
         if existed && size.is_some() {
             eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
@@ -558,30 +564,32 @@ fn build_udfrw<'a>(
                 return Err(());
             }
         };
-        let dev = match udfrw_open(backend, label, mkfs, existed, &mut scratch) {
+        let m = match udfrw_open(backend, label, mkfs, existed, &mut scratch) {
             Ok(d) => d,
             Err(msg) => {
                 eprintln!("snowdrive: {msg}");
                 return Err(());
             }
         };
-        log::debug!("LUN {lun}: {path} UdfRw DVD+RW ({} bytes)", dev.capacity());
-        dev
+        log::debug!("LUN {lun}: {path} UdfRw DVD+RW ({} bytes)", m.capacity());
+        CdMedia::UdfRw(m)
     } else {
         let (slot, tail) = ram_rest.split_first_mut().unwrap();
         ram_rest = tail;
         let backend = BlockBackend::Ram(RamBackend::new(slot));
-        let dev = match udfrw_open(backend, "SNOWDRIVE", false, false, &mut scratch) {
+        let m = match udfrw_open(backend, "SNOWDRIVE", false, false, &mut scratch) {
             Ok(d) => d,
             Err(msg) => {
                 eprintln!("snowdrive: {msg}");
                 return Err(());
             }
         };
-        log::debug!("LUN {lun}: UdfRw DVD+RW in RAM ({} bytes)", dev.capacity());
-        dev
+        log::debug!("LUN {lun}: UdfRw DVD+RW in RAM ({} bytes)", m.capacity());
+        CdMedia::UdfRw(m)
     };
-    devices.push(Device::UdfRw(dev));
+    let mut drive = CdromDrive::new();
+    drive.load(media);
+    devices.push(Device::Cdrom(drive));
     Ok(ram_rest)
 }
 
@@ -595,7 +603,7 @@ fn udfrw_open<B: BlockStorage>(
     mkfs: bool,
     existed: bool,
     scratch: &mut [u8],
-) -> Result<UdfRwDevice<B>, String> {
+) -> Result<UdfRwMedia<B>, String> {
     let formatted = UdfRwMedia::formatted(&mut backend);
     if formatted && mkfs {
         return Err(format!(
@@ -608,7 +616,7 @@ fn udfrw_open<B: BlockStorage>(
         ));
     }
     let force = mkfs || !existed || !formatted;
-    UdfRwDevice::open_or_materialize(backend, label, force, scratch)
+    UdfRwMedia::open_or_materialize(backend, label, force, scratch)
         .map_err(|e| format!("udfrw: {e}"))
 }
 
@@ -1218,15 +1226,20 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     };
 
     let fs = StdFsBackend::new(&args.dir);
-    let dev = match CdLiveFsDevice::new(fs, &label) {
+    let live = match LiveData::new(fs, &label) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("snowdrive: failed to scan {}: {e}", args.dir);
             return ExitCode::FAILURE;
         }
     };
-    let total_sectors = dev.layout().total;
-    let mut dev = dev;
+    let total_sectors = live.layout().total;
+    let mut flat = FlatMedia::new(
+        live,
+        snowdrive_scsi::cdrom::CurrentProfile::from_capacity(
+            u64::from(total_sectors) * u64::from(ISO_SECTOR_SIZE),
+        ),
+    );
 
     let file = match File::create(&args.out) {
         Ok(f) => f,
@@ -1238,7 +1251,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     let mut writer = BufWriter::new(file);
     let mut sector = [0u8; ISO_SECTOR_SIZE as usize];
     for lba in 0..total_sectors {
-        if dev
+        if flat
             .read_data(u64::from(lba) * u64::from(ISO_SECTOR_SIZE), &mut sector)
             .is_err()
         {
@@ -1315,10 +1328,7 @@ enum CdromSpec {
 enum DeviceKind {
     Block,
     CdBlock,
-    CdFlat,
-    #[cfg(feature = "udf_void")]
-    UdfRw,
-    CdLiveFs,
+    Cdrom,
 }
 
 /// Collect the file-backed specs as `(kind, path)` pairs for dual-mount
@@ -1337,12 +1347,12 @@ fn dual_mount_specs<'a>(
         })
         .collect();
     out.extend(cdrom_specs.iter().filter_map(|s| match s {
-        CdromSpec::Flat { path } => Some((DeviceKind::CdFlat, path.as_str())),
-        CdromSpec::Live { dir } => Some((DeviceKind::CdLiveFs, dir.as_str())),
+        CdromSpec::Flat { path } => Some((DeviceKind::Cdrom, path.as_str())),
+        CdromSpec::Live { dir } => Some((DeviceKind::Cdrom, dir.as_str())),
         #[cfg(feature = "udf_void")]
         CdromSpec::UdfRw {
             path: Some(path), ..
-        } => Some((DeviceKind::UdfRw, path.as_str())),
+        } => Some((DeviceKind::Cdrom, path.as_str())),
         #[cfg(feature = "udf_void")]
         CdromSpec::UdfRw { path: None, .. } => None, // RAM: no path
     }));
@@ -1883,10 +1893,7 @@ mod tests {
         let d = dual_mount_specs(&[], &cdrom);
         assert_eq!(
             d,
-            vec![
-                (DeviceKind::CdFlat, "boot.iso"),
-                (DeviceKind::CdLiveFs, "tree")
-            ]
+            vec![(DeviceKind::Cdrom, "boot.iso"), (DeviceKind::Cdrom, "tree")]
         );
         assert!(check_dual_mount(&d).is_empty());
     }

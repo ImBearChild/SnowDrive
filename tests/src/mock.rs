@@ -1108,12 +1108,12 @@ mod tests {
         let _ = std::fs::remove_file(&iso);
     }
 
-    // ── Mixed heterogeneous LUNs: Device enum (Block + CdFlat + CdLiveFs) ──
+    // ── Mixed heterogeneous LUNs: Device enum (Block + Cdrom with Flat + Live) ──
 
     #[test]
-    fn mixed_lun_block_cdflat_and_livefs_dispatch() {
-        use snowdrive_scsi::cdrom::CdLiveFsDevice;
-        use snowdrive_scsi::cdrom::CdromDevice;
+    fn mixed_lun_block_cdrom_flat_and_live_dispatch() {
+        use snowdrive_scsi::cdrom::drive::CdromDrive;
+        use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
         use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
         use snowdrive_scsi::scsi::device::Device;
         use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
@@ -1129,19 +1129,31 @@ mod tests {
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("DATA.BIN"), vec![0x42u8; 4096]).unwrap();
 
+        // Extract the live file's LBA before moving into the device (the
+        // layout is accessible from LiveData before wrapping in FlatMedia).
+        let live_for_lba =
+            LiveData::new(StdFsBackend::new(&tree.to_string_lossy()), "TEST").unwrap();
+        let live_lba = live_for_lba.layout().extents[0].lba;
+        let flat_live = FlatMedia::new(live_for_lba, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
+
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let d0 = Device::Block(
+        let mut devs: Vec<Device<'_>> = Vec::new();
+
+        devs.push(Device::Block(
             BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
-        );
-        let flat = CdromDevice::new(BlockBackend::File(
-            FileBackend::open(iso.to_str().unwrap(), false).unwrap(),
         ));
-        let d1 = Device::CdFlat(flat);
-        // Extract the live file's LBA before moving the device into the enum.
-        let live = CdLiveFsDevice::new(StdFsBackend::new(&tree.to_string_lossy()), "TEST").unwrap();
-        let live_lba = live.layout().extents[0].lba;
-        let d2 = Device::CdLiveFs(live);
-        let mut devs = [d0, d1, d2];
+
+        // LUN 1: flat CD-ROM via CdromDrive + CdMedia::Flat
+        let backend = BlockBackend::File(FileBackend::open(iso.to_str().unwrap(), false).unwrap());
+        let flat = FlatMedia::new(backend, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
+        let mut drive1 = CdromDrive::new();
+        drive1.load_quiet(CdMedia::Flat(flat));
+        devs.push(Device::Cdrom(drive1));
+
+        // LUN 2: live CD-ROM via CdromDrive + CdMedia::Live
+        let mut drive2 = CdromDrive::new();
+        drive2.load_quiet(CdMedia::Live(Box::new(flat_live)));
+        devs.push(Device::Cdrom(drive2));
 
         let mut conn = MockConn::new();
         let mut session = Session::default();

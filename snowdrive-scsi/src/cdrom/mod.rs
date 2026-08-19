@@ -22,7 +22,6 @@
 
 pub mod common;
 pub mod device;
-#[cfg(feature = "udf_void")]
 pub mod drive;
 #[cfg(feature = "livefs")]
 pub mod livefs;
@@ -34,10 +33,11 @@ pub use common::{
     build_get_config_response, CdromDeviceCommon, CurrentProfile, CDROM_IDENTITY, SECTOR_SIZE,
 };
 pub use device::CdromDevice;
-#[cfg(feature = "udf_void")]
 pub use drive::CdromDrive;
 #[cfg(feature = "livefs")]
 pub use livefs::CdLiveFsDevice;
-pub use media::{CdMedia, MediaError};
+pub use media::{
+    CdLiveFsError, CdMedia, FlatData, FlatMedia, LiveData, LiveDataBuilder, MediaError,
+};
 #[cfg(feature = "udf_void")]
 pub use udfrw::{UdfRwDevice, UdfRwError, UdfRwMedia};

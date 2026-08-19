@@ -139,6 +139,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
         scan_dir(&mut fs, "", &mut files, &mut handles)?;
         let layout = compute_layout(&files, label).map_err(|e: IsoError| match e {
             IsoError::TooManyFiles => CdLiveFsError::TooManyFiles,
+            IsoError::InvalidLabel => CdLiveFsError::TooManyFiles,
         })?;
         Ok(Self {
             common: CdromDeviceCommon::new(CurrentProfile::from_capacity(

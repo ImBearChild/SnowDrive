@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use iso9660_no_std::{DirectoryEntry, ISO9660Reader, ISODirectory, ISO9660};
 
 use snowdrive_disc::live::{MAX_JOLIET_NAME_CHARS, SECTOR_SIZE};
-use snowdrive_scsi::cdrom::CdLiveFsDevice;
+use snowdrive_scsi::cdrom::media::{FlatMedia, LiveData};
 use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 
 /// Wrap a `std::io::Cursor` so it implements `embedded_io::{Read, Seek}`
@@ -79,12 +79,13 @@ fn build_tree() -> (PathBuf, Vec<(String, Vec<u8>)>) {
 /// Dump the whole live image (all sectors) to a `Vec<u8>`.
 fn build_image(dir: &Path) -> Vec<u8> {
     let fs = StdFsBackend::new(&dir.to_string_lossy());
-    let mut dev = CdLiveFsDevice::new(fs, "CROSS").expect("scan tree");
-    let total = dev.layout().total as usize;
+    let live = LiveData::new(fs, "CROSS").expect("scan tree");
+    let total = live.layout().total as usize;
+    let mut flat = FlatMedia::new(live, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
     let mut img = vec![0u8; total * SECTOR_SIZE as usize];
     for lba in 0..total as u32 {
         let start = lba as usize * SECTOR_SIZE as usize;
-        dev.read_data(
+        flat.read_data(
             lba as u64 * SECTOR_SIZE as u64,
             &mut img[start..start + SECTOR_SIZE as usize],
         )
