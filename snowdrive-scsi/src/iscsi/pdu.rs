@@ -16,14 +16,14 @@
 //! - Login Response (Status-Class 36, Status-Detail 37; bytes 20-23 Reserved): §10.13
 //! - Reject (Reason byte 2): §10.17
 //!
-//! Phase 1 negotiates HeaderDigest/DataDigest=None; no CRC32C is implemented.
+//! negotiates HeaderDigest/DataDigest=None; no CRC32C is implemented.
 
 use core::ops::Index;
 
 /// Basic Header Segment length in bytes (RFC 3720 §10.2.1).
 pub const BHS_SIZE: usize = 48;
 
-/// Largest data segment length negotiated in Phase 1 (RFC 3720 §10.2.1.6).
+/// Largest data segment length negotiated (RFC 3720 §10.2.1.6).
 pub const MAX_DATA_SEGMENT: u32 = 8192;
 
 /// iSCSI PDU opcodes (RFC 3720 §10.2.1.2).
@@ -159,7 +159,7 @@ impl Bhs {
         self.0[1] = flags;
     }
 
-    /// TotalAHSLength, byte 4 (RFC 3720 §10.2.1.5). Phase 1 requires 0.
+    /// TotalAHSLength, byte 4 (RFC 3720 §10.2.1.5). requires 0.
     pub fn total_ahs_length(&self) -> u8 {
         self.0[4]
     }

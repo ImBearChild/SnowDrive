@@ -1,4 +1,4 @@
-//! UdfRw media + device layer (`__UDFRW_PLAN.md` §7, commits 2–3).
+//! UdfRw media + device layer (UDF RW).
 //!
 //! A random-writable DVD+RW over any [`BlockStorage`] backend, built on the
 //! pure volume skeleton of [`crate::udf_void`].
@@ -16,7 +16,7 @@
 //! Presents the media as a DVD+RW: profile 0x001A, Random Writable + DVD+RW
 //! features, and a READ/WRITE data plane. MMC commands dispatch here; SPC
 //! commands go to [`CdromDeviceCommon`]. When the `CdromDrive`/`CdMedia`
-//! rewrite (plan M1–M9) lands, the media becomes `CdMedia::UdfRw`.
+//! rewrite (refactoring) lands, the media becomes `CdMedia::UdfRw`.
 //!
 //! Free space is left as zeros; the OS filesystem (`udf`) allocates and
 //! writes it later. This layer never parses UDF contents.
@@ -36,7 +36,7 @@ use crate::udf_void::{
     compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError,
 };
 
-/// INQUIRY identity for the UdfRw device (plan §11.3 builder territory):
+/// INQUIRY identity for the UdfRw device (plan MMC builder territory):
 /// SCSI family with SPC-4 and MMC-6 version descriptors.
 pub const UDFRW_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
@@ -417,7 +417,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
     /// compatibility behavior; a zero-length BOT transaction still completes
     /// immediately.
     ///
-    /// CDB byte 1 bit layout (MMC-6 §6.4):
+    /// CDB byte 1 bit layout (MMC-6 MMC):
     /// - bit 7 (FmtData): 1 = parameter list follows, 0 = no parameter list
     /// - bit 4 (DCRT): Disable Certification — must be 1
     /// - bit 3 (Immediate): 0 = format completes before status, 1 = status
@@ -717,7 +717,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
     }
 
     /// READ TRACK INFORMATION (0x52): a formatted DVD+RW data track
-    /// (MMC-6 §6.26, Table 494). Windows' optical stack queries this to
+    /// (MMC-6 MMC, Table 494). Windows' optical stack queries this to
     /// determine media state; an INVALID COMMAND reply makes it fall back to
     /// read-only handling.
     fn read_track_information_cmd<'a>(
@@ -758,8 +758,8 @@ impl<B: BlockStorage> UdfRwDevice<B> {
     }
 
     /// READ DVD STRUCTURE (0xAD): format 0 (Physical Format Information,
-    /// MMC-6 §6.22.3.2.1, Table 398) and format 30h (Disc Control Blocks,
-    /// MMC-6 §6.22.3.2.25). Format 0 reports a single-layer rewritable
+    /// MMC-6 MMC, Table 398) and format 30h (Disc Control Blocks,
+    /// MMC-6 MMC). Format 0 reports a single-layer rewritable
     /// DVD+RW (Windows uses the Disk Category / Layer Type to decide whether
     /// the medium is writable); format 30h returns the Write Inhibit DCB
     /// (WDCB) whose Write Protect Actions field carries the media
@@ -831,7 +831,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         // Response: 2-byte structure data length + 2 reserved + the 32 KiB
-        // DCB (padded with zeros per §6.22.3.2.25.1).
+        // DCB (padded with zeros per MMC).
         const DCB_SIZE: usize = 32768;
         let mut buf = [0u8; 4 + DCB_SIZE];
         buf[0..2].copy_from_slice(&(DCB_SIZE as u16).to_be_bytes());
@@ -854,7 +854,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
 
     /// READ FORMAT CAPACITIES (0x23): formatted media, random-writable —
     /// the current/maximum capacity descriptor carries the formatted
-    /// partition length (MMC-6 §6.23.3.2.3, Table 466: DVD+RW).
+    /// partition length (MMC-6 MMC, Table 466: DVD+RW).
     fn read_format_capacities_cmd<'a>(
         &mut self,
         cdb: &[u8],

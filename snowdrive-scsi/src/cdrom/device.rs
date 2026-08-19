@@ -1,4 +1,4 @@
-//! CdromDevice: flat ISO/RAM CD-ROM (Phase 2c, plan §8.2).
+//! CdromDevice: flat ISO/RAM CD-ROM.
 //!
 //! A read-only CD-ROM emulated over any [`BlockStorage`] backend (ISO file,
 //! RAM disk). SPC commands are delegated to [`CdromDeviceCommon`]; MMC
@@ -18,7 +18,7 @@ use crate::scsi::scsi::{
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
 
-/// Flat ISO/RAM CD-ROM device (plan §8.2 / §3.2).
+/// Flat ISO/RAM CD-ROM device (plan MMC / MMC).
 ///
 /// Read-only: all write commands return DATA PROTECT. Generic over any
 /// [`BlockStorage`] backend (FileBackend for ISO files, RamBackend for
@@ -122,7 +122,7 @@ impl<B: BlockStorage> CdromDevice<B> {
             execute_spc(&mut self.common, cmd, data, dsl)
         } else {
             // Total: `do_cmd` is public API — reject CDBs shorter than
-            // their opcode group's fixed length (SPC-4 §7.3) before any
+            // their opcode group's fixed length (SPC-4 MMC) before any
             // field access, instead of panicking on a short slice.
             let Some(op) = cdb_opcode(cdb) else {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
@@ -262,7 +262,7 @@ impl<B: BlockStorage> CdromDevice<B> {
 
     // ── READ TOC ────────────────────────────────────────────────────
 
-    /// READ TOC/PMA/ATIP (0x43) — plan §8.2.
+    /// READ TOC/PMA/ATIP (0x43) —
     ///
     /// Format 0000b: single data track + lead-out.
     /// Format 0001b: single session.
@@ -350,7 +350,7 @@ impl<B: BlockStorage> CdromDevice<B> {
     }
 
     /// READ BUFFER CAPACITY (0x5C) — a read-only drive has no write buffer.
-    /// Only byte-length reporting (Block = 0) is supported (MMC-6 §6.17.2.2).
+    /// Only byte-length reporting (Block = 0) is supported (MMC-6 MMC).
     fn read_buffer_capacity_cmd<'a>(
         &mut self,
         cdb: &[u8],
@@ -376,7 +376,7 @@ impl<B: BlockStorage> CdromDevice<B> {
 
     // ── GET CONFIGURATION ───────────────────────────────────────────
 
-    /// GET CONFIGURATION (0x46) — plan §8.2.
+    /// GET CONFIGURATION (0x46) —
     ///
     /// Current Profile from capacity; common features from
     /// [`build_get_config_response`].

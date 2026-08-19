@@ -1,4 +1,4 @@
-//! CdLiveFsDevice: live ISO9660 CD-ROM over a host directory (Phase 2e).
+//! CdLiveFsDevice: live ISO9660 CD-ROM over a host directory.
 //!
 //! The device scans a host directory tree via [`FsStorage`] at
 //! construction, computes an ISO9660/Joliet LBA layout with the pure
@@ -60,7 +60,7 @@ impl From<FsError> for CdLiveFsError {
     }
 }
 
-/// Live ISO9660 CD-ROM device (plan §8.2 / §3.2 / §11.2).
+/// Live ISO9660 CD-ROM device (plan MMC / MMC / MMC).
 ///
 /// Generic over any [`FsStorage`] implementation (StdFsBackend on desktop,
 /// an embedded file system for no_std).  Read-only: write commands return
@@ -270,7 +270,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             execute_spc(&mut self.common, cmd, data, dsl)
         } else {
             // Total: `do_cmd` is public API — reject CDBs shorter than
-            // their opcode group's fixed length (SPC-4 §7.3) before any
+            // their opcode group's fixed length (SPC-4 MMC) before any
             // field access, instead of panicking on a short slice.
             let Some(op) = cdb_opcode(cdb) else {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
@@ -488,7 +488,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
     }
 
     /// READ BUFFER CAPACITY (0x5C) — a read-only drive has no write buffer.
-    /// Only byte-length reporting (Block = 0) is supported (MMC-6 §6.17.2.2).
+    /// Only byte-length reporting (Block = 0) is supported (MMC-6 MMC).
     fn read_buffer_capacity_cmd<'a>(
         &mut self,
         cdb: &[u8],

@@ -1,14 +1,14 @@
-//! CD-ROM media types, geometry and media-layer methods (plan §3.3 / M1–M2).
+//! CD-ROM media types, geometry and media-layer methods.
 //!
-//! M1: Type definitions (Track, SessionInfo, DiscState, DiscType, …).
-//! M2: `CdMedia` gains inherent methods that `CdromDrive` delegates to;
-//!     `UdfRw` variant is concrete; `MediaEventStatus` for GESN.
+//! - Type definitions (Track, SessionInfo, DiscState, DiscType, ...).
+//! - `CdMedia` gains inherent methods that `CdromDrive` delegates to;
+//!   `UdfRw` variant is concrete; `MediaEventStatus` for GESN.
 //!
 //! Types defined here:
 //! - Geometry constants (`MAX_TRACKS`, `SECTOR_SIZE_DATA`, …)
 //! - `TrackKind`, `TrackStatus`, `RecordingMode`, `DiscState`, `DiscType`
 //! - `TrackFile`, `Track`, `SessionInfo`
-//! - `MediaError` (write-path error model, plan §3.2 A1)
+//! - `MediaError` (write-path error model, A1)
 //! - `MediaEventStatus` (GESN media class response)
 //! - `CdMedia` enum with inherent methods for the drive layer
 
@@ -21,7 +21,7 @@ use crate::scsi::backend::BlockBackend;
 #[cfg(feature = "udf_void")]
 use crate::scsi::backend::BlockStorageError;
 
-// ── Geometry constants (plan §3.3) ─────────────────────────────────
+// ── Geometry constants ─────────────────────────────────
 
 /// Maximum number of tracks on a single disc (MMC limit).
 pub const MAX_TRACKS: usize = 99;
@@ -47,7 +47,7 @@ pub const DEFAULT_CD_CAPACITY: u32 = 360_000;
 /// Sector size in bytes (module-level alias for `SECTOR_SIZE_DATA`).
 pub const SECTOR_SIZE: u32 = 2048;
 
-// ── Track / Session / Disc enums (plan §3.3) ──────────────────────
+// ── Track / Session / Disc enums ──────────────────────
 
 /// Whether a track carries data or audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub enum TrackKind {
     Audio,
 }
 
-/// Track recording status (plan §3.3 / MMC-6 Table 367 analogous).
+/// Track recording status (plan MC-6 Table 367 analogous).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackStatus {
     /// RESERVE TRACK issued but no data written yet.
@@ -67,7 +67,7 @@ pub enum TrackStatus {
     Complete,
 }
 
-/// Recording mode for the disc (plan §3.3).
+/// Recording mode for the disc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
     /// CD-R always; CD-RW initial state.
@@ -76,7 +76,7 @@ pub enum RecordingMode {
     RestrictedOverwrite,
 }
 
-/// Overall disc state (plan §3.3 / MMC-6 Table 367).
+/// Overall disc state (plan MC-6 Table 367).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscState {
     /// No tracks written; disc is empty.
@@ -87,7 +87,7 @@ pub enum DiscState {
     Finalized,
 }
 
-/// Physical disc type for profile reporting (plan §3.3).
+/// Physical disc type for profile reporting.
 ///
 /// **Not** the same as `DiscInfo.disc_type: u8` (MMC-6 Table 369 byte 8
 /// values like 0x00/0x20).  This enum identifies the *media family*;
@@ -113,9 +113,9 @@ impl DiscType {
     }
 }
 
-// ── Track / Session data structures (plan §3.3) ───────────────────
+// ── Track / Session data structures ───────────────────
 
-/// A file backing part of a track's data (Bundle multi-file split, plan §7.1).
+/// A file backing part of a track's data (Bundle multi-file split,).
 #[derive(Debug, Clone)]
 pub struct TrackFile {
     /// Ordinal within the track (0-based).
@@ -124,10 +124,10 @@ pub struct TrackFile {
     pub size: u64,
 }
 
-/// Track descriptor — one per logical track on the disc (plan §3.3).
+/// Track descriptor — one per logical track on the disc.
 #[derive(Debug, Clone)]
 pub struct Track {
-    /// Track number (1-based, MMC convention).
+    /// Track number (1-basedMC convention).
     pub num: u8,
     /// Data or audio.
     pub kind: TrackKind,
@@ -153,7 +153,7 @@ pub struct Track {
     pub files: heapless::Vec<TrackFile, MAX_FILES_PER_TRACK>,
 }
 
-/// Session descriptor — one per session on the disc (plan §3.3).
+/// Session descriptor — one per session on the disc.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     /// Session number (1-based).
@@ -168,9 +168,9 @@ pub struct SessionInfo {
     pub closed: bool,
 }
 
-// ── Write-path error model (plan §3.2 A1) ─────────────────────────
+// ── Write-path error model (plan  A1) ─────────────────────────
 
-/// Errors from the media write path (plan §3.2 A1).
+/// Errors from the media write path (plan  A1).
 ///
 /// The drive layer maps these to SCSI sense codes:
 /// - `IllegalField` → 24h/00h (INVALID FIELD IN CDB)
@@ -189,7 +189,7 @@ pub enum MediaError {
     Io,
 }
 
-// ── GESN media event status (plan §2.3 / MMC-6 §6.5) ─────────────
+// ── GESN media event status (plan MC-6 ) ─────────────
 
 /// Media event status for GET EVENT STATUS NOTIFICATION (MMC-6 Table 265).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,28 +202,28 @@ pub enum MediaEventStatus {
     MediaInserted,
 }
 
-// ── CdMedia enum (plan §2.2) ──────────────────────────────────────
+// ── CdMedia enum ──────────────────────────────────────
 
 /// The media slot inside a [`CdromDrive`](super::drive::CdromDrive).
 ///
-/// `None` means the tray is empty (plan §6.1).  Each variant wraps a
+/// `None` means the tray is empty.  Each variant wraps a
 /// concrete media type that provides geometry and a data plane.
 ///
 /// Variants are added incrementally:
-/// - **M2**: `UdfRw(…)` (migrated from standalone `UdfRwDevice`)
-/// - **M3**: `Flat(…)` and `Live(…)`
-/// - **M7**: `Bundle(…)`
+/// - * `UdfRw(…)` (migrated from standalone `UdfRwDevice`)
+/// - * `Flat(…)` and `Live(…)`
+/// - * `Bundle(…)`
 pub enum CdMedia<'a> {
-    /// Flat ISO/RAM read-only image (plan §5.1, M3).
-    Flat(/* FlatMedia<BlockBackend<'a>> — M3 */),
+    /// Flat ISO/RAM read-only image (plan ).
+    Flat(/* FlatMedia<BlockBackend<'a>> */),
 
-    /// Live ISO9660 from a host directory (plan §5.2, M3).
-    Live(/* FlatMedia<LiveData<FsBackend>> — M3 */),
+    /// Live ISO9660 from a host directory (plan ).
+    Live(/* FlatMedia<LiveData<FsBackend>> */),
 
-    /// Bundle: multi-track, multi-session disc package (plan §7.1, M7).
-    Bundle(/* BundleMedia<FsBackend> — M7 */),
+    /// Bundle: multi-track, multi-session disc package (plan ).
+    Bundle(/* BundleMedia<FsBackend> */),
 
-    /// UDF random-writable DVD+RW (plan §5.4, M2).
+    /// UDF random-writable DVD+RW (plan ).
     #[cfg(feature = "udf_void")]
     UdfRw(UdfRwMedia<BlockBackend<'a>>),
 
@@ -233,9 +233,9 @@ pub enum CdMedia<'a> {
 
 #[cfg(feature = "udf_void")]
 impl<'a> CdMedia<'a> {
-    // ── Profile (plan §3.2) ────────────────────────────────────────
+    // ── Profile ────────────────────────────────────────
 
-    /// Current Profile for GET CONFIGURATION (plan §3.2).
+    /// Current Profile for GET CONFIGURATION.
     pub fn profile(&self) -> CurrentProfile {
         match self {
             Self::UdfRw(_) => CurrentProfile::DvdRw,
@@ -245,9 +245,9 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    // ── Geometry (plan §3.2) ───────────────────────────────────────
+    // ── Geometry ───────────────────────────────────────
 
-    /// Largest readable LBA (plan §3.2 `max_lba`).
+    /// Largest readable LBA (plan  `max_lba`).
     pub fn max_lba(&self) -> u64 {
         match self {
             Self::UdfRw(m) => m.max_lba(),
@@ -257,7 +257,7 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    /// Lead-out start LBA = number of data sectors (plan §3.2).
+    /// Lead-out start LBA = number of data sectors.
     pub fn lead_out_lba(&self) -> u32 {
         match self {
             Self::UdfRw(m) => m.lead_out_lba(),
@@ -277,7 +277,7 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    // ── Data plane (plan §3.2) ─────────────────────────────────────
+    // ── Data plane ─────────────────────────────────────
 
     /// Read data from the medium (target data path).
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
@@ -313,7 +313,7 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    // ── GESN (plan §2.3, M2 unified) ──────────────────────────────
+    // ── GESN (plan  unified) ──────────────────────────────
 
     /// Media event status for GET EVENT STATUS NOTIFICATION.
     pub fn event_status(&self) -> MediaEventStatus {
@@ -326,7 +326,7 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    // ── READ DVD STRUCTURE (M2 unified) ────────────────────────────
+    // ── READ DVD STRUCTURE ────────────────────────────
 
     /// Physical format information for READ DVD STRUCTURE format 0.
     pub fn dvd_physical_format(&self) -> Option<DvdPhysicalFormat> {
@@ -349,7 +349,7 @@ impl<'a> CdMedia<'a> {
 }
 
 /// Physical format information for READ DVD STRUCTURE format 0
-/// (MMC-6 §6.22.3.2.1, Table 398).
+/// (MMC-6 , Table 398).
 #[derive(Debug, Clone, Copy)]
 pub struct DvdPhysicalFormat {
     pub disk_category_part_version: u8,

@@ -137,13 +137,13 @@ pub enum Device<'a> {
     Block(BlockDevice<BlockBackend<'a>>),
     #[cfg(feature = "std")]
     CdBlock(CDBlockDevice),
-    /// Flat ISO/RAM CD-ROM (Phase 2c).
+    /// Flat ISO/RAM CD-ROM.
     #[cfg(feature = "cdrom")]
     CdFlat(CdromDevice<BlockBackend<'a>>),
     /// Random-writable DVD+RW (UdfRw, plan commit 4).
     #[cfg(all(feature = "cdrom", feature = "udf_void"))]
     UdfRw(UdfRwDevice<BlockBackend<'a>>),
-    /// Live ISO9660 CD-ROM over a host directory (Phase 2e).
+    /// Live ISO9660 CD-ROM over a host directory.
     #[cfg(all(feature = "livefs", feature = "std"))]
     CdLiveFs(CdLiveFsDevice<StdFsBackend>),
 }

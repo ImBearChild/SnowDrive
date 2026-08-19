@@ -15,8 +15,8 @@
 //!   (file, default key `img=`).
 //! - `--cdrom` (CD plane): `img=<iso>` (flat full MMC), `live=<dir>` (live
 //!   ISO9660 over a directory); bare `.iso` maps to `img=`. Other bare
-//!   values are rejected (no auto-typing by suffix). `bundle=` (Phase 3)
-//!   and `ram=` (Phase 4) are reserved.
+//!   values are rejected (no auto-typing by suffix). `bundle=` (not yet implemented)
+//!   and `ram=` (not yet implemented) are reserved.
 //! - `--cdrom udfrw=<path>[,size=…][,mkfs=true]` or `--cdrom udfrw=ram:<size>`:
 //!   a random-writable DVD+RW (empty UDF 2.01 volume). `size=` creates a new
 //!   file (K/M/G suffixes) and writes the volume structure; `mkfs=true`
@@ -114,7 +114,7 @@ struct ServeArgs {
 
     /// CD-ROM device: `img=<path>.iso` (flat, full MMC) or `live=<dir>`
     /// (live ISO9660); a bare `.iso` also maps to `img=`. `bundle=` (Phase
-    /// 3) and `ram=` (Phase 4) are reserved. Repeatable; these LUNs follow
+    /// 3) and `ram=` (not yet implemented) are reserved. Repeatable; these LUNs follow
     /// the `--disk` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
@@ -513,8 +513,8 @@ fn build_devices<'a>(
     Ok(())
 }
 
-/// Build a `--cdrom udfrw=` device (file or RAM) per `__UDFRW_PLAN.md`
-/// §7.x: an existing formatted volume opens as-is, `size=` creates a new
+/// Build a `--cdrom udfrw=` device (file or RAM).
+/// An existing formatted volume opens as-is, `size=` creates a new
 /// file + structure, `mkfs=true` forces the structure into an existing
 /// blank file, `ram:<size>` uses memory. Consumes the next `udfrw=ram:`
 /// slot from `ram_rest` and returns the remaining tail.
@@ -586,7 +586,7 @@ fn build_udfrw<'a>(
 }
 
 /// Open (or materialize) a UdfRw volume, applying the CLI policy
-/// (`__UDFRW_PLAN.md` §7.x rules): refuse `mkfs=true` over an existing
+///: refuse `mkfs=true` over an existing
 /// formatted volume; require `mkfs=true` for an existing non-udfrw file.
 #[cfg(feature = "udf_void")]
 fn udfrw_open<B: BlockStorage>(
@@ -1422,15 +1422,15 @@ fn parse_disk_spec(spec: &str) -> Result<DiskSpec, String> {
 /// - `live=<dir>` → live ISO9660 CD-ROM over the directory.
 /// - `<path>.iso` → same as `img=<path>` (bare value: only `.iso` is
 ///   auto-typed; anything else is rejected — no bundle auto-detection).
-/// - `bundle=` / `ram=` → reserved for Phase 3 / Phase 4.
+/// - `bundle=` / `ram=` → reserved for  not yet implemented / not yet implemented.
 fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
     if let Some(path) = spec.strip_prefix("bundle=") {
         return Err(format!(
-            "{path}: bundle cdrom mode is not yet supported (Phase 3)"
+            "{path}: bundle cdrom mode is not yet supported (not yet implemented)"
         ));
     }
     if spec.starts_with("ram=") {
-        return Err("ram= cdrom mode is not yet supported (Phase 4)".to_string());
+        return Err("ram= cdrom mode is not yet supported (not yet implemented)".to_string());
     }
     if let Some(rest) = spec.strip_prefix("udfrw=") {
         return parse_udfrw_spec(rest);
@@ -1482,7 +1482,7 @@ fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
 
 /// Parse the `udfrw=` value: `ram:<size>` (memory) or
 /// `<path>[,size=…][,mkfs=true]` (file). File semantics per
-/// `__UDFRW_PLAN.md` §7.x: `size=` creates a new file + structure, `mkfs`
+///  `size=` creates a new file + structure, `mkfs`
 /// forces the structure into an existing blank file, both are exclusive.
 #[cfg(feature = "udf_void")]
 fn parse_udfrw_spec(spec: &str) -> Result<CdromSpec, String> {
@@ -1712,7 +1712,7 @@ mod tests {
         assert!(parse_cdrom_spec("rw.d").is_err());
         assert!(parse_cdrom_spec("tree").is_err());
         assert!(parse_cdrom_spec("tree,recovery=delete").is_err());
-        // RAM mode (Phase 4).
+        // RAM mode (not yet implemented).
         assert!(parse_cdrom_spec("ram=64M").is_err());
     }
 

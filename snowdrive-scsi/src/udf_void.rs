@@ -1,4 +1,4 @@
-//! Empty UDF void volume generation (`__UDFRW_PLAN.md` §1–6).
+//! Empty UDF void volume generation — UDF void volume generation.
 //!
 //! Pure algorithms: **no storage, no FS, no alloc** — mirror of
 //! `iso9660::live`. The media layer (`CdMedia::UdfRw`, plan §7) materializes
@@ -39,7 +39,7 @@
 //! against the OpenBSD `sys/isofs/udf/ecma167-udf.h` struct layouts. A few
 //! values are marked "oracle-verify" in the comments: they must be diffed
 //! against a `mkudffs`-generated reference image before the media layer
-//! ships (`__UDFRW_PLAN.md` §8/§9) — space-bitmap polarity, USE extent
+//! ships  — space-bitmap polarity, USE extent
 //! flags, PD partition-contents identifier and the root FID flag bits.
 
 use core::fmt;
@@ -371,7 +371,7 @@ pub fn crc16(data: &[u8], crc: u16) -> u16 {
 /// over the 16-byte body (AVDP size 32 − tag 16).
 ///
 /// Used by the media layer to detect an already-formatted UdfRw volume
-/// (`__UDFRW_PLAN.md` §7.x rule 4). Accepts any valid AVDP: the compact
+///   . Accepts any valid AVDP: the compact
 /// UdfRw anchor (crc_len = 16, CRC over the two extents) or a standard
 /// full-sector anchor (crc_len = 496, CRC over the rest of the sector).
 pub fn is_avdp(sector: &[u8]) -> bool {

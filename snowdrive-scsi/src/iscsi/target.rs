@@ -23,7 +23,7 @@ use crate::scsi::scsi::{asc, opcode_name, Sense, SenseKey};
 
 /// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
 const LOGIN_MAX: usize = 4096;
-/// Target Transfer Tag for R2T — single outstanding transfer (Phase 1).
+/// Target Transfer Tag for R2T — single outstanding transfer.
 const TTT: u32 = 1;
 /// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
 /// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
@@ -243,7 +243,7 @@ impl Session {
             Err(()) => return StepResult::Closed,
         };
 
-        // AHS defense: Phase 1 assumes TotalAHSLength = 0.
+        // AHS defense: Assumes TotalAHSLength = 0.
         if pdu.bhs.total_ahs_length() != 0 {
             return self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs);
         }

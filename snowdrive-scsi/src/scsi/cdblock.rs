@@ -1,4 +1,4 @@
-//! CDBlock device: a "lazy CD" (Phase 1.5, plan §8.1b).
+//! CDBlock device: a "lazy CD" — minimal CD-ROM.
 //!
 //! Reports itself as a CD-ROM (PDT=0x05) while reading a flat ISO image
 //! through a read-only [`FileBackend`]. Implements a minimal MMC command set
@@ -468,7 +468,7 @@ impl SpcDevice for CDBlockDevice {
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {
-        // Plan §8.1b: MODE SENSE is "same as Phase 1" — the caching page
+        // MODE SENSE is identical to the block device — the caching page
         // (0x08), vendor page (0x00) and the 0x3F concatenation.
         block_mode_page(page)
     }

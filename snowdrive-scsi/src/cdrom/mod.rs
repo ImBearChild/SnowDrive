@@ -1,4 +1,4 @@
-//! CD-ROM device emulation (plan §8.2).
+//! CD-ROM device emulation.
 //!
 //! The optical-media device layer, independent of the SCSI block stack
 //! (`snowdrive::scsi`): SPC commands are delegated to `snowdrive::scsi::spc`,

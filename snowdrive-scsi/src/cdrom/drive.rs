@@ -1,4 +1,4 @@
-//! CdromDrive: unified CD-ROM device with swappable media (plan §2.2 / M2).
+//! CdromDrive: unified CD-ROM device with swappable media (plan ).
 //!
 //! One constant device identity + one mutable media slot.  **All** MMC
 //! command dispatch lives here; media types only provide geometry and a
@@ -20,36 +20,36 @@ use crate::scsi::scsi::{
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDevice, SpcEffect};
 
-// ── CdromDrive (plan §2.2) ────────────────────────────────────────
+// ── CdromDrive ────────────────────────────────────────
 
-/// Unified CD-ROM drive with a swappable media slot (plan §2.2).
+/// Unified CD-ROM drive with a swappable media slot.
 ///
 /// The drive identity (INQUIRY, caps, drive_id) is constant; the media
 /// slot is mutable.  `SpcDevice` is implemented directly here.
 pub struct CdromDrive<'a> {
     pub(crate) sense: Sense,
     pub(crate) prevent_removal: bool,
-    /// UNIT ATTENTION pending (plan §6.3): independent of `sense`.
+    /// UNIT ATTENTION pending: independent of `sense`.
     pub(crate) pending_ua: Option<Sense>,
     /// Device capability model — single source for GET CONFIG features
-    /// and MODE SENSE 0x2A page (plan §5.3).
+    /// and MODE SENSE 0x2A page.
     pub(crate) caps: CdromCapabilities,
-    /// VPD 0x80/0x83恒定标识（换盘不漂移, plan §2.2）.
+    /// VPD 0x80/0x83恒定标识（换盘不漂移,）.
     pub(crate) drive_id: u64,
     /// INQUIRY identity.
     pub(crate) identity: DeviceIdentity,
-    /// Media slot: `None` = empty tray (plan §6.1).
+    /// Media slot: `None` = empty tray.
     #[cfg(feature = "udf_void")]
     pub(crate) media: Option<CdMedia<'a>>,
-    /// Tray state: `true` = open (plan §6.1 ASCQ).
+    /// Tray state: `true` = open (plan  ASCQ).
     pub(crate) tray_open: bool,
-    /// Page 0x05 write parameter cache (plan §7.5/§7.6).
-    #[allow(dead_code)] // used in M4/M7
+    /// Page 0x05 write parameter cache (plan /).
+    #[allow(dead_code)] // used in later milestones
     pub(crate) mode_page_05: [u8; 16],
     #[allow(dead_code)]
     pub(crate) mode_page_05_valid: bool,
     /// `true` when `load()` was requested by START STOP Load=1 on empty tray
-    /// (plan §6.5/§6.6).
+    /// (plan /).
     pub(crate) media_requested: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
@@ -66,7 +66,7 @@ impl<'a> CdromDrive<'a> {
         Self::builder().build()
     }
 
-    /// Start building a new drive (plan §11.3).
+    /// Start building a new drive.
     pub fn builder() -> CdromDriveBuilder {
         CdromDriveBuilder {
             identity: CDROM_IDENTITY,
@@ -75,9 +75,9 @@ impl<'a> CdromDrive<'a> {
         }
     }
 
-    // ── Media slot (plan §6.6) ─────────────────────────────────────
+    // ── Media slot ─────────────────────────────────────
 
-    /// Load media into the drive (plan §6.6).
+    /// Load media into the drive.
     #[cfg(feature = "udf_void")]
     pub fn load(&mut self, media: CdMedia<'a>) {
         self.media = Some(media);
@@ -88,7 +88,7 @@ impl<'a> CdromDrive<'a> {
         ));
     }
 
-    /// Eject the media (plan §6.5/§6.6).
+    /// Eject the media (plan /).
     #[cfg(feature = "udf_void")]
     pub fn eject(&mut self) {
         self.media = None;
@@ -160,7 +160,7 @@ impl<'a> CdromDrive<'a> {
         CurrentProfile::CdRom
     }
 
-    /// Current GET CONFIGURATION profile: 0000h when tray is empty (plan §6.4).
+    /// Current GET CONFIGURATION profile: 0000h when tray is empty.
     fn current_profile_code(&self) -> u16 {
         #[cfg(feature = "udf_void")]
         if let Some(ref m) = self.media {
@@ -181,7 +181,7 @@ impl<'a> CdromDrive<'a> {
         [0x00, m as u8, s as u8, f as u8]
     }
 
-    // ── Unified command dispatch (plan §2.3) ───────────────────────
+    // ── Unified command dispatch ───────────────────────
 
     /// Process one SCSI command.  **All** MMC commands are dispatched
     /// here — media only provides structured values.
@@ -195,7 +195,7 @@ impl<'a> CdromDrive<'a> {
             return Err(crate::scsi::device::Error::WorkBufTooSmall);
         }
 
-        // Plan §6.3: UNIT ATTENTION takes priority over everything
+        // Plan : UNIT ATTENTION takes priority over everything
         // except INQUIRY / REQUEST SENSE / REPORT LUNS.
         let spc = parse_spc(cdb);
         if let Some(ua) = self.pending_ua {
@@ -229,7 +229,7 @@ impl<'a> CdromDrive<'a> {
             }
         }
 
-        // ── Intercept TUR before execute_spc (plan §6.1) ──────────
+        // ── Intercept TUR before execute_spc ──────────
         if let Some(SpcCommand::TestUnitReady) = spc {
             if self.media.is_some() {
                 let outcome = CommandOutcome::Status;
@@ -558,7 +558,7 @@ impl<'a> CdromDrive<'a> {
             sessions: 1,
             first_track: 1,
             last_track: 1,
-            disc_type: 0x00, // CD-ROM (not XA, plan §3.3 note)
+            disc_type: 0x00, // CD-ROM (not XA, note)
             mrw_status: 0,
             lead_out_lba: self.lead_out_lba(),
         };
@@ -592,7 +592,7 @@ impl<'a> CdromDrive<'a> {
         } else {
             buf[2] = 0x80; // NEA=1
         }
-        // Event Code 0 (NoChg), Media Present (bit 1).
+        // Event Code 0 (NoChg)edia Present (bit 1).
         buf[4] = 0x00;
         buf[5] = 0x02;
         let n = buf.len().min(alloc as usize).min(data.len());
@@ -754,7 +754,7 @@ impl SpcDevice for CdromDrive<'_> {
     }
 
     fn medium_type(&self) -> u8 {
-        0x41 // removable media (plan §5.3)
+        0x41 // removable media
     }
 
     fn id(&self) -> u64 {
@@ -775,7 +775,7 @@ impl SpcDevice for CdromDrive<'_> {
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
         if loej && !load {
-            // Eject (plan §6.5).
+            // Eject.
             if self.prevent_removal {
                 return SpcEffect::RemovalPrevented;
             }
@@ -787,7 +787,7 @@ impl SpcDevice for CdromDrive<'_> {
             }
             SpcEffect::Good
         } else if loej && load {
-            // Load on empty tray → media_requested (plan §6.5/§6.6).
+            // Load on empty tray → media_requested (plan /).
             if self.media.is_none() {
                 self.tray_open = false;
                 self.media_requested = true;
@@ -844,9 +844,9 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
     }
 }
 
-// ── Builder (plan §11.3) ───────────────────────────────────────────
+// ── Builder ───────────────────────────────────────────
 
-/// Builder for `CdromDrive` (plan §11.3).
+/// Builder for `CdromDrive`.
 ///
 /// Constructs the drive identity; media is injected at runtime via
 /// `load()`.
@@ -880,7 +880,7 @@ impl CdromDriveBuilder {
         self
     }
 
-    /// Enable/disable eject and lock (plan §5.3 true-device calibration).
+    /// Enable/disable eject and lock (plan  true-device calibration).
     pub fn eject_capable(mut self, eject: bool) -> Self {
         self.caps.eject = eject;
         self.caps.lock = eject;

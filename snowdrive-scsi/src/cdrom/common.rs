@@ -1,4 +1,4 @@
-//! CD-ROM common device layer (plan §3.2 / §8.2).
+//! CD-ROM common device layer (plan  / ).
 //!
 //! [`CdromDeviceCommon`] holds the shared SPC-level state (sense, prevent,
 //! profile) and implements [`SpcDevice`] so that all three CD-ROM device
@@ -6,7 +6,7 @@
 //! INQUIRY / MODE SENSE / REQUEST SENSE / GET CONFIGURATION common
 //! features to a single code path via field embedding (composition).
 //!
-//! Per plan §5.3, only the *synthesis* of MMC responses is shared here:
+//! Per, only the *synthesis* of MMC responses is shared here:
 //! [`build_get_config_response`] and [`build_read_disc_info`] lay out the
 //! bytes for the MMC field structure, taking the device's state as
 //! parameters.  The per-device command dispatch (which state it feeds,
@@ -20,7 +20,7 @@ use crate::scsi::spc::{DeviceIdentity, SpcDevice, SpcEffect};
 /// CD-ROM logical block size (Mode 1: 2048 data bytes per sector).
 pub const SECTOR_SIZE: u32 = 2048;
 
-/// INQUIRY identity for CD-ROM devices (plan §8.2): SCSI family, with
+/// INQUIRY identity for CD-ROM devices: SCSI family, with
 /// SPC-4 and MMC-6 version descriptors.
 pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
@@ -29,16 +29,16 @@ pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
 };
 
-/// Current Profile code for GET CONFIGURATION (MMC-6 §6.6).
+/// Current Profile code for GET CONFIGURATION (MMC-6 ).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentProfile {
     /// 0x0008 — CD-ROM (images ≤ 700 MiB).
     CdRom,
     /// 0x0010 — DVD-ROM (images > 700 MiB).
     DvdRom,
-    /// 0x0009 — CD-R (Phase 3, writable bundle).
+    /// 0x0009 — CD-R — CD-R recordable media.
     CdR,
-    /// 0x000A — CD-RW (Phase 4).
+    /// 0x000A — CD-RW.
     CdRw,
     /// 0x001A — DVD+RW (UdfRw random-writable media, plan commit 3).
     DvdRw,
@@ -56,7 +56,7 @@ impl CurrentProfile {
         }
     }
 
-    /// Pick the profile from a capacity in bytes (plan §8.2 table).
+    /// Pick the profile from a capacity in bytes (plan  table).
     pub fn from_capacity(capacity: u64) -> Self {
         if capacity <= 700 * 1024 * 1024 {
             Self::CdRom
@@ -66,7 +66,7 @@ impl CurrentProfile {
     }
 }
 
-/// CD-ROM common state shared by all three CD device types (plan §3.2).
+/// CD-ROM common state shared by all three CD device types.
 ///
 /// Each concrete device embeds this struct as a field (composition) and
 /// delegates SPC commands to `execute_spc(&mut self.common, ...)`.
@@ -116,7 +116,7 @@ impl SpcDevice for CdromDeviceCommon {
     }
 
     fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
-        // CD-ROM: START STOP UNIT accepted and ignored (plan §8.2).
+        // CD-ROM: START STOP UNIT accepted and ignored.
         SpcEffect::Good
     }
 
@@ -127,7 +127,7 @@ impl SpcDevice for CdromDeviceCommon {
 
 // ── CD-ROM MODE SENSE pages ─────────────────────────────────────────
 
-/// Caching page (0x08, SPC-4 §7.4.7): WCE=0, RCD=0, DRA=1.
+/// Caching page (0x08, SPC-4 ): WCE=0, RCD=0, DRA=1.
 const CACHING_PAGE: [u8; 20] = [
     0x88, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0,
 ];
@@ -135,11 +135,11 @@ const CACHING_PAGE: [u8; 20] = [
 /// Vendor-specific page (0x00).
 const VENDOR_PAGE: [u8; 4] = [0x00, 2, 0x00, 0x08];
 
-/// CD-ROM Parameters page (0x0D, MMC-6 §6.12.2): page_length=2,
+/// CD-ROM Parameters page (0x0D, MMC-6 ): page_length=2,
 /// sector_size=2048 (big-endian u16).
 const CDROM_PARAMS: [u8; 4] = [0x0D, 0x02, 0x08, 0x00];
 
-/// CD-ROM Audio Control page (0x0E, MMC-6 §6.12.3): page_length=14,
+/// CD-ROM Audio Control page (0x0E, MMC-6 ): page_length=14,
 /// no audio.  Total = 2 + 14 = 16 bytes.
 const CDROM_AUDIO: [u8; 16] = [
     0x0E, 0x0E, // page code, page length = 14
@@ -153,7 +153,7 @@ const CDROM_AUDIO: [u8; 16] = [
 
 /// Device-declared capability set — the single model every
 /// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
-/// 0x2A page) is built from (plan §5.3). Devices feed their capabilities;
+/// 0x2A page) is built from. Devices feed their capabilities;
 /// the shared builders only lay out bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdromCapabilities {
@@ -190,7 +190,7 @@ pub struct CdromCapabilities {
     /// have this feature (it belongs to DVD-RAM), but the Windows cdrom
     /// class driver gates all optical formatting on it.
     pub defect_management: bool,
-    /// Write-side extras (Phase 3+ CD-R/CD-RW).
+    /// Write-side extras (CD-R/CD-RW).
     pub write_cdr: bool,
     pub write_cdrw: bool,
     pub test_write: bool,
@@ -424,7 +424,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 // ── GET CONFIGURATION common features builder ───────────────────────
 
 /// Build GET CONFIGURATION feature descriptors common to all CD-ROM
-/// devices (plan §8.2).  Writes into `buf[off..]` and returns the new
+/// devices.  Writes into `buf[off..]` and returns the new
 /// offset.  `profile` is the current profile; `last_lba` feeds the Random
 /// Writable feature (ignored unless `caps.random_writable`).
 ///
@@ -459,7 +459,7 @@ pub fn build_get_config_features(
     let include = |code: u16| code >= start_feature;
 
     // Profile List (0x0000) is required in EVERY GET CONFIGURATION response
-    // per MMC-6 §6.6. It identifies the profiles supported by the drive;
+    // per MMC-6  It identifies the profiles supported by the drive;
     // the mounted profile is marked current.
     if matches!(profile, CurrentProfile::DvdRw) {
         const PROFILES: [u16; 14] = [
@@ -664,7 +664,7 @@ pub fn build_get_config_response<'a>(
     }
 }
 
-/// Build the READ BUFFER CAPACITY response (MMC-6 §6.17.3.1, Table 342):
+/// Build the READ BUFFER CAPACITY response (MMC-6 , Table 342):
 /// 12-byte structure with Data Length = 10. `buffer_len` / `blank_len` are
 /// the whole / unused buffer bytes (0 for a drive without a write buffer).
 pub fn build_read_buffer_capacity<'a>(
@@ -687,8 +687,8 @@ pub fn build_read_buffer_capacity<'a>(
 }
 
 /// Disc state parameters for the Standard Disc Information response
-/// (MMC-6 §6.21.3.1). Each device feeds its own state — this struct only
-/// transports values, it never reads device state (plan §5.3).
+/// (MMC-6 ). Each device feeds its own state — this struct only
+/// transports values, it never reads device state.
 pub struct DiscInfo {
     /// Disc Status (MMC-6 Table 367): 0=empty, 1=incomplete, 2=finalized.
     pub disc_status: u8,
@@ -712,10 +712,10 @@ pub struct DiscInfo {
     pub lead_out_lba: u32,
 }
 
-/// Build the Standard Disc Information response (MMC-6 §6.21.3.1) into
+/// Build the Standard Disc Information response (MMC-6 ) into
 /// `data`, bounded by `alloc`. Returns a Data-In outcome carrying the
 /// synthesized bytes (`immediate`). An `alloc` of zero is not an error and
-/// yields an empty data phase (MMC-6 §6.21.2.2).
+/// yields an empty data phase (MMC-6 ).
 pub fn build_read_disc_info<'a>(
     data: &'a mut [u8],
     alloc: u16,
@@ -734,7 +734,7 @@ pub fn build_read_disc_info<'a>(
     buf[5] = info.first_track;
     buf[6] = info.last_track;
     // Byte 7: DID_V/DBC_V/DAC_V clear, URU=1 (unrestricted write use,
-    // MMC-6 §6.21.3.1.12 — zero marks the disc "restricted use", which
+    // MMC-6  — zero marks the disc "restricted use", which
     // requires a Write Parameters Page app code and makes Windows refuse
     // writes), MRW Status (bits 1:0).
     buf[7] = 0x20 | (info.mrw_status & 0x03);
