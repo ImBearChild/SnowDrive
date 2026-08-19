@@ -622,6 +622,7 @@ impl<B: BlockStorage> UdfRwDevice<B> {
             start,
             alloc,
             self.max_lba().min(u32::MAX as u64) as u32,
+            true,
         )
     }
 

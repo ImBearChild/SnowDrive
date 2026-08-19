@@ -342,7 +342,7 @@ impl<B: BlockStorage> CdromDevice<B> {
             sessions: 1,
             first_track: 1,
             last_track: 1,
-            disc_type: 0x20, // CD-ROM XA
+            disc_type: 0x00, // CD-ROM (not XA)
             mrw_status: 0,
             lead_out_lba: self.lead_out_lba(),
         };
@@ -397,6 +397,7 @@ impl<B: BlockStorage> CdromDevice<B> {
             start,
             alloc,
             0,
+            true,
         )
     }
 }
@@ -727,7 +728,7 @@ mod tests {
         assert_eq!(&buf[0..2], &[0x00, 0x32]); // length
         assert_eq!(buf[2], 0x0E); // finalized, complete session, data CD (Table 365)
         assert_eq!(buf[3], 1); // first track
-        assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
+        assert_eq!(buf[8], 0x00); // disc type CD-ROM (not XA)
                                   // 100 sectors → lead-out LBA 100 (0x00000064).
         assert_eq!(&buf[20..24], &100u32.to_be_bytes());
     }

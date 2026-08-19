@@ -507,6 +507,11 @@ impl<'a> CdromDrive<'a> {
         }
         let profile_code = self.current_profile_code();
         let last_lba = self.max_lba().min(u32::MAX as u64) as u32;
+        // Feature current bit: device-level features (Core, Removable,
+        // Write Protect) are always current; media-dependent features
+        // (Random Readable, Multi-Read, CD/DVD Read, write features)
+        // are current only when media is present and readable (§6.4).
+        let media_current = self.media.is_some();
         // Build into a local scratch buffer, patch profile code, then copy.
         let mut scratch = [0u8; 512];
         {
@@ -518,6 +523,7 @@ impl<'a> CdromDrive<'a> {
                 start,
                 512,
                 last_lba,
+                media_current,
             );
         }
         // Patch profile code (bytes 6-7).

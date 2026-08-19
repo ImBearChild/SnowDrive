@@ -481,7 +481,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             sessions: 1,
             first_track: 1,
             last_track: 1,
-            disc_type: 0x20, // CD-ROM XA
+            disc_type: 0x00, // CD-ROM (not XA)
             mrw_status: 0,
             lead_out_lba: self.lead_out_lba(),
         };
@@ -532,6 +532,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
             start,
             alloc,
             0,
+            true,
         )
     }
 }
@@ -828,8 +829,10 @@ mod tests {
         assert!(n >= 8);
         // Current profile (bytes 6-7) = CD-ROM (0x0008) for small trees.
         assert_eq!(&out[6..8], &[0x00, 0x08]);
-        // Feature list starts at byte 8.
-        assert!(out[8] == 0x00 && out[9] == 0x01); // Core
+        // Feature list starts at byte 8; Profile List (0x0000) first,
+        // then Core (0x0001) at byte 16.
+        assert!(out[8] == 0x00 && out[9] == 0x00); // Profile List
+        assert!(out[16] == 0x00 && out[17] == 0x01); // Core
     }
 
     #[test]
@@ -865,7 +868,7 @@ mod tests {
         assert_eq!(&buf[0..2], &[0x00, 0x32]); // length
         assert_eq!(buf[2], 0x0E); // finalized, complete session, data CD (Table 365)
         assert_eq!(buf[3], 1); // first track
-        assert_eq!(buf[8], 0x20); // disc type CD-ROM XA
+        assert_eq!(buf[8], 0x00); // disc type CD-ROM (not XA)
                                   // Lead-out = layout total (31 sectors for the sample tree).
         assert_eq!(&buf[20..24], &31u32.to_be_bytes());
 
