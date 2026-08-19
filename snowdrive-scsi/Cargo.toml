@@ -1,0 +1,31 @@
+[package]
+name = "snowdrive-scsi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SnowDrive SCSI: core + iSCSI + USB MSC + CD-ROM device emulation"
+
+[features]
+default = ["std"]
+std = ["embedded-io/std", "snowdrive-common/std", "snowdrive-disc/std"]
+scsi = []
+iso9660 = []
+udf_void = []
+iscsi = ["scsi"]
+cdrom = ["scsi"]
+livefs = ["cdrom", "iso9660", "snowdrive-disc/iso9660"]
+usb = ["scsi"]
+log = ["dep:log", "snowdrive-common/log"]
+defmt = ["dep:defmt", "snowdrive-common/defmt"]
+
+[dependencies]
+embedded-io = "0.7"
+heapless = "0.8"
+snowdrive-common = { path = "../snowdrive-common", default-features = false }
+snowdrive-disc = { path = "../snowdrive-disc", default-features = false }
+log = { version = "0.4", optional = true, default-features = false }
+defmt = { version = "1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+usb-gadget = "1.1"
+bytes = "1"

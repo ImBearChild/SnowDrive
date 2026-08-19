@@ -57,7 +57,9 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     pub fn formatted(backend: &mut B) -> bool {
         let mut sector = [0u8; SECTOR_SIZE as usize];
         let off = u64::from(crate::udf_void::AVDP_LBA) * u64::from(SECTOR_SIZE);
-        if backend.read(off, &mut sector).is_err() {
+        if backend.seek(embedded_io::SeekFrom::Start(off)).is_err()
+            || backend.read_exact(&mut sector).is_err()
+        {
             return false;
         }
         is_avdp(&sector)
@@ -119,9 +121,13 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         let crc = sbd_crc(&layout, scratch).map_err(UdfRwError::Layout)?;
         gen_sector(&layout, layout.sbd_lba, &mut sector);
         patch_sbd_crc(&mut sector, crc);
+        let off = u64::from(layout.sbd_lba) * u64::from(SECTOR_SIZE);
         backend
-            .write(u64::from(layout.sbd_lba) * u64::from(SECTOR_SIZE), &sector)
-            .map_err(UdfRwError::Block)?;
+            .seek(embedded_io::SeekFrom::Start(off))
+            .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
+        backend
+            .write_all(&sector)
+            .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
         for lba in (layout.sbd_lba + 1)..(layout.sbd_lba + layout.sbd_sectors) {
             write_sector(&mut backend, &layout, lba, &mut sector)?;
         }
@@ -133,7 +139,7 @@ impl<B: BlockStorage> UdfRwMedia<B> {
 
     /// Capacity in bytes (the backend length).
     pub fn capacity(&self) -> u64 {
-        self.backend.capacity()
+        BlockStorage::capacity(&self.backend)
     }
 
     /// Largest readable LBA (`capacity / 2048 − 1`, saturating).
@@ -158,17 +164,28 @@ impl<B: BlockStorage> UdfRwMedia<B> {
 
     /// Read from the byte plane (target data path).
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        self.backend.read(offset, buf)
+        self.backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
+        self.backend
+            .read_exact(buf)
+            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
     }
 
     /// Write to the byte plane (target data path).
     pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
-        self.backend.write(offset, buf)
+        self.backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
+        self.backend
+            .write_all(buf)
+            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
     }
 
     /// Flush the byte plane.
     pub fn sync(&mut self) -> Result<(), BlockStorageError> {
-        self.backend.sync()
+        BlockStorage::sync(&mut self.backend)
+            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
     }
 
     /// Clear the logical medium as the destructive part of FORMAT UNIT.
@@ -179,7 +196,12 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         let mut offset = 0u64;
         while offset < self.capacity() {
             let len = (self.capacity() - offset).min(zeroes.len() as u64) as usize;
-            self.backend.write(offset, &zeroes[..len])?;
+            self.backend
+                .seek(embedded_io::SeekFrom::Start(offset))
+                .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
+            self.backend
+                .write_all(&zeroes[..len])
+                .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
             offset += len as u64;
         }
         Ok(())
@@ -201,7 +223,12 @@ fn write_sector<B: BlockStorage>(
 ) -> Result<(), UdfRwError> {
     gen_sector(layout, lba, sector);
     let off = u64::from(lba) * u64::from(SECTOR_SIZE);
-    backend.write(off, sector).map_err(UdfRwError::Block)
+    backend
+        .seek(embedded_io::SeekFrom::Start(off))
+        .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
+    backend
+        .write_all(sector)
+        .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))
 }
 
 // ── SCSI device ─────────────────────────────────────────────────────
@@ -616,8 +643,8 @@ impl<B: BlockStorage> UdfRwDevice<B> {
         buf[4] = 1; // number of sessions
         buf[5] = 1; // first track in last session
         buf[6] = 1; // last track in last session
-        // FORMAT UNIT is synchronous in this emulation, so report background
-        // formatting complete rather than leaving Windows in MRW active state.
+                    // FORMAT UNIT is synchronous in this emulation, so report background
+                    // formatting complete rather than leaving Windows in MRW active state.
         buf[7] = 0x23; // URU=1 | MRW=11b (background format complete)
         buf[8] = 0x00; // Disc Type is defined only for CD media (Table 365)
         let n = buf.len().min(alloc as usize).min(data.len());
@@ -1526,7 +1553,7 @@ mod tests {
         assert_eq!(buf[0], 0x3B, "mode data length");
         assert_eq!(buf[1], 0x41, "DVD+RW medium type");
         assert_eq!(buf[4], 0x2A); // page code
-        // Page byte 2 (buf[6]): CD-R/CD-RW read, Mode 2, Multi-Session, CD-DA.
+                                  // Page byte 2 (buf[6]): CD-R/CD-RW read, Mode 2, Multi-Session, CD-DA.
         assert_eq!(buf[6] & 0x40, 0x40, "CD-R read");
         assert_eq!(buf[6] & 0x80, 0x80, "CD-RW read");
         // Page byte 3 (buf[7]): DVD read.

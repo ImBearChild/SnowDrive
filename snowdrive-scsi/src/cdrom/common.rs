@@ -258,7 +258,7 @@ pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     burn_proof: true,
     num_volume_levels: 0,
     buffer_size: 0,
-    max_read_speed: 0x2B48,  // 11080 KB/s ≈ 32x CD
+    max_read_speed: 0x2B48, // 11080 KB/s ≈ 32x CD
     max_write_speed: 0x2B48,
     ..CdromCapabilities::read_only_cd_rom()
 };

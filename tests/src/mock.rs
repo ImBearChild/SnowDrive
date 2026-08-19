@@ -5,12 +5,14 @@
 #[cfg(test)]
 mod tests {
     use crate::mock_conn::MockConn;
-    use snowdrive::common::block_storage::RamBackend;
-    use snowdrive::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
-    use snowdrive::iscsi::target::{LoginStage, Session, StepResult};
-    use snowdrive::scsi::block::BlockDevice;
-    use snowdrive::scsi::device::ScsiDevice;
-    use snowdrive::MIN_DATA_LEN;
+    use snowdrive_scsi::common::block_storage::RamBackend;
+    use snowdrive_scsi::iscsi::pdu::{
+        flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE,
+    };
+    use snowdrive_scsi::iscsi::target::{LoginStage, Session, StepResult};
+    use snowdrive_scsi::scsi::block::BlockDevice;
+    use snowdrive_scsi::scsi::device::ScsiDevice;
+    use snowdrive_scsi::MIN_DATA_LEN;
 
     /// iSCSI target scratch buffer: BHS header + data area.
     const WORK_LEN: usize = MIN_DATA_LEN + BHS_SIZE;
@@ -808,7 +810,7 @@ mod tests {
 
     #[test]
     fn serve_conn_login_then_logout() {
-        use snowdrive::iscsi::target::serve_conn;
+        use snowdrive_scsi::iscsi::target::serve_conn;
 
         let mut conn = MockConn::new();
         let mut session = Session::default();
@@ -1025,9 +1027,9 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_and_cdblock_dispatch() {
-        use snowdrive::scsi::backend::BlockBackend;
-        use snowdrive::scsi::cdblock::CDBlockDevice;
-        use snowdrive::scsi::device::Device;
+        use snowdrive_scsi::scsi::backend::BlockBackend;
+        use snowdrive_scsi::scsi::cdblock::CDBlockDevice;
+        use snowdrive_scsi::scsi::device::Device;
 
         let dir = std::env::temp_dir();
         let iso = dir.join(format!("snowscsi_mock_cdblock_{}.iso", std::process::id()));
@@ -1110,11 +1112,11 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_cdflat_and_livefs_dispatch() {
-        use snowdrive::cdrom::CdLiveFsDevice;
-        use snowdrive::cdrom::CdromDevice;
-        use snowdrive::scsi::backend::{BlockBackend, FileBackend};
-        use snowdrive::scsi::device::Device;
-        use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
+        use snowdrive_scsi::cdrom::CdLiveFsDevice;
+        use snowdrive_scsi::cdrom::CdromDevice;
+        use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
+        use snowdrive_scsi::scsi::device::Device;
+        use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 
         // LUN 1 source: a flat ISO file (0xCD sectors).
         let dir = std::env::temp_dir();
@@ -1136,11 +1138,7 @@ mod tests {
         ));
         let d1 = Device::CdFlat(flat);
         // Extract the live file's LBA before moving the device into the enum.
-        let live = CdLiveFsDevice::new(
-            FsBackend::Std(StdFsBackend::new(&tree.to_string_lossy())),
-            "TEST",
-        )
-        .unwrap();
+        let live = CdLiveFsDevice::new(StdFsBackend::new(&tree.to_string_lossy()), "TEST").unwrap();
         let live_lba = live.layout().extents[0].lba;
         let d2 = Device::CdLiveFs(live);
         let mut devs = [d0, d1, d2];

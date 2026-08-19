@@ -71,7 +71,7 @@ impl CDBlockDevice {
     }
 
     /// Raw backend access (target data path reads chunks via
-    /// [`BlockStorage::read`]; the device is read-only, so only reads are
+    /// [`BlockStorage`]; the device is read-only, so only reads are
     /// meaningful).
     pub fn backend(&mut self) -> &mut FileBackend {
         &mut self.backend
@@ -79,7 +79,7 @@ impl CDBlockDevice {
 
     /// Image size in bytes (from the file opened at construction).
     pub fn capacity(&self) -> u64 {
-        self.backend.capacity()
+        BlockStorage::capacity(&self.backend)
     }
 
     /// Largest readable LBA: `(file_size / 2048) - 1`. Saturates to 0 for
@@ -102,13 +102,25 @@ impl CDBlockDevice {
     /// Read data from the backend (target data path), setting MEDIUM ERROR
     /// sense on failure.
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        match self.backend.read(offset, buf) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
-                Err(e)
-            }
+        use embedded_io::Read;
+        use embedded_io::Seek;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(BlockStorageError::OutOfBounds)?;
+        if end > BlockStorage::capacity(&self.backend) {
+            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+            return Err(BlockStorageError::OutOfBounds);
         }
+        if self
+            .backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .is_err()
+            || self.backend.read_exact(buf).is_err()
+        {
+            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
+        }
+        Ok(())
     }
 
     /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `data`
@@ -452,7 +464,7 @@ impl SpcDevice for CDBlockDevice {
     }
 
     fn id(&self) -> u64 {
-        self.backend.capacity()
+        BlockStorage::capacity(&self.backend)
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {
@@ -584,9 +596,10 @@ mod tests {
     fn cdblock_backend_is_read_only() {
         let f = TempFile::new(2048);
         let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        use embedded_io::Write;
         assert_eq!(
-            dev.backend().write(0, &[0xAA; 16]),
-            Err(BlockStorageError::NotWritable)
+            dev.backend().write(&[0xAA; 16]),
+            Err(embedded_io::ErrorKind::Other)
         );
     }
 
@@ -596,7 +609,12 @@ mod tests {
         std::fs::write(&f.path, vec![0x42u8; 4096]).unwrap();
         let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
         let mut buf = [0u8; 4];
-        dev.backend().read(2048, &mut buf).unwrap();
+        use embedded_io::Read;
+        use embedded_io::Seek;
+        dev.backend()
+            .seek(embedded_io::SeekFrom::Start(2048))
+            .unwrap();
+        dev.backend().read_exact(&mut buf).unwrap();
         assert_eq!(buf, [0x42; 4]);
     }
 

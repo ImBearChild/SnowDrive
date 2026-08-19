@@ -2,7 +2,7 @@
 //!
 //! The device scans a host directory tree via [`FsStorage`] at
 //! construction, computes an ISO9660/Joliet LBA layout with the pure
-//! algorithms in [`crate::iso9660::live`], and serves it as a read-only
+//! algorithms in [`snowdrive_disc::live`], and serves it as a read-only
 //! CD-ROM.  Metadata sectors (PVD / SVD / Path Table / root directory)
 //! are generated on the fly by [`gen_sector`]; file-data sectors are
 //! read from the host filesystem via [`resolve`] → `fs.read(handle, ...)`.
@@ -15,16 +15,16 @@ use crate::cdrom::common::{
     build_get_config_response, build_read_buffer_capacity, build_read_disc_info, cdrom_mode_page,
     CdromDeviceCommon, CurrentProfile, DiscInfo, CDROM_IDENTITY, READ_ONLY_CDROM_CAPS,
 };
-use crate::common::fs_storage::{DirEntry, FileHandle, FsError, FsStorage, OpenOptions};
-use crate::iso9660::live::{
-    compute_layout, gen_sector, resolve, FileEntry, IsoError, Layout, MAX_FILES, MAX_PATH_LEN,
-    SECTOR_SIZE,
-};
+use crate::common::fs_storage::{DirEntry, FsError, FsStorage, OpenOptions};
 use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, op, Sense, SenseKey,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
+use snowdrive_disc::live::{
+    compute_layout, gen_sector, resolve, FileEntry, IsoError, Layout, MAX_FILES, MAX_PATH_LEN,
+    SECTOR_SIZE,
+};
 
 /// Directory-scan buffer size (entries per `read_dir` call).  A single
 /// directory with more entries than this is rejected (`DirTooLarge`) —
@@ -60,18 +60,6 @@ impl From<FsError> for CdLiveFsError {
     }
 }
 
-/// Map a filesystem error onto the block-storage error used by the
-/// SCSI data plane (`ScsiDevice::read_data`).
-impl From<FsError> for crate::scsi::backend::BlockStorageError {
-    fn from(e: FsError) -> Self {
-        match e {
-            FsError::NotFound | FsError::OutOfBounds => Self::OutOfBounds,
-            FsError::NotWritable => Self::NotWritable,
-            FsError::Io(kind) => Self::Io(kind),
-        }
-    }
-}
-
 /// Live ISO9660 CD-ROM device (plan §8.2 / §3.2 / §11.2).
 ///
 /// Generic over any [`FsStorage`] implementation (StdFsBackend on desktop,
@@ -81,13 +69,13 @@ pub struct CdLiveFsDevice<F: FsStorage> {
     pub(crate) common: CdromDeviceCommon,
     pub(crate) fs: F,
     pub(crate) layout: Layout,
-    /// Open handle per scanned entry, aligned with the `files` slice the
+    /// Open file per scanned entry, aligned with the `files` slice the
     /// layout's `extents[].file_index` indexes into (`None` for dirs).
-    pub(crate) handles: Vec<Option<FileHandle>, MAX_FILES>,
+    pub(crate) handles: Vec<Option<F::File>, MAX_FILES>,
 }
 
 /// Recursively scan `dir_rel` ("" = root), appending entries and opening
-/// file handles.  Directories appear before their children.
+/// files.  Directories appear before their children.
 ///
 /// Each recursion level owns its own `read_dir` buffer: the child listing
 /// would otherwise overwrite the parent's not-yet-processed entries.
@@ -95,7 +83,7 @@ fn scan_dir<F: FsStorage>(
     fs: &mut F,
     dir_rel: &str,
     files: &mut Vec<FileEntry, MAX_FILES>,
-    handles: &mut Vec<Option<FileHandle>, MAX_FILES>,
+    handles: &mut Vec<Option<F::File>, MAX_FILES>,
 ) -> Result<(), CdLiveFsError> {
     let mut buf: [DirEntry; SCAN_BUF] = core::array::from_fn(|_| DirEntry {
         name: heapless::String::new(),
@@ -147,7 +135,7 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
     /// `label` is the ISO9660 volume label (truncated to 16 ASCII chars).
     pub fn new(mut fs: F, label: &str) -> Result<Self, CdLiveFsError> {
         let mut files = Vec::<FileEntry, MAX_FILES>::new();
-        let mut handles = Vec::<Option<FileHandle>, MAX_FILES>::new();
+        let mut handles = Vec::<Option<F::File>, MAX_FILES>::new();
         scan_dir(&mut fs, "", &mut files, &mut handles)?;
         let layout = compute_layout(&files, label).map_err(|e: IsoError| match e {
             IsoError::TooManyFiles => CdLiveFsError::TooManyFiles,
@@ -211,21 +199,26 @@ impl<F: FsStorage> CdLiveFsDevice<F> {
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
         let metadata_end = self.layout.first_file_lba;
         if lba < metadata_end {
-            // System area (zeros) + descriptors + path tables + all
-            // directory extents (PVD/SVD/Path Table/root + sub-directories).
             gen_sector(&self.layout, lba, sector);
             return Ok(());
         }
-        if let Some((file_index, file_offset, remaining)) = resolve(&self.layout, lba) {
-            let handle = self.handles[file_index]
-                .ok_or(crate::scsi::backend::BlockStorageError::OutOfBounds)?;
-            let need = (remaining as usize).min(SECTOR_SIZE as usize);
-            let got = self.fs.read(&handle, file_offset, &mut sector[..need])?;
-            sector[got..need].fill(0);
-            Ok(())
-        } else {
-            Err(crate::scsi::backend::BlockStorageError::OutOfBounds)
-        }
+        let (file_index, file_offset, remaining) = match resolve(&self.layout, lba) {
+            Some(v) => v,
+            None => return Err(crate::scsi::backend::BlockStorageError::OutOfBounds),
+        };
+        let file = self.handles[file_index]
+            .as_mut()
+            .ok_or(crate::scsi::backend::BlockStorageError::OutOfBounds)?;
+        let need = (remaining as usize).min(SECTOR_SIZE as usize);
+        use embedded_io::Read;
+        use embedded_io::Seek;
+        file.seek(embedded_io::SeekFrom::Start(file_offset))
+            .map_err(|_| crate::scsi::backend::BlockStorageError::OutOfBounds)?;
+        let got = file
+            .read(&mut sector[..need])
+            .map_err(|_| crate::scsi::backend::BlockStorageError::OutOfBounds)?;
+        sector[got..need].fill(0);
+        Ok(())
     }
 
     /// Read data from the virtual disc (target data path).  Reads are
@@ -669,7 +662,7 @@ mod tests {
     #[test]
     fn scan_builds_file_tree_and_layout() {
         let (_dir, fs) = sample_tree();
-        let mut dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
+        let dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
         let layout = dev.layout();
         assert_eq!(layout.label.as_str(), "TEST");
         // 3 files + 1 dir (SUB) = 4 entries; extents only for files.
@@ -893,7 +886,7 @@ mod tests {
     fn empty_tree_is_valid_empty_disc() {
         let dir = temp_dir("empty");
         let fs = StdFsBackend::new(&dir.to_string_lossy());
-        let mut dev = CdLiveFsDevice::new(fs, "EMPTY").unwrap();
+        let dev = CdLiveFsDevice::new(fs, "EMPTY").unwrap();
         // Empty tree → metadata only (no file area).
         assert_eq!(dev.layout().extents.len(), 0);
         // READ CAPACITY → max_lba = 24 (descriptors 16-18, PVD PT-L/M 19-20,
@@ -934,24 +927,58 @@ mod tests {
         use crate::common::fs_storage::OpenOptions;
         use crate::scsi::fs_backend::FsError;
 
+        struct MockFile {
+            data: &'static [u8],
+            pos: u64,
+        }
+
+        impl embedded_io::ErrorType for MockFile {
+            type Error = embedded_io::ErrorKind;
+        }
+
+        impl embedded_io::Read for MockFile {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+                let available = self.data.len().saturating_sub(self.pos as usize);
+                let n = buf.len().min(available);
+                buf[..n].copy_from_slice(&self.data[self.pos as usize..self.pos as usize + n]);
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+
+        impl embedded_io::Write for MockFile {
+            fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+                let _ = buf;
+                Err(embedded_io::ErrorKind::Unsupported)
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        impl embedded_io::Seek for MockFile {
+            fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+                self.pos = match pos {
+                    embedded_io::SeekFrom::Start(off) => off,
+                    embedded_io::SeekFrom::Current(off) => (self.pos as i64 + off) as u64,
+                    embedded_io::SeekFrom::End(off) => (self.data.len() as i64 + off) as u64,
+                };
+                Ok(self.pos)
+            }
+        }
+
         struct MockFs;
 
         impl FsStorage for MockFs {
-            fn open(&mut self, path: &str, _opts: OpenOptions) -> Result<FileHandle, FsError> {
-                // Only the real tree's paths exist.
+            type File = MockFile;
+
+            fn open(&mut self, path: &str, _opts: OpenOptions) -> Result<MockFile, FsError> {
                 match path {
-                    "sub/x" | "sub/y" | "tail" => Ok(FileHandle::new(0)),
+                    "sub/x" | "sub/y" | "tail" => Ok(MockFile { data: &[], pos: 0 }),
                     _ => Err(FsError::NotFound),
                 }
             }
-            fn read(&mut self, _h: &FileHandle, _o: u64, b: &mut [u8]) -> Result<usize, FsError> {
-                b.fill(0);
-                Ok(b.len())
-            }
-            fn write(&mut self, _h: &FileHandle, _o: u64, _b: &[u8]) -> Result<(), FsError> {
-                Ok(())
-            }
-            fn close(&mut self, _h: FileHandle) {}
+            fn close(&mut self, _file: MockFile) {}
             fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError> {
                 let mk = |name: &str, is_dir: bool, size: u64| {
                     let mut s = heapless::String::<256>::new();
@@ -962,7 +989,6 @@ mod tests {
                         size,
                     }
                 };
-                // Root: a directory first, then a file (order is the point).
                 let list: &[DirEntry] = match path {
                     "" => &[mk("sub", true, 0), mk("tail", false, 3)],
                     "sub" => &[mk("x", false, 1), mk("y", false, 2)],

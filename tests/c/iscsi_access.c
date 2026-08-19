@@ -5,6 +5,8 @@
  * handles opaque pointers and never assumes struct layout.
  *
  */
+#include <stddef.h>
+#include <stdint.h>
 #include <iscsi/scsi-lowlevel.h>
 
 int snow_task_status(const struct scsi_task *t)

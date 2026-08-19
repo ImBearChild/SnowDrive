@@ -12,7 +12,7 @@ use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
 #[cfg(all(feature = "livefs", feature = "std"))]
-use crate::scsi::fs_backend::FsBackend;
+use crate::scsi::fs_backend::StdFsBackend;
 use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
@@ -145,7 +145,7 @@ pub enum Device<'a> {
     UdfRw(UdfRwDevice<BlockBackend<'a>>),
     /// Live ISO9660 CD-ROM over a host directory (Phase 2e).
     #[cfg(all(feature = "livefs", feature = "std"))]
-    CdLiveFs(CdLiveFsDevice<FsBackend>),
+    CdLiveFs(CdLiveFsDevice<StdFsBackend>),
 }
 
 impl ScsiDevice for Device<'_> {
@@ -220,7 +220,7 @@ impl ScsiDevice for Device<'_> {
             #[cfg(all(feature = "cdrom", feature = "udf_void"))]
             Self::UdfRw(dev) => <UdfRwDevice<BlockBackend<'_>> as ScsiDevice>::device_type(dev),
             #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::CdLiveFs(dev) => <CdLiveFsDevice<FsBackend> as ScsiDevice>::device_type(dev),
+            Self::CdLiveFs(dev) => <CdLiveFsDevice<StdFsBackend> as ScsiDevice>::device_type(dev),
         }
     }
 }
@@ -312,13 +312,13 @@ mod tests {
     #[test]
     fn device_enum_cdlivefs_dispatch() {
         use crate::cdrom::livefs::CdLiveFsDevice;
-        use crate::scsi::fs_backend::{FsBackend, StdFsBackend};
+        use crate::scsi::fs_backend::StdFsBackend;
         let dir =
             std::env::temp_dir().join(format!("snowscsi_device_livefs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
-        let fs = FsBackend::Std(StdFsBackend::new(&dir.to_str().unwrap()));
+        let fs = StdFsBackend::new(&dir.to_str().unwrap());
         let dev = CdLiveFsDevice::new(fs, "TEST").unwrap();
         let mut dev = Device::CdLiveFs(dev);
         let mut w = work();

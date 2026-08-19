@@ -43,20 +43,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser};
-use snowdrive::cdrom::CdLiveFsDevice;
-use snowdrive::cdrom::CdromDevice;
+use snowdrive_scsi::cdrom::CdLiveFsDevice;
+use snowdrive_scsi::cdrom::CdromDevice;
 #[cfg(feature = "udf_void")]
-use snowdrive::cdrom::{UdfRwDevice, UdfRwMedia};
-use snowdrive::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
-use snowdrive::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
-use snowdrive::scsi::block::BlockDevice;
-use snowdrive::scsi::cdblock::CDBlockDevice;
-use snowdrive::scsi::device::Device;
-use snowdrive::scsi::fs_backend::{FsBackend, StdFsBackend};
-use snowdrive::MIN_DATA_LEN;
+use snowdrive_scsi::cdrom::{UdfRwDevice, UdfRwMedia};
+use snowdrive_scsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
+use snowdrive_scsi::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
+use snowdrive_scsi::scsi::block::BlockDevice;
+use snowdrive_scsi::scsi::cdblock::CDBlockDevice;
+use snowdrive_scsi::scsi::device::Device;
+use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
+use snowdrive_scsi::MIN_DATA_LEN;
 
 #[cfg(target_os = "linux")]
-use snowdrive::usb::{
+use snowdrive_scsi::usb::{
     BotEvent, BotIo, BotIoErr, BotNeed, BotSession, BotStep, BotStepResult, CtrlAck, CtrlReply,
     CtrlReq, Gadget,
 };
@@ -282,16 +282,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 /// Flush every backend; errors are reported to stderr but not fatal.
 fn sync_devices(devices: &mut [Device<'_>]) {
     for (i, dev) in devices.iter_mut().enumerate() {
-        let result = match dev {
-            Device::Block(d) => d.backend().sync(),
-            Device::CdBlock(d) => d.backend().sync(),
-            Device::CdFlat(d) => d.backend().sync(),
+        let failed = match dev {
+            Device::Block(d) => d.backend().sync().is_err(),
+            Device::CdBlock(d) => d.backend().sync().is_err(),
+            Device::CdFlat(d) => d.backend().sync().is_err(),
             #[cfg(all(feature = "cdrom", feature = "udf_void"))]
-            Device::UdfRw(d) => d.media().sync(),
-            Device::CdLiveFs(d) => d.sync().map_err(Into::into),
+            Device::UdfRw(d) => d.media().sync().is_err(),
+            Device::CdLiveFs(d) => d.sync().is_err(),
         };
-        if let Err(e) = result {
-            eprintln!("snowdrive: sync failed for LUN {i}: {e}");
+        if failed {
+            eprintln!("snowdrive: sync failed for LUN {i}");
         }
     }
 }
@@ -481,7 +481,7 @@ fn build_devices<'a>(
                 devices.push(Device::CdFlat(dev));
             }
             CdromSpec::Live { dir } => {
-                let fs = FsBackend::Std(StdFsBackend::new(dir));
+                let fs = StdFsBackend::new(dir);
                 let label = Path::new(dir)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -1029,7 +1029,7 @@ impl<'a> Gadget<'a> for FfsGadget {
         let ev = self.custom.try_event().ok()??;
         match ev {
             Event::SetupHostToDevice(receiver)
-                if receiver.ctrl_req().request == snowdrive::usb::BOT_RESET =>
+                if receiver.ctrl_req().request == snowdrive_scsi::usb::BOT_RESET =>
             {
                 Some(CtrlReq::BotReset {
                     ack: FfsAck {
@@ -1038,7 +1038,7 @@ impl<'a> Gadget<'a> for FfsGadget {
                 })
             }
             Event::SetupDeviceToHost(sender)
-                if sender.ctrl_req().request == snowdrive::usb::GET_MAX_LUN =>
+                if sender.ctrl_req().request == snowdrive_scsi::usb::GET_MAX_LUN =>
             {
                 Some(CtrlReq::GetMaxLun {
                     reply: FfsReply {
@@ -1217,7 +1217,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
             .to_string(),
     };
 
-    let fs = FsBackend::Std(StdFsBackend::new(&args.dir));
+    let fs = StdFsBackend::new(&args.dir);
     let dev = match CdLiveFsDevice::new(fs, &label) {
         Ok(d) => d,
         Err(e) => {
@@ -1298,7 +1298,7 @@ enum CdromSpec {
     /// `img=<iso>` → flat ISO9660, full MMC (`CdromDevice<FileBackend>`).
     Flat { path: String },
     /// `live=<dir>` → live ISO9660 over a directory
-    /// (`CdLiveFsDevice<FsBackend>`).
+    /// (`CdLiveFsDevice<StdFsBackend>`).
     Live { dir: String },
     /// `udfrw=<path>[,size=…][,mkfs=true]` or `udfrw=ram:<size>` → a
     /// random-writable DVD+RW (`UdfRwDevice`). `path = None` means RAM.

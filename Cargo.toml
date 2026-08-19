@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "snowdrive",
+    "snowdrive-common",
+    "snowdrive-disc",
+    "snowdrive-scsi",
+    "snowdrive-cli",
     "tests",
 ]

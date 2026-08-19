@@ -34,7 +34,7 @@ impl<B: BlockStorage> CdromDevice<B> {
     /// The profile is derived from the backend capacity (≤700 MiB → CD-ROM,
     /// >700 MiB → DVD-ROM).
     pub fn new(backend: B) -> Self {
-        let profile = CurrentProfile::from_capacity(backend.capacity());
+        let profile = CurrentProfile::from_capacity(BlockStorage::capacity(&backend));
         Self {
             common: CdromDeviceCommon::new(profile),
             backend,
@@ -62,7 +62,7 @@ impl<B: BlockStorage> CdromDevice<B> {
     }
 
     pub fn capacity(&self) -> u64 {
-        self.backend.capacity()
+        BlockStorage::capacity(&self.backend)
     }
 
     /// Largest readable LBA: `(capacity / 2048) - 1`. Saturates to 0 for
@@ -88,13 +88,16 @@ impl<B: BlockStorage> CdromDevice<B> {
     /// Read data from the backend (target data path), setting MEDIUM ERROR
     /// on failure.
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        match self.backend.read(offset, buf) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
-                Err(e)
-            }
+        if self
+            .backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .is_err()
+            || self.backend.read_exact(buf).is_err()
+        {
+            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
         }
+        Ok(())
     }
 
     /// Write data to the backend (target data path). For this read-only
@@ -410,7 +413,7 @@ impl<B: BlockStorage> SpcDevice for CdromDevice<B> {
     }
 
     fn id(&self) -> u64 {
-        self.backend.capacity()
+        BlockStorage::capacity(&self.backend)
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {

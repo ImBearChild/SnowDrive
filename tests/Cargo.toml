@@ -6,7 +6,9 @@ license = "MIT OR Apache-2.0"
 description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 
 [dependencies]
-snowdrive = { path = "../snowdrive", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "usb"] }
+snowdrive-scsi = { path = "../snowdrive-scsi", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "usb"] }
+snowdrive-disc = { path = "../snowdrive-disc", default-features = false, features = ["std"] }
+snowdrive-common = { path = "../snowdrive-common", default-features = false, features = ["std"] }
 embedded-io = "0.7"
 # Independent ISO9660 reader used to cross-validate the live generator's
 # output (test-only; not a dependency of the library). iso9660-no-std is

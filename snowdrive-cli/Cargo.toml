@@ -1,0 +1,38 @@
+[package]
+name = "snowdrive-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SnowDrive CLI: serve + mkisofs"
+
+[[bin]]
+name = "snowdrive"
+path = "src/main.rs"
+
+[features]
+default = ["full"]
+full = ["std", "scsi", "iscsi", "iso9660", "udf_void", "cdrom", "livefs", "usb", "log",
+        "dep:clap", "dep:ctrlc", "dep:env_logger"]
+std = ["snowdrive-scsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
+scsi = ["snowdrive-scsi/scsi"]
+iso9660 = ["snowdrive-scsi/iso9660"]
+udf_void = ["snowdrive-scsi/udf_void"]
+iscsi = ["snowdrive-scsi/iscsi"]
+cdrom = ["snowdrive-scsi/cdrom"]
+livefs = ["snowdrive-scsi/livefs"]
+usb = ["snowdrive-scsi/usb"]
+log = ["snowdrive-scsi/log", "dep:log"]
+defmt = ["snowdrive-scsi/defmt"]
+
+[dependencies]
+snowdrive-scsi = { path = "../snowdrive-scsi", default-features = false }
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
+env_logger = { version = "0.11", optional = true }
+log = { version = "0.4", optional = true, default-features = false }
+embedded-io = "0.7"
+heapless = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+usb-gadget = "1.1"
+bytes = "1"

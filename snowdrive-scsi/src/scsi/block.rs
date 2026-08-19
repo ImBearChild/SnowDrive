@@ -68,6 +68,16 @@ impl<B: BlockStorage> BlockDevice<B> {
         CommandOutcome::CheckCondition(self.sense)
     }
 
+    fn check_bounds(&self, offset: u64, len: usize) -> Result<(), BlockStorageError> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or(BlockStorageError::OutOfBounds)?;
+        if end > self.backend.capacity() {
+            return Err(BlockStorageError::OutOfBounds);
+        }
+        Ok(())
+    }
+
     /// Write received data to the backend, setting sense on failure
     /// (C `snowscsi_write_data` backend flush semantics).
     pub fn write_data(
@@ -75,11 +85,23 @@ impl<B: BlockStorage> BlockDevice<B> {
         offset: u64,
         buf: &[u8],
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        match self.backend.write(offset, buf) {
+        if let Err(e) = self.check_bounds(offset, buf.len()) {
+            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+            return Err(e);
+        }
+        if self
+            .backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .is_err()
+        {
+            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
+        }
+        match self.backend.write_all(buf) {
             Ok(()) => Ok(()),
-            Err(e) => {
+            Err(_) => {
                 self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-                Err(e)
+                Err(BlockStorageError::Io(embedded_io::ErrorKind::Other))
             }
         }
     }
@@ -90,11 +112,23 @@ impl<B: BlockStorage> BlockDevice<B> {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        match self.backend.read(offset, buf) {
+        if let Err(e) = self.check_bounds(offset, buf.len()) {
+            self.set_sense(SenseKey::MediumError, 0x11, 0);
+            return Err(e);
+        }
+        if self
+            .backend
+            .seek(embedded_io::SeekFrom::Start(offset))
+            .is_err()
+        {
+            self.set_sense(SenseKey::MediumError, 0x11, 0);
+            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
+        }
+        match self.backend.read_exact(buf) {
             Ok(()) => Ok(()),
-            Err(e) => {
+            Err(_) => {
                 self.set_sense(SenseKey::MediumError, 0x11, 0);
-                Err(e)
+                Err(BlockStorageError::Io(embedded_io::ErrorKind::Other))
             }
         }
     }
@@ -833,7 +867,7 @@ mod tests {
                 ..
             } => {
                 let r = dev.write_data(byte_offset, immediate);
-                assert_eq!(r, Err(crate::scsi::backend::BlockStorageError::NotWritable));
+                assert!(r.is_err(), "write to read-only backend must fail");
                 assert_eq!(dev.sense().key, SenseKey::MediumError);
                 assert_eq!(dev.sense().asc, asc::WRITE_FAULT);
             }

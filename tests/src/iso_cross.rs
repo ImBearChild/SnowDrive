@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use iso9660_no_std::{DirectoryEntry, ISO9660Reader, ISODirectory, ISO9660};
 
-use snowdrive::cdrom::CdLiveFsDevice;
-use snowdrive::iso9660::live::{MAX_JOLIET_NAME_CHARS, SECTOR_SIZE};
-use snowdrive::scsi::fs_backend::StdFsBackend;
+use snowdrive_disc::live::{MAX_JOLIET_NAME_CHARS, SECTOR_SIZE};
+use snowdrive_scsi::cdrom::CdLiveFsDevice;
+use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 
 /// Wrap a `std::io::Cursor` so it implements `embedded_io::{Read, Seek}`
 /// (the trait `iso9660-no-std` reads through). `read_at` seeks per LBA.

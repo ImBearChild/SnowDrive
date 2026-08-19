@@ -2,7 +2,7 @@
 //!
 //! [`FsStorage`] models a file/directory abstraction that embedded callers
 //! implement (littlefs, FatFs, etc.). The std implementation
-//! ([`StdFsBackend`]) lives in `snowscsi::fs_backend`.
+//! ([`StdFsBackend`]) lives in `snowdrive::scsi::fs_backend`.
 
 use embedded_io::ErrorKind as IoErrorKind;
 
@@ -15,27 +15,6 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// Size in bytes (0 for directories).
     pub size: u64,
-}
-
-/// Opaque file handle — concrete impls decide the internal representation.
-///
-/// Fields are private; use [`FileHandle::new`] (inside an impl) and
-/// [`FileHandle::get`] to construct / inspect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileHandle(usize);
-
-impl FileHandle {
-    /// Construct a handle wrapping `idx`. Semantic meaning is impl-defined
-    /// (array index, fd, etc.).
-    pub const fn new(idx: usize) -> Self {
-        Self(idx)
-    }
-
-    /// Extract the inner index (impl-internal; external code should not
-    /// depend on the numeric value).
-    pub const fn get(&self) -> usize {
-        self.0
-    }
 }
 
 /// Filesystem access error (`no_std`, `core::error::Error`).
@@ -66,9 +45,7 @@ impl core::error::Error for FsError {}
 
 /// Options for [`FsStorage::open`].
 ///
-/// Mirrors the no_std subset of `std::fs::OpenOptions`.  Public fields
-/// let concrete impls map to their own open semantics (std
-/// `OpenOptions` bits; FatFs `fopen` mode strings, etc.).
+/// Mirrors the no_std subset of `std::fs::OpenOptions`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpenOptions {
     pub read: bool,
@@ -78,7 +55,7 @@ pub struct OpenOptions {
 }
 
 impl OpenOptions {
-    /// Read-only probe — file must exist (used by `toc_load` buffer scan).
+    /// Read-only probe — file must exist.
     pub const fn read_only() -> Self {
         Self {
             read: true,
@@ -88,8 +65,7 @@ impl OpenOptions {
         }
     }
 
-    /// Open existing or create; read-write, no truncate (RESERVE TRACK /
-    /// re-opening track files).
+    /// Open existing or create; read-write, no truncate.
     pub const fn open_or_create() -> Self {
         Self {
             read: true,
@@ -99,8 +75,7 @@ impl OpenOptions {
         }
     }
 
-    /// Create or truncate; read-write (writing `toc.N.json` — avoids stale
-    /// tail bytes from a longer previous JSON).
+    /// Create or truncate; read-write.
     pub const fn create_or_truncate() -> Self {
         Self {
             read: true,
@@ -111,42 +86,29 @@ impl OpenOptions {
     }
 }
 
-/// Filesystem storage backend (replaces the C function-pointer table).
+/// Filesystem storage backend.
 ///
-/// Models file/directory operations.  All methods take `&mut self`.
-/// No `Send` supertrait — single-threaded targets never cross threads;
-/// call sites that need `Send` add their own bound.
+/// Namespace operations (open / close / read_dir / remove / sync) stay on
+/// the backend. **Byte-level** read/write/seek moves to the associated
+/// [`File`](FsStorage::File) type — each opened file is an independent
+/// `embedded_io::Read + Write + Seek` stream.
 pub trait FsStorage {
+    /// Each opened file is a seekable byte stream.
+    type File: embedded_io::Read + embedded_io::Write + embedded_io::Seek;
+
     /// Open a file at `path` with the given `opts`.
-    ///
-    /// Returns an opaque [`FileHandle`].  `opts` controls the open mode
-    /// (read-only, read-write, create-or-truncate, etc.).
-    fn open(&mut self, path: &str, opts: OpenOptions) -> Result<FileHandle, FsError>;
+    fn open(&mut self, path: &str, opts: OpenOptions) -> Result<Self::File, FsError>;
 
-    /// Read from an open file starting at `offset` into `buf`.
-    ///
-    /// Returns the **actual number of bytes read** (short-read at EOF).
-    fn read(&mut self, handle: &FileHandle, offset: u64, buf: &mut [u8]) -> Result<usize, FsError>;
-
-    /// Write `buf` to an open file at `offset`.
-    ///
-    /// Extends the file when writing past current length; does **not**
-    /// truncate on short writes (caller tracks length bookkeeping).
-    fn write(&mut self, handle: &FileHandle, offset: u64, buf: &[u8]) -> Result<(), FsError>;
-
-    /// Close a file handle.
-    fn close(&mut self, handle: FileHandle);
+    /// Close a file (embedded-io has no close; lifecycle managed by FsStorage).
+    fn close(&mut self, file: Self::File);
 
     /// Scan a directory, returning all entries (including sub-directories).
-    ///
-    /// Writes up to `out.len()` entries into `out`; returns the count
-    /// written.
     fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError>;
 
     /// Root directory absolute path (for ISO9660 path table).
     fn root(&self) -> &str;
 
-    /// Persist the entire filesystem (e.g. after writing `toc.N.json`).
+    /// Persist the entire filesystem.
     fn sync(&mut self) -> Result<(), FsError>;
 
     /// Remove a file (BLANK / orphan track cleanup).

@@ -635,17 +635,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "snowdrive"
+name = "snowdrive-cli"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "defmt",
  "embedded-io",
  "env_logger",
  "heapless",
  "log",
+ "snowdrive-scsi",
+ "usb-gadget",
+]
+
+[[package]]
+name = "snowdrive-common"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "embedded-io",
+ "heapless",
+ "log",
+]
+
+[[package]]
+name = "snowdrive-disc"
+version = "0.1.0"
+dependencies = [
+ "embedded-io",
+ "heapless",
+ "snowdrive-common",
+]
+
+[[package]]
+name = "snowdrive-scsi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "defmt",
+ "embedded-io",
+ "heapless",
+ "log",
+ "snowdrive-common",
+ "snowdrive-disc",
  "usb-gadget",
 ]
 
@@ -657,7 +690,9 @@ dependencies = [
  "embedded-io",
  "iso9660-no-std",
  "pkg-config",
- "snowdrive",
+ "snowdrive-common",
+ "snowdrive-disc",
+ "snowdrive-scsi",
 ]
 
 [[package]]

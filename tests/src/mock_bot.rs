@@ -7,7 +7,7 @@
 
 use core::time::Duration;
 
-use snowdrive::usb::{BotIo, BotIoErr, CtrlAck, CtrlReply, CtrlReq, Gadget};
+use snowdrive_scsi::usb::{BotIo, BotIoErr, CtrlAck, CtrlReply, CtrlReq, Gadget};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

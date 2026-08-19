@@ -8,10 +8,10 @@
 //! non-blocking `BotSession` poll core the PC driver uses.
 
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
-use snowdrive::scsi::backend::{BlockBackend, RamBackend};
-use snowdrive::scsi::block::BlockDevice;
-use snowdrive::scsi::device::{Device, ScsiDevice};
-use snowdrive::usb::{
+use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
+use snowdrive_scsi::scsi::block::BlockDevice;
+use snowdrive_scsi::scsi::device::{Device, ScsiDevice};
+use snowdrive_scsi::usb::{
     BotEvent, BotIo, BotIoErr, BotNeed, BotSession, BotStep, BotStepResult, CtrlAck, CtrlReply,
     CtrlReq, Gadget, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
 };
@@ -180,8 +180,8 @@ fn command_sequence_inquiry_read_capacity_tur() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -246,8 +246,8 @@ fn command_sequence_read_and_write_verify_backend() {
     }
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -313,8 +313,8 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -392,8 +392,8 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -422,8 +422,8 @@ fn phase_error_on_direction_mismatch() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -451,8 +451,8 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -495,8 +495,8 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -552,8 +552,8 @@ fn invalid_cbw_without_stall_falls_back_to_command() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     io.stall_available = false;
     let mut stalled = false;
@@ -589,8 +589,8 @@ fn host_probe_script_drives_serve_bot() {
     }
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut gadget = MockGadget::new();
     let mut stalled = false;
@@ -673,8 +673,8 @@ fn reset_injects_unit_attention() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -782,8 +782,8 @@ fn bot_reset_interrupts_data_phase() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut gadget = MockGadget::new();
     let mut stalled = false;
@@ -864,8 +864,8 @@ fn mode_sense_10_and_prevent_allow() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -908,8 +908,8 @@ fn request_sense_with_large_allocation_is_short_packet() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -953,8 +953,8 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
     }
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -992,8 +992,8 @@ fn data_out_host_overrun_is_drained() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
@@ -1028,8 +1028,8 @@ fn opcode_report_luns_synthesized() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut devs = [block_device(&mut ram)];
     let mut s = BotSession::new();
-    let mut work = [0u8; snowdrive::MIN_DATA_LEN];
-    let mut recv = [0u8; snowdrive::MIN_DATA_LEN];
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
