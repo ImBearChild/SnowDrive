@@ -43,6 +43,8 @@
 use core::cmp::Ordering;
 use heapless::{String, Vec};
 
+use snowdrive_common::fs_storage::{DirEntry, FsError, FsStorage, OpenOptions};
+
 /// Sector size for ISO 9660.
 pub const SECTOR_SIZE: u32 = 2048;
 
@@ -1287,6 +1289,327 @@ impl core::fmt::Display for IsoError {
 }
 
 impl core::error::Error for IsoError {}
+
+// ── LiveData: live ISO9660 over FsStorage ───────────────────────
+
+/// Directory-scan buffer size (entries per `read_dir` call).
+const SCAN_BUF: usize = 32;
+
+/// Error opening a live FS device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdLiveFsError {
+    /// Filesystem failure during the tree scan.
+    Fs(FsError),
+    /// The tree exceeds the layout capacity (MAX_FILES).
+    TooManyFiles,
+    /// A directory has more entries than the scan buffer can hold.
+    DirTooLarge,
+}
+
+impl core::fmt::Display for CdLiveFsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fs(e) => write!(f, "filesystem error: {e}"),
+            Self::TooManyFiles => write!(f, "too many files for the live layout"),
+            Self::DirTooLarge => write!(f, "directory exceeds the live scan buffer"),
+        }
+    }
+}
+
+impl core::error::Error for CdLiveFsError {}
+
+impl From<FsError> for CdLiveFsError {
+    fn from(e: FsError) -> Self {
+        Self::Fs(e)
+    }
+}
+
+impl From<IsoError> for CdLiveFsError {
+    fn from(e: IsoError) -> Self {
+        match e {
+            IsoError::TooManyFiles => Self::TooManyFiles,
+            IsoError::InvalidLabel => Self::TooManyFiles,
+        }
+    }
+}
+
+/// Live ISO9660 data plane: scans a host directory tree, computes an
+/// ISO9660/Joliet LBA layout, and serves sectors on the fly.
+///
+/// Implements [`embedded_io::Read`] + [`embedded_io::Seek`] so it can be
+/// used as a standalone ISO image reader without any SCSI dependency.
+pub struct LiveData<F: FsStorage> {
+    #[allow(dead_code)] // kept for lifetime / ownership
+    fs: F,
+    layout: Layout,
+    handles: Vec<Option<F::File>, MAX_FILES>,
+    pos: u64,
+}
+
+impl<F: FsStorage> LiveData<F> {
+    /// Scan the tree under `fs`'s root and build the live layout.
+    pub fn new(mut fs: F, label: &str) -> Result<Self, CdLiveFsError> {
+        let mut files = Vec::<FileEntry, MAX_FILES>::new();
+        let mut handles = Vec::<Option<F::File>, MAX_FILES>::new();
+        scan_dir(&mut fs, "", &mut files, &mut handles)?;
+        let layout = compute_layout(&files, label)?;
+        Ok(Self {
+            fs,
+            layout,
+            handles,
+            pos: 0,
+        })
+    }
+
+    /// Create from pre-built options (validated before scan).
+    pub fn with_opts(mut fs: F, opts: &IsoOptions) -> Result<Self, CdLiveFsError> {
+        let mut files = Vec::<FileEntry, MAX_FILES>::new();
+        let mut handles = Vec::<Option<F::File>, MAX_FILES>::new();
+        scan_dir(&mut fs, "", &mut files, &mut handles)?;
+        let layout = compute_layout_opts(&files, opts)?;
+        Ok(Self {
+            fs,
+            layout,
+            handles,
+            pos: 0,
+        })
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Total image size in bytes.
+    pub fn size(&self) -> u64 {
+        u64::from(self.layout.total) * u64::from(SECTOR_SIZE)
+    }
+
+    /// Fill one 2048-byte sector at `lba` (metadata or file data).
+    fn fill_sector(
+        &mut self,
+        lba: u32,
+        sector: &mut [u8; SECTOR_SIZE as usize],
+    ) -> Result<(), embedded_io::ErrorKind> {
+        let metadata_end = self.layout.first_file_lba;
+        if lba < metadata_end {
+            gen_sector(&self.layout, lba, sector);
+            return Ok(());
+        }
+        let (file_index, file_offset, remaining) = match resolve(&self.layout, lba) {
+            Some(v) => v,
+            None => return Err(embedded_io::ErrorKind::InvalidData),
+        };
+        let file = self.handles[file_index]
+            .as_mut()
+            .ok_or(embedded_io::ErrorKind::NotFound)?;
+        let need = (remaining as usize).min(SECTOR_SIZE as usize);
+        use embedded_io::{Read, Seek};
+        file.seek(embedded_io::SeekFrom::Start(file_offset))
+            .map_err(|_| embedded_io::ErrorKind::Other)?;
+        let got = file
+            .read(&mut sector[..need])
+            .map_err(|_| embedded_io::ErrorKind::Other)?;
+        sector[got..need].fill(0);
+        Ok(())
+    }
+}
+
+impl<F: FsStorage> embedded_io::ErrorType for LiveData<F> {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl<F: FsStorage> embedded_io::Read for LiveData<F> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if self.pos >= self.size() {
+            return Ok(0);
+        }
+        let mut off = self.pos;
+        let mut dst = buf;
+        let mut total = 0usize;
+        while !dst.is_empty() {
+            let lba = (off / u64::from(SECTOR_SIZE)) as u32;
+            let within = (off % u64::from(SECTOR_SIZE)) as usize;
+            let n = (SECTOR_SIZE as usize - within).min(dst.len());
+            let mut sector = [0u8; SECTOR_SIZE as usize];
+            self.fill_sector(lba, &mut sector)?;
+            dst[..n].copy_from_slice(&sector[within..within + n]);
+            off += n as u64;
+            dst = &mut dst[n..];
+            total += n;
+        }
+        self.pos += total as u64;
+        Ok(total)
+    }
+}
+
+impl<F: FsStorage> embedded_io::Seek for LiveData<F> {
+    fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+        self.pos = match pos {
+            embedded_io::SeekFrom::Start(s) => s.min(self.size()),
+            embedded_io::SeekFrom::Current(d) => {
+                let new = (self.pos as i64).saturating_add(d);
+                if new < 0 {
+                    0
+                } else {
+                    (new as u64).min(self.size())
+                }
+            }
+            embedded_io::SeekFrom::End(d) => {
+                let base = self.size() as i64;
+                let new = base.saturating_add(d);
+                if new < 0 {
+                    0
+                } else {
+                    (new as u64).min(self.size())
+                }
+            }
+        };
+        Ok(self.pos)
+    }
+}
+
+/// Recursively scan `dir_rel` ("" = root), appending entries and opening
+/// files.  Directories appear before their children.
+fn scan_dir<F: FsStorage>(
+    fs: &mut F,
+    dir_rel: &str,
+    files: &mut Vec<FileEntry, MAX_FILES>,
+    handles: &mut Vec<Option<F::File>, MAX_FILES>,
+) -> Result<(), CdLiveFsError> {
+    let mut buf: [DirEntry; SCAN_BUF] = core::array::from_fn(|_| DirEntry {
+        name: heapless::String::new(),
+        is_dir: false,
+        size: 0,
+    });
+    let n = fs.read_dir(dir_rel, &mut buf)?;
+    if n == SCAN_BUF {
+        return Err(CdLiveFsError::DirTooLarge);
+    }
+    for entry in &buf[..n] {
+        let mut path = heapless::String::<MAX_PATH_LEN>::new();
+        if !dir_rel.is_empty() {
+            path.push_str(dir_rel)
+                .map_err(|_| CdLiveFsError::TooManyFiles)?;
+            path.push('/').map_err(|_| CdLiveFsError::TooManyFiles)?;
+        }
+        path.push_str(entry.name.as_str())
+            .map_err(|_| CdLiveFsError::TooManyFiles)?;
+
+        files
+            .push(FileEntry {
+                path: path.clone(),
+                size: entry.size,
+                is_dir: entry.is_dir,
+            })
+            .map_err(|_| CdLiveFsError::TooManyFiles)?;
+
+        if entry.is_dir {
+            handles
+                .push(None)
+                .map_err(|_| CdLiveFsError::TooManyFiles)?;
+            scan_dir(fs, path.as_str(), files, handles)?;
+        } else {
+            let h = fs.open(path.as_str(), OpenOptions::read_only())?;
+            handles
+                .push(Some(h))
+                .map_err(|_| CdLiveFsError::TooManyFiles)?;
+        }
+    }
+    Ok(())
+}
+
+// ── LiveDataBuilder ─────────────────────────────────────────
+
+/// Builder for constructing [`LiveData`] with configurable ISO options.
+///
+/// The builder validates all options at `build()` time — **before** the
+/// directory scan — so invalid inputs fail fast without touching the
+/// filesystem.
+pub struct LiveDataBuilder<F: FsStorage> {
+    fs: F,
+    opts: Result<IsoOptions, IsoError>,
+}
+
+impl<F: FsStorage> LiveDataBuilder<F> {
+    /// Start building with a filesystem backend.
+    pub fn new(fs: F) -> Self {
+        Self {
+            fs,
+            opts: Err(IsoError::InvalidLabel), // must set label
+        }
+    }
+
+    /// Set the volume label (1-16 ASCII chars).
+    pub fn label(mut self, label: &str) -> Self {
+        self.opts = IsoOptions::with_label(label);
+        self
+    }
+
+    /// Set the system identifier (ECMA-119 §8.4.4 BP 9-40).
+    pub fn system_id(mut self, id: &str) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            let _ = opts.system_id.push_str(id);
+        }
+        self
+    }
+
+    /// Set the publisher identifier (BP 319-446).
+    pub fn publisher(mut self, name: &str) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            let _ = opts.publisher.push_str(name);
+        }
+        self
+    }
+
+    /// Set the data preparer identifier (BP 447-574).
+    pub fn data_preparer(mut self, name: &str) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            let _ = opts.data_preparer.push_str(name);
+        }
+        self
+    }
+
+    /// Set the application identifier (BP 575-702).
+    pub fn application_id(mut self, name: &str) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            let _ = opts.application_id.push_str(name);
+        }
+        self
+    }
+
+    /// Set the volume set identifier (BP 191-318).
+    pub fn volume_set_id(mut self, id: &str) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            let _ = opts.volume_set_id.push_str(id);
+        }
+        self
+    }
+
+    /// Enable or disable Joliet (UCS-2BE) tree.  Default: `true`.
+    pub fn joliet(mut self, enabled: bool) -> Self {
+        if let Ok(ref mut opts) = self.opts {
+            opts.joliet = enabled;
+        }
+        self
+    }
+
+    /// Build the [`LiveData`] by scanning the filesystem and computing
+    /// the layout.
+    pub fn build(self) -> Result<LiveData<F>, CdLiveFsError> {
+        let opts = self.opts?;
+        let mut fs = self.fs;
+        let mut files = Vec::<FileEntry, MAX_FILES>::new();
+        let mut handles = Vec::<Option<F::File>, MAX_FILES>::new();
+        scan_dir(&mut fs, "", &mut files, &mut handles)?;
+        let layout = compute_layout_opts(&files, &opts)?;
+        Ok(LiveData {
+            fs,
+            layout,
+            handles,
+            pos: 0,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -16,6 +16,7 @@ use crate::cdrom::common::CurrentProfile;
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
 use crate::scsi::backend::BlockBackend;
+use crate::scsi::backend::BlockStorage;
 use crate::scsi::backend::BlockStorageError;
 
 // ── Geometry constants ─────────────────────────────────
@@ -489,91 +490,28 @@ impl<D: FlatData> FlatMedia<D> {
     }
 }
 
-// ── LiveData (live ISO9660 over FsStorage) ───────────────────
+// ── LiveData re-export from snowdrive-disc ───────────────────
 
-use crate::common::fs_storage::{DirEntry, FsError, FsStorage, OpenOptions};
-use crate::scsi::backend::BlockStorage;
-use snowdrive_disc::live::{
-    compute_layout, compute_layout_opts, gen_sector, resolve, FileEntry, IsoError, IsoOptions,
-    Layout, MAX_FILES, MAX_PATH_LEN, SECTOR_SIZE as LIVE_SECTOR_SIZE,
-};
+pub use snowdrive_disc::{CdLiveFsError, LiveData, LiveDataBuilder};
 
-/// Directory-scan buffer size (entries per `read_dir` call).
-const SCAN_BUF: usize = 32;
+// ── FlatData impl for LiveData ─────────────────────────────
 
-/// Live ISO9660 data plane: scans a host directory tree, computes an
-/// ISO9660/Joliet LBA layout, and serves sectors on the fly.
-///
-/// Implements [`FlatData`] so it can be wrapped in [`FlatMedia`].
-pub struct LiveData<F: FsStorage> {
-    #[allow(dead_code)] // kept for lifetime / future use
-    fs: F,
-    layout: Layout,
-    handles: heapless::Vec<Option<F::File>, MAX_FILES>,
-}
-
-impl<F: FsStorage> LiveData<F> {
-    /// Scan the tree under `fs`'s root and build the live layout.
-    pub fn new(mut fs: F, label: &str) -> Result<Self, CdLiveFsError> {
-        let mut files = heapless::Vec::<FileEntry, MAX_FILES>::new();
-        let mut handles = heapless::Vec::<Option<F::File>, MAX_FILES>::new();
-        scan_dir(&mut fs, "", &mut files, &mut handles)?;
-        let layout = compute_layout(&files, label).map_err(|e: IsoError| match e {
-            IsoError::TooManyFiles => CdLiveFsError::TooManyFiles,
-            IsoError::InvalidLabel => CdLiveFsError::TooManyFiles,
-        })?;
-        Ok(Self {
-            fs,
-            layout,
-            handles,
-        })
-    }
-
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
-    /// Fill one 2048-byte sector at `lba` (metadata or file data).
-    fn fill_sector(
-        &mut self,
-        lba: u32,
-        sector: &mut [u8; LIVE_SECTOR_SIZE as usize],
-    ) -> Result<(), BlockStorageError> {
-        let metadata_end = self.layout.first_file_lba;
-        if lba < metadata_end {
-            gen_sector(&self.layout, lba, sector);
-            return Ok(());
-        }
-        let (file_index, file_offset, remaining) = match resolve(&self.layout, lba) {
-            Some(v) => v,
-            None => return Err(BlockStorageError::OutOfBounds),
-        };
-        let file = self.handles[file_index]
-            .as_mut()
-            .ok_or(BlockStorageError::OutOfBounds)?;
-        let need = (remaining as usize).min(LIVE_SECTOR_SIZE as usize);
-        use embedded_io::{Read, Seek};
-        file.seek(embedded_io::SeekFrom::Start(file_offset))
-            .map_err(|_| BlockStorageError::OutOfBounds)?;
-        let got = file
-            .read(&mut sector[..need])
-            .map_err(|_| BlockStorageError::OutOfBounds)?;
-        sector[got..need].fill(0);
-        Ok(())
-    }
-}
-
-impl<F: FsStorage> FlatData for LiveData<F> {
+impl<F: snowdrive_common::fs_storage::FsStorage> FlatData for LiveData<F> {
     fn read(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        use embedded_io::{Read, Seek};
         let mut off = byte_offset;
         let mut dst = buf;
         while !dst.is_empty() {
-            let lba = (off / u64::from(LIVE_SECTOR_SIZE)) as u32;
-            let within = (off % u64::from(LIVE_SECTOR_SIZE)) as usize;
-            let n = (LIVE_SECTOR_SIZE as usize - within).min(dst.len());
-            let mut sector = [0u8; LIVE_SECTOR_SIZE as usize];
-            self.fill_sector(lba, &mut sector)?;
-            dst[..n].copy_from_slice(&sector[within..within + n]);
+            let lba = (off / u64::from(snowdrive_disc::SECTOR_SIZE)) as u32;
+            let within = (off % u64::from(snowdrive_disc::SECTOR_SIZE)) as usize;
+            let n = (snowdrive_disc::SECTOR_SIZE as usize - within).min(dst.len());
+            let mut tmp = [0u8; snowdrive_disc::SECTOR_SIZE as usize];
+            self.seek(embedded_io::SeekFrom::Start(
+                lba as u64 * u64::from(snowdrive_disc::SECTOR_SIZE),
+            ))
+            .map_err(|_| BlockStorageError::OutOfBounds)?;
+            Read::read(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
+            dst[..n].copy_from_slice(&tmp[within..within + n]);
             off += n as u64;
             dst = &mut dst[n..];
         }
@@ -581,195 +519,7 @@ impl<F: FsStorage> FlatData for LiveData<F> {
     }
 
     fn capacity(&self) -> u64 {
-        u64::from(self.layout.total) * u64::from(LIVE_SECTOR_SIZE)
-    }
-}
-
-// ── LiveDataBuilder ─────────────────────────────────────────
-
-/// Builder for constructing [`LiveData`] with configurable ISO options.
-///
-/// The builder validates all options at `build()` time — **before** the
-/// directory scan — so invalid inputs fail fast without touching the
-/// filesystem.
-///
-/// ```ignore
-/// let live = LiveDataBuilder::new(fs)
-///     .label("MYDISC")
-///     .publisher("Acme Corp")
-///     .joliet(false)
-///     .build()?;
-/// ```
-pub struct LiveDataBuilder<F: FsStorage> {
-    fs: F,
-    opts: Result<IsoOptions, IsoError>,
-}
-
-impl<F: FsStorage> LiveDataBuilder<F> {
-    /// Start building with a filesystem backend.
-    pub fn new(fs: F) -> Self {
-        Self {
-            fs,
-            opts: Err(IsoError::InvalidLabel), // must set label
-        }
-    }
-
-    /// Set the volume label (1-16 ASCII chars).
-    pub fn label(mut self, label: &str) -> Self {
-        self.opts = IsoOptions::with_label(label);
-        self
-    }
-
-    /// Set the system identifier (ECMA-119 §8.4.4 BP 9-40).
-    pub fn system_id(mut self, id: &str) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            let _ = opts.system_id.push_str(id);
-        }
-        self
-    }
-
-    /// Set the publisher identifier (BP 319-446).
-    pub fn publisher(mut self, name: &str) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            let _ = opts.publisher.push_str(name);
-        }
-        self
-    }
-
-    /// Set the data preparer identifier (BP 447-574).
-    pub fn data_preparer(mut self, name: &str) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            let _ = opts.data_preparer.push_str(name);
-        }
-        self
-    }
-
-    /// Set the application identifier (BP 575-702).
-    pub fn application_id(mut self, name: &str) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            let _ = opts.application_id.push_str(name);
-        }
-        self
-    }
-
-    /// Set the volume set identifier (BP 191-318).
-    pub fn volume_set_id(mut self, id: &str) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            let _ = opts.volume_set_id.push_str(id);
-        }
-        self
-    }
-
-    /// Enable or disable Joliet (UCS-2BE) tree.  Default: `true`.
-    pub fn joliet(mut self, enabled: bool) -> Self {
-        if let Ok(ref mut opts) = self.opts {
-            opts.joliet = enabled;
-        }
-        self
-    }
-
-    /// Build the [`LiveData`] by scanning the filesystem and computing
-    /// the layout.
-    pub fn build(self) -> Result<LiveData<F>, CdLiveFsError> {
-        let opts = self.opts?;
-        let mut fs = self.fs;
-        let mut files = heapless::Vec::<FileEntry, MAX_FILES>::new();
-        let mut handles = heapless::Vec::<Option<F::File>, MAX_FILES>::new();
-        scan_dir(&mut fs, "", &mut files, &mut handles)?;
-        let layout = compute_layout_opts(&files, &opts).map_err(|e: IsoError| match e {
-            IsoError::TooManyFiles => CdLiveFsError::TooManyFiles,
-            IsoError::InvalidLabel => CdLiveFsError::TooManyFiles,
-        })?;
-        Ok(LiveData {
-            fs,
-            layout,
-            handles,
-        })
-    }
-}
-
-/// Recursively scan `dir_rel` ("" = root), appending entries and opening
-/// files.  Directories appear before their children.
-fn scan_dir<F: FsStorage>(
-    fs: &mut F,
-    dir_rel: &str,
-    files: &mut heapless::Vec<FileEntry, MAX_FILES>,
-    handles: &mut heapless::Vec<Option<F::File>, MAX_FILES>,
-) -> Result<(), CdLiveFsError> {
-    let mut buf: [DirEntry; SCAN_BUF] = core::array::from_fn(|_| DirEntry {
-        name: heapless::String::new(),
-        is_dir: false,
-        size: 0,
-    });
-    let n = fs.read_dir(dir_rel, &mut buf)?;
-    if n == SCAN_BUF {
-        return Err(CdLiveFsError::DirTooLarge);
-    }
-    for entry in &buf[..n] {
-        let mut path = heapless::String::<MAX_PATH_LEN>::new();
-        if !dir_rel.is_empty() {
-            path.push_str(dir_rel)
-                .map_err(|_| CdLiveFsError::TooManyFiles)?;
-            path.push('/').map_err(|_| CdLiveFsError::TooManyFiles)?;
-        }
-        path.push_str(entry.name.as_str())
-            .map_err(|_| CdLiveFsError::TooManyFiles)?;
-
-        files
-            .push(FileEntry {
-                path: path.clone(),
-                size: entry.size,
-                is_dir: entry.is_dir,
-            })
-            .map_err(|_| CdLiveFsError::TooManyFiles)?;
-
-        if entry.is_dir {
-            handles
-                .push(None)
-                .map_err(|_| CdLiveFsError::TooManyFiles)?;
-            scan_dir(fs, path.as_str(), files, handles)?;
-        } else {
-            let h = fs.open(path.as_str(), OpenOptions::read_only())?;
-            handles
-                .push(Some(h))
-                .map_err(|_| CdLiveFsError::TooManyFiles)?;
-        }
-    }
-    Ok(())
-}
-
-/// Error opening a live FS device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdLiveFsError {
-    Fs(FsError),
-    TooManyFiles,
-    DirTooLarge,
-}
-
-impl core::fmt::Display for CdLiveFsError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Fs(e) => write!(f, "filesystem error: {e}"),
-            Self::TooManyFiles => write!(f, "too many files for the live layout"),
-            Self::DirTooLarge => write!(f, "directory exceeds the live scan buffer"),
-        }
-    }
-}
-
-impl core::error::Error for CdLiveFsError {}
-
-impl From<FsError> for CdLiveFsError {
-    fn from(e: FsError) -> Self {
-        Self::Fs(e)
-    }
-}
-
-impl From<IsoError> for CdLiveFsError {
-    fn from(e: IsoError) -> Self {
-        match e {
-            IsoError::TooManyFiles => Self::TooManyFiles,
-            IsoError::InvalidLabel => Self::TooManyFiles,
-        }
+        self.size()
     }
 }
 
