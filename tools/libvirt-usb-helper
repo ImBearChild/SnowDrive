@@ -1,0 +1,183 @@
+#!/bin/bash
+# libvirt-usb-helper - Attach USB device to a libvirt VM via hostdev passthrough.
+# Default device: 1209:0001 (override via args). VM name is required (no default).
+# Usage:
+#   sudo ./tools/attach-usb.sh <vm-name> [vendor_id] [product_id]
+#   sudo ./tools/attach-usb.sh win10
+#   sudo ./tools/attach-usb.sh win10 0x1209 0x0001
+#   sudo ./tools/attach-usb.sh win10 --vendor 0x1209 --product 0x0001 --detach
+set -euo pipefail
+export LC_ALL=C
+export LANG=C
+export LANGUAGE=C
+
+VENDOR_DEFAULT="0x1209"
+PRODUCT_DEFAULT="0x0001"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <vm-name> [options] [vendor_id] [product_id]
+
+Attach (or detach) a USB host device to a libvirt VM.
+
+Arguments:
+  <vm-name>              Libvirt domain name (required, no default)
+
+Options:
+  --vendor <id>          USB vendor ID in hex (default: $VENDOR_DEFAULT)
+  --product <id>         USB product ID in hex (default: $PRODUCT_DEFAULT)
+  --detach               Detach instead of attach
+  -h, --help             Show this help
+
+Positional overrides (alternative to --vendor/--product):
+  $(basename "$0") <vm-name> <vendor_id> <product_id>
+
+Examples:
+  $(basename "$0") win10
+  $(basename "$0") myvm 0x1234 0x5678
+  $(basename "$0") win10 --vendor 0x1209 --product 0x0001
+  $(basename "$0") win10 --detach
+
+Notes:
+  - Requires virsh and lsusb on the host.
+  - Uses managed='yes' so libvirt detaches the device from the host automatically.
+  - If the VM is running, uses --live --config (hotplug + persistent).
+    If shut off, uses --config (persistent, effective on next boot).
+EOF
+}
+
+die() { echo "[ERROR] $*" >&2; exit 1; }
+info() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+
+# --- parse args ---
+VM=""
+VENDOR="$VENDOR_DEFAULT"
+PRODUCT="$PRODUCT_DEFAULT"
+DETACH=0
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --vendor) VENDOR="${2:-}"; [[ -n "$VENDOR" ]] || die "--vendor requires a value"; shift 2 ;;
+    --product) PRODUCT="${2:-}"; [[ -n "$PRODUCT" ]] || die "--product requires a value"; shift 2 ;;
+    --detach) DETACH=1; shift ;;
+    --) shift; while [[ $# -gt 0 ]]; do POSITIONAL+=("$1"); shift; done; break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# positional: <vm-name> [vendor] [product]
+if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
+  VM="${POSITIONAL[0]}"
+fi
+if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
+  VENDOR="${POSITIONAL[1]}"
+fi
+if [[ ${#POSITIONAL[@]} -ge 3 ]]; then
+  PRODUCT="${POSITIONAL[2]}"
+fi
+if [[ ${#POSITIONAL[@]} -gt 3 ]]; then
+  die "too many positional arguments (see --help)"
+fi
+
+[[ -n "$VM" ]] || { usage >&2; echo "" >&2; die "vm-name is required (no default)"; }
+
+# normalize hex prefix
+normalize_hex() {
+  local v="$1"
+  v=$(echo "$v" | tr '[:upper:]' '[:lower:]')
+  [[ "$v" == 0x* ]] || v="0x$v"
+  echo "$v"
+}
+VENDOR=$(normalize_hex "$VENDOR")
+PRODUCT=$(normalize_hex "$PRODUCT")
+VENDOR_NOPREFIX=${VENDOR#0x}
+PRODUCT_NOPREFIX=${PRODUCT#0x}
+XML="/tmp/usb-${VENDOR_NOPREFIX}-${PRODUCT_NOPREFIX}.xml"
+
+# --- checks ---
+command -v virsh >/dev/null 2>&1 || die "virsh not found, install libvirt-clients"
+if ! virsh dominfo "$VM" >/dev/null 2>&1; then
+  echo "[ERROR] Domain '$VM' not found" >&2
+  echo "Available domains:" >&2
+  virsh list --all || true
+  exit 1
+fi
+
+# --- detach mode ---
+if [[ "$DETACH" -eq 1 ]]; then
+  # generate XML for detach (must match what was attached)
+  cat > "$XML" <<EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='$VENDOR'/>
+    <product id='$PRODUCT'/>
+  </source>
+</hostdev>
+EOF
+  if virsh list --state-running 2>/dev/null | grep -qw "$VM"; then
+    info "Detaching $VENDOR:$PRODUCT from running domain '$VM' (--live --config)..."
+    virsh detach-device "$VM" "$XML" --live --config
+  else
+    RAW_STATE=$(virsh domstate "$VM" 2>/dev/null || echo "unknown")
+    info "Domain '$VM' is $RAW_STATE, detaching persistent config (--config)..."
+    virsh detach-device "$VM" "$XML" --config || virsh detach-device "$VM" "$XML" --current || true
+  fi
+  info "Detached $VENDOR:$PRODUCT from $VM"
+  virsh dumpxml "$VM" | grep -A6 hostdev || info "No hostdev entries remaining"
+  exit 0
+fi
+
+# --- attach mode ---
+info "Checking host USB device $VENDOR:$PRODUCT ..."
+if ! lsusb 2>/dev/null | grep -qi "${VENDOR_NOPREFIX}:${PRODUCT_NOPREFIX}"; then
+  warn "lsusb did not find $VENDOR:$PRODUCT, ensure device is plugged into host"
+  lsusb || true
+else
+  lsusb | grep -i "${VENDOR_NOPREFIX}:${PRODUCT_NOPREFIX}" || true
+fi
+
+# already attached?
+if virsh dumpxml "$VM" | grep -q "$VENDOR" && virsh dumpxml "$VM" | grep -q "$PRODUCT"; then
+  warn "Domain '$VM' already has $VENDOR:$PRODUCT configured"
+  virsh dumpxml "$VM" | grep -A6 hostdev || true
+  echo "[INFO] To re-attach, detach first: virsh detach-device $VM $XML --live --config" >&2
+  exit 0
+fi
+
+# USB controller check
+if ! virsh dumpxml "$VM" | grep -q "controller.*usb"; then
+  warn "Domain '$VM' has no USB controller; consider adding via 'virsh edit $VM':"
+  warn "  <controller type='usb' model='qemu-xhci' ports='15'/>"
+fi
+
+cat > "$XML" <<EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='$VENDOR'/>
+    <product id='$PRODUCT'/>
+  </source>
+</hostdev>
+EOF
+
+info "Generated $XML:"
+cat "$XML"
+
+if virsh list --state-running 2>/dev/null | grep -qw "$VM"; then
+  info "Domain '$VM' is running, hot-plugging with --live --config ..."
+  virsh attach-device "$VM" "$XML" --live --config
+else
+  RAW_STATE=$(virsh domstate "$VM" 2>/dev/null || echo "unknown")
+  info "Domain '$VM' is $RAW_STATE, applying persistent config (--config, effective on next boot)..."
+  virsh attach-device "$VM" "$XML" --config
+fi
+
+echo "[OK] Attached $VENDOR:$PRODUCT to $VM"
+info "Verification:"
+virsh dumpxml "$VM" | grep -A6 hostdev || warn "hostdev not found in dumpxml (check libvirt logs)"
+echo ""
+echo "To detach: virsh detach-device $VM $XML --live --config  (if running) or --config (if shut off)"
+echo "Or: $(basename "$0") $VM --vendor $VENDOR --product $PRODUCT --detach"
