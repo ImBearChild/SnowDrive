@@ -9,13 +9,14 @@
 //! drive_id).  Media is injected at runtime via `load()`/`eject()`.
 
 use crate::cdrom::common::{
-    build_get_config_response, build_read_buffer_capacity, build_read_disc_info, cdrom_mode_page,
-    CdromCapabilities, CurrentProfile, DiscInfo, CDROM_IDENTITY, SECTOR_SIZE,
+    build_get_config_response_for_media, build_read_buffer_capacity, build_read_disc_info,
+    cdrom_mode_page_for_caps, CdromCapabilities, DiscInfo, MediaState, CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::cdrom::media::CdMedia;
 use crate::scsi::device::{CommandOutcome, DeviceType};
 use crate::scsi::scsi::{
-    asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, op, Sense, SenseKey,
+    asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, cdb_write_args, op, Sense,
+    SenseKey,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDevice, SpcEffect};
 
@@ -149,20 +150,16 @@ impl<'a> CdromDrive<'a> {
         0
     }
 
-    #[allow(dead_code)] // used when MEDIA commands need profile per-media
-    fn media_profile(&self) -> CurrentProfile {
-        if let Some(ref m) = self.media {
-            return m.profile();
-        }
-        CurrentProfile::CdRom
+    /// Whether the loaded medium accepts SBC random writes.
+    fn is_random_writable(&self) -> bool {
+        self.media_state().random_writable
     }
 
-    /// Current GET CONFIGURATION profile: 0000h when tray is empty.
-    fn current_profile_code(&self) -> u16 {
-        if let Some(ref m) = self.media {
-            return m.profile().code();
-        }
-        0x0000
+    fn media_state(&self) -> MediaState {
+        self.media
+            .as_ref()
+            .map(CdMedia::state)
+            .unwrap_or_else(MediaState::empty)
     }
 
     /// TOC address helper (LBA or MSF).
@@ -255,10 +252,35 @@ impl<'a> CdromDrive<'a> {
 
                 // ── WRITE(6/10/12/16) ───────────────────────────
                 op::WRITE_6 | op::WRITE_10 | op::WRITE_12 | op::WRITE_16 => {
-                    // For now, all write commands return DATA PROTECT.
-                    // The UDFRW write path (DataOut + write_data) will be
-                    // added when the write command parser is ported.
-                    self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
+                    let Some((lba, count)) = cdb_write_args(op, cdb) else {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
+                    };
+                    if !self.is_random_writable() {
+                        self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
+                    } else if count == 0 {
+                        CommandOutcome::Status
+                    } else if lba > self.max_lba()
+                        || lba
+                            .checked_add(u64::from(count))
+                            .is_none_or(|end| end > self.max_lba() + 1)
+                    {
+                        self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE)
+                    } else {
+                        let Some(bytes) = u64::from(count).checked_mul(u64::from(SECTOR_SIZE))
+                        else {
+                            return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
+                        };
+                        let received = dsl.min(data.len());
+                        if received as u64 > bytes {
+                            self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+                        } else {
+                            CommandOutcome::DataOut {
+                                transfer_len: bytes,
+                                byte_offset: lba * u64::from(SECTOR_SIZE),
+                                immediate: &data[..received],
+                            }
+                        }
+                    }
                 }
 
                 // ── READ CAPACITY(10) ───────────────────────────
@@ -505,45 +527,10 @@ impl<'a> CdromDrive<'a> {
         if rt == 0x03 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let profile_code = self.current_profile_code();
-        let last_lba = self.max_lba().min(u32::MAX as u64) as u32;
-        // Feature current bit: device-level features (Core, Removable,
-        // Write Protect) are always current; media-dependent features
-        // (Random Readable, Multi-Read, CD/DVD Read, write features)
-        // are current only when media is present and readable (§6.4).
-        let media_current = self.media.is_some();
-        let current_profile = if self.media.is_some() {
-            self.media_profile()
-        } else {
-            CurrentProfile::Empty
-        };
-        // Build into a local scratch buffer, patch profile code, then copy.
-        let mut scratch = [0u8; 512];
-        {
-            let _outcome = build_get_config_response(
-                &mut scratch,
-                current_profile,
-                &self.caps,
-                rt,
-                start,
-                512,
-                last_lba,
-                media_current,
-            );
-        }
-        // Patch profile code (bytes 6-7).
-        scratch[6] = (profile_code >> 8) as u8;
-        scratch[7] = profile_code as u8;
-        // Compute actual response length from the header.
-        let data_len =
-            u32::from_be_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]) as usize + 4;
-        let n = data_len.min(alloc as usize).min(data.len());
-        data[..n].copy_from_slice(&scratch[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            byte_offset: 0,
-            immediate: &data[..n],
-        }
+        let media = self.media_state();
+        let outcome =
+            build_get_config_response_for_media(data, &self.caps, &media, rt, start, alloc);
+        outcome
     }
 
     // ── READ DISC INFORMATION ───────────────────────────────────────
@@ -554,13 +541,13 @@ impl<'a> CdromDrive<'a> {
         }
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
         let info = DiscInfo {
-            disc_status: 2,           // finalized
-            state_of_last_session: 3, // complete
-            erasable: false,
+            disc_status: if self.is_random_writable() { 0 } else { 2 },
+            state_of_last_session: if self.is_random_writable() { 0 } else { 3 },
+            erasable: self.is_random_writable(),
             sessions: 1,
             first_track: 1,
             last_track: 1,
-            disc_type: 0x00, // CD-ROM (not XA, note)
+            disc_type: 0x00,
             mrw_status: 0,
             lead_out_lba: self.lead_out_lba(),
         };
@@ -720,7 +707,13 @@ impl<'a> CdromDrive<'a> {
         buf[8] = 0x02; // formatted media
         buf[10] = 0x08; // Block Length 2048 (24-bit)
         buf[12..16].copy_from_slice(&partition_len.to_be_bytes());
-        buf[16] = 0x26 << 2; // DVD+RW format type 26h
+        // DVD-RAM uses the standard formatted-medium descriptor.  The
+        // descriptor's format type is not the DVD+RW 26h type.
+        buf[16] = if self.is_random_writable() {
+            0x00
+        } else {
+            0x26 << 2
+        };
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
@@ -772,7 +765,7 @@ impl SpcDevice for CdromDrive<'_> {
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {
-        cdrom_mode_page(page)
+        cdrom_mode_page_for_caps(page, &self.caps)
     }
 
     fn sense(&self) -> &Sense {
@@ -928,6 +921,7 @@ impl CdromDriveBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdrom::common::CurrentProfile;
     use crate::cdrom::media::FlatMedia;
     use crate::scsi::backend::{BlockBackend, RamBackend};
 

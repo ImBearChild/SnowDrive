@@ -1,6 +1,6 @@
 //! UdfRw media layer (UDF RW).
 //!
-//! A random-writable DVD+RW over any [`BlockStorage`] backend, built on the
+//! A random-writable DVD-RAM over any [`BlockStorage`] backend, built on the
 //! pure volume skeleton of [`crate::udf_void`].
 //!
 //! - **Materialize** the empty UDF 2.01 volume into the backend (once, on
@@ -20,7 +20,7 @@ use crate::udf_void::{
     compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError,
 };
 
-/// A random-writable DVD+RW (UDF 2.01 plain build) over a byte plane.
+/// A random-writable DVD-RAM (UDF 2.01 plain build) over a byte plane.
 pub struct UdfRwMedia<B: BlockStorage> {
     backend: B,
     layout: Layout,

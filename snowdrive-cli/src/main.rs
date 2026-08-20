@@ -587,7 +587,9 @@ fn build_udfrw<'a>(
         log::debug!("LUN {lun}: UdfRw DVD+RW in RAM ({} bytes)", m.capacity());
         CdMedia::UdfRw(m)
     };
-    let mut drive = CdromDrive::new();
+    let mut drive = CdromDrive::builder()
+        .capabilities(snowdrive_scsi::cdrom::HYPER_MULTI_CAPS)
+        .build();
     drive.load(media);
     devices.push(Device::Cdrom(drive));
     Ok(ram_rest)

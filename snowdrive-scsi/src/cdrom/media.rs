@@ -12,7 +12,7 @@
 //! - `MediaEventStatus` (GESN media class response)
 //! - `CdMedia` enum with inherent methods for the drive layer
 
-use crate::cdrom::common::CurrentProfile;
+use crate::cdrom::common::{CurrentProfile, MediaState};
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
 use crate::scsi::backend::BlockBackend;
@@ -222,7 +222,7 @@ pub enum CdMedia<'a> {
     /// Bundle: multi-track, multi-session disc package (plan ).
     Bundle(/* BundleMedia<FsBackend> */),
 
-    /// UDF random-writable DVD+RW (plan ).
+    /// UDF random-writable DVD-RAM.
     #[cfg(feature = "udf_void")]
     UdfRw(UdfRwMedia<BlockBackend<'a>>),
 
@@ -231,6 +231,42 @@ pub enum CdMedia<'a> {
 }
 
 impl<'a> CdMedia<'a> {
+    /// Describe the currently inserted medium without exposing drive
+    /// capabilities.
+    pub fn state(&self) -> MediaState {
+        let profile = self.profile();
+        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
+        match self {
+            #[cfg(feature = "udf_void")]
+            Self::UdfRw(_) => MediaState {
+                profile,
+                present: true,
+                ready: true,
+                formatted: true,
+                formattable: true,
+                erasable: true,
+                write_protected: false,
+                random_writable: true,
+                defect_management: true,
+                max_lba,
+                block_size: SECTOR_SIZE,
+            },
+            _ => MediaState {
+                profile,
+                present: true,
+                ready: true,
+                formatted: true,
+                formattable: false,
+                erasable: false,
+                write_protected: true,
+                random_writable: false,
+                defect_management: false,
+                max_lba,
+                block_size: SECTOR_SIZE,
+            },
+        }
+    }
+
     // ── Profile ────────────────────────────────────────
 
     /// Current Profile for GET CONFIGURATION.
@@ -240,7 +276,7 @@ impl<'a> CdMedia<'a> {
             #[cfg(all(feature = "livefs", feature = "std"))]
             Self::Live(m) => m.profile(),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(_) => CurrentProfile::DvdRw,
+            Self::UdfRw(_) => CurrentProfile::DvdRam,
             _ => CurrentProfile::CdRom,
         }
     }
@@ -346,7 +382,7 @@ impl<'a> CdMedia<'a> {
         match self {
             #[cfg(feature = "udf_void")]
             Self::UdfRw(m) => Some(DvdPhysicalFormat {
-                disk_category_part_version: 0x91, // DVD+RW
+                disk_category_part_version: 0x10, // DVD-RAM, version 0
                 layer_type: 0x04,                 // single-layer, rewritable
                 data_start: 0x0003_0000,
                 data_end: 0x0003_0000 + m.lead_out_lba(),

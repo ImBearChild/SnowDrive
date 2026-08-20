@@ -12,7 +12,8 @@ pub mod udfrw;
 
 pub use common::{
     build_get_config_response, build_read_buffer_capacity, build_read_disc_info, CdromCapabilities,
-    CurrentProfile, DiscInfo, CDROM_IDENTITY, SECTOR_SIZE,
+    CurrentProfile, DiscInfo, MediaState, CDROM_IDENTITY, HYPER_MULTI_CAPS, SECTOR_SIZE,
+    UDFRW_CAPS,
 };
 pub use drive::CdromDrive;
 pub use media::{

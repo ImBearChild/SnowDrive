@@ -275,6 +275,20 @@ pub fn cdb_read_args(op: u8, cdb: &[u8]) -> Option<(u64, u32)> {
     }
 }
 
+/// `(lba, count)` for a WRITE(6/10/12/16) CDB.
+pub fn cdb_write_args(op: u8, cdb: &[u8]) -> Option<(u64, u32)> {
+    match op {
+        op::WRITE_6 => Some((u64::from(cdb_lba6(cdb)?), cdb_transfer_len6(cdb)?)),
+        op::WRITE_10 => Some((
+            u64::from(cdb_lba10(cdb)?),
+            u32::from(cdb_transfer_len10(cdb)?),
+        )),
+        op::WRITE_12 => Some((u64::from(cdb_lba12(cdb)?), cdb_transfer_len12(cdb)?)),
+        op::WRITE_16 => Some((cdb_lba16(cdb)?, cdb_transfer_len16(cdb)?)),
+        _ => None,
+    }
+}
+
 /// Human-readable opcode name.
 pub fn opcode_name(opcode: u8) -> &'static str {
     match opcode {
