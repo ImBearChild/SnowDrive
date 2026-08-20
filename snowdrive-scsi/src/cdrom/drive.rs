@@ -923,6 +923,8 @@ impl CdromDriveBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdrom::media::FlatMedia;
+    use crate::scsi::backend::{BlockBackend, RamBackend};
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
@@ -1098,5 +1100,128 @@ mod tests {
         assert!(matches!(outcome, CommandOutcome::DataIn { .. }));
         // UA is NOT cleared by INQUIRY.
         assert!(dev.pending_ua.is_some());
+    }
+
+    #[test]
+    fn drive_empty_tray_tur_open_ascq() {
+        let mut dev = CdromDrive::new();
+        dev.tray_open = true;
+        let mut w = work();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
+        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(dev.sense.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
+    }
+
+    #[test]
+    fn drive_load_eject_ua_cycle() {
+        let mut dev = CdromDrive::new();
+        let mut w = work();
+        let mut cdb = [0u8; 6];
+
+        // Initially empty tray → NOT READY.
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
+        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
+
+        // START STOP LoEj=1, Load=1 → load media on empty tray.
+        use crate::scsi::spc::SpcDevice;
+        let effect = dev.start_stop(true, true); // loej=true, load=true
+        assert_eq!(effect, SpcEffect::Good);
+        assert!(dev.media_requested);
+        assert!(!dev.tray_open);
+
+        // Simulate integrator loading media.
+        let mut img = vec![0u8; 2048];
+        let flat = FlatMedia::new(
+            BlockBackend::Ram(RamBackend::new(&mut img)),
+            CurrentProfile::CdRom,
+        );
+        dev.load(CdMedia::Flat(flat));
+        assert!(dev.is_media_present());
+
+        // TUR → CC(UA 28h/00h).
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::CheckCondition(s) => {
+                assert_eq!(s.key, SenseKey::UnitAttention);
+                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+            }
+            _ => panic!("expected CheckCondition with UA"),
+        }
+        // UA is NOT cleared by delivery.
+        assert!(dev.pending_ua.is_some());
+
+        // REQUEST SENSE → clears UA.
+        cdb[0] = op::REQUEST_SENSE;
+        cdb[4] = 18;
+        let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert!(dev.pending_ua.is_none());
+
+        // TUR → GOOD.
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert_eq!(outcome, CommandOutcome::Status);
+
+        // START STOP LoEj=1, Load=0 → eject.
+        let effect = dev.start_stop(true, false); // loej=true, load=false
+        assert_eq!(effect, SpcEffect::Good);
+        assert!(dev.tray_open);
+        assert!(!dev.is_media_present());
+
+        // TUR → CC(UA 28h/00h) then → NOT READY 3Ah/02h.
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::CheckCondition(s) => {
+                assert_eq!(s.key, SenseKey::UnitAttention);
+                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+            }
+            _ => panic!("expected CheckCondition with UA"),
+        }
+        // REQUEST SENSE → clears UA.
+        cdb[0] = op::REQUEST_SENSE;
+        cdb[4] = 18;
+        let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        // TUR → NOT READY 3Ah/02h (tray open).
+        cdb[0] = op::TEST_UNIT_READY;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
+        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(dev.sense.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
+    }
+
+    #[test]
+    fn drive_ua_overrides_read_capacity() {
+        let mut dev = CdromDrive::new();
+        dev.pending_ua = Some(Sense::new(
+            SenseKey::UnitAttention,
+            asc::MEDIUM_MAY_HAVE_CHANGED,
+            0,
+        ));
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_CAPACITY_10;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::CheckCondition(s) => {
+                assert_eq!(s.key, SenseKey::UnitAttention);
+                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+            }
+            _ => panic!("expected CheckCondition with UA"),
+        }
+    }
+
+    #[test]
+    fn drive_prevent_removal_blocks_eject() {
+        let mut dev = CdromDrive::new();
+        use crate::scsi::spc::SpcDevice;
+        dev.set_prevent(true);
+        let effect = dev.start_stop(true, false); // loej=true, load=false
+        assert_eq!(effect, SpcEffect::RemovalPrevented);
     }
 }
