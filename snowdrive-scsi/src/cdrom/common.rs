@@ -13,13 +13,10 @@
 //! whether a command is supported) stays in each device's own
 //! `execute_mmc_*` — device state never enters this module.
 
-use crate::scsi::device::{CommandOutcome, DeviceType};
-use crate::scsi::scsi::Sense;
-use crate::scsi::spc::{DeviceIdentity, SpcDevice, SpcEffect};
-
+use crate::scsi::device::CommandOutcome;
+use crate::scsi::spc::DeviceIdentity;
 /// CD-ROM logical block size (Mode 1: 2048 data bytes per sector).
 pub const SECTOR_SIZE: u32 = 2048;
-
 /// INQUIRY identity for CD-ROM devices: SCSI family, with
 /// SPC-4 and MMC-6 version descriptors.
 pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
@@ -28,8 +25,7 @@ pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
     revision: *b"0100",
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
 };
-
-/// Current Profile code for GET CONFIGURATION (MMC-6 ).
+/// Current Profile code for GET CONFIGURATION (MMC-6 §5.4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentProfile {
     /// 0x0008 — CD-ROM (images ≤ 700 MiB).
@@ -40,10 +36,9 @@ pub enum CurrentProfile {
     CdR,
     /// 0x000A — CD-RW.
     CdRw,
-    /// 0x001A — DVD+RW (UdfRw random-writable media, plan commit 3).
+    /// 0x001A — DVD+RW (UdfRw random-writable media).
     DvdRw,
 }
-
 impl CurrentProfile {
     /// Numeric profile code (MMC-6 Table 64).
     pub fn code(self) -> u16 {
@@ -55,8 +50,7 @@ impl CurrentProfile {
             Self::DvdRw => 0x001A,
         }
     }
-
-    /// Pick the profile from a capacity in bytes (plan  table).
+    /// Pick the profile from a capacity in bytes.
     pub fn from_capacity(capacity: u64) -> Self {
         if capacity <= 700 * 1024 * 1024 {
             Self::CdRom
@@ -65,80 +59,16 @@ impl CurrentProfile {
         }
     }
 }
-
-/// CD-ROM common state shared by all three CD device types.
-///
-/// Each concrete device embeds this struct as a field (composition) and
-/// delegates SPC commands to `execute_spc(&mut self.common, ...)`.
-pub struct CdromDeviceCommon {
-    pub sense: Sense,
-    pub prevent_removal: bool,
-    pub sector_size: u32,
-    pub profile: CurrentProfile,
-}
-
-impl CdromDeviceCommon {
-    pub fn new(profile: CurrentProfile) -> Self {
-        Self {
-            sense: Sense::clear(),
-            prevent_removal: false,
-            sector_size: SECTOR_SIZE,
-            profile,
-        }
-    }
-}
-
-impl SpcDevice for CdromDeviceCommon {
-    fn device_type(&self) -> DeviceType {
-        DeviceType::Cdrom
-    }
-
-    fn identity(&self) -> &DeviceIdentity {
-        &CDROM_IDENTITY
-    }
-
-    fn id(&self) -> u64 {
-        // Concrete devices override this via a wrapper; the common struct
-        // alone returns 0.  Identity synthesis in execute_spc uses dev.id().
-        0
-    }
-
-    fn mode_page(&self, page: u8) -> Option<&[u8]> {
-        cdrom_mode_page(page)
-    }
-
-    fn sense(&self) -> &Sense {
-        &self.sense
-    }
-
-    fn sense_mut(&mut self) -> &mut Sense {
-        &mut self.sense
-    }
-
-    fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
-        // CD-ROM: START STOP UNIT accepted and ignored.
-        SpcEffect::Good
-    }
-
-    fn set_prevent(&mut self, prevent: bool) {
-        self.prevent_removal = prevent;
-    }
-}
-
 // ── CD-ROM MODE SENSE pages ─────────────────────────────────────────
-
 /// Caching page (0x08, SPC-4 ): WCE=0, RCD=0, DRA=1.
 const CACHING_PAGE: [u8; 20] = [
     0x88, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0,
 ];
-
 /// Vendor-specific page (0x00).
 const VENDOR_PAGE: [u8; 4] = [0x00, 2, 0x00, 0x08];
-
 /// CD-ROM Parameters page (0x0D, MMC-6 ): page_length=2,
 /// sector_size=2048 (big-endian u16).
 const CDROM_PARAMS: [u8; 4] = [0x0D, 0x02, 0x08, 0x00];
-
 /// CD-ROM Audio Control page (0x0E, MMC-6 ): page_length=14,
 /// no audio.  Total = 2 + 14 = 16 bytes.
 const CDROM_AUDIO: [u8; 16] = [
@@ -150,7 +80,6 @@ const CDROM_AUDIO: [u8; 16] = [
     0x02, 0x00, // output port 1: channel selection = 0x02 (channel 1)
     0x00, 0x00, // output port 1: volume = 0
 ];
-
 /// Device-declared capability set — the single model every
 /// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
 /// 0x2A page) is built from. Devices feed their capabilities;
@@ -200,7 +129,6 @@ pub struct CdromCapabilities {
     pub max_read_speed: u16,  // KB/s
     pub max_write_speed: u16, // KB/s
 }
-
 impl CdromCapabilities {
     /// A read-only CD-ROM drive: Mode-1 data read is the implicit baseline,
     /// tray mechanism, eject/lock/load per real device calibration (§6.8).
@@ -232,10 +160,8 @@ impl CdromCapabilities {
         }
     }
 }
-
 /// The capabilities of the read-only CD-ROM devices (flat / livefs).
 pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
-
 /// Capabilities of the UdfRw device: reads DVD media and presents a
 /// formatted, random-writable DVD+RW (features 0x0020 + 0x002A).
 /// FeatureDefectManagement (0x0008) is also reported — while not standard
@@ -267,12 +193,10 @@ pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     max_read_speed: 0x2B48,
     max_write_speed: 0x2B48,
 };
-
 /// `true` → 1 (const bit packing).
 const fn bit(b: bool) -> u8 {
     b as u8
 }
-
 /// 3-bit loading mechanism type (MMC-6 Table 99: 000b caddy/slot, 001b tray).
 const fn loading_type_bits(tray: bool) -> u8 {
     if tray {
@@ -281,7 +205,6 @@ const fn loading_type_bits(tray: bool) -> u8 {
         0b000
     }
 }
-
 /// Build the CD/DVD Capabilities & Mechanical Status mode page (0x2A) from
 /// `caps` (MMC-3 / SFF-8090 layout). MMC-6 Appendix E.9 marks this page
 /// legacy ("implementing mode page 2Ah is not recommended") — GET
@@ -344,42 +267,9 @@ pub const fn build_capabilities_page(caps: &CdromCapabilities) -> [u8; 56] {
     p[41] = 0;
     p
 }
-
 /// CD/DVD Capabilities & Mechanical Status page (0x2A) for the read-only
 /// devices, built from the capability model rather than hardcoded bytes.
 const CDROM_CAPABILITIES: [u8; 56] = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
-
-/// MODE SENSE page 0x2A for the UdfRw device, built from the capability
-/// model. Includes the base 24-byte page plus CD write speed descriptors.
-const UDFRW_CAPABILITIES: [u8; 56] = build_capabilities_page(&UDFRW_CAPS);
-
-/// Total byte count of all UdfRw mode pages (for 0x3F sizing).
-pub(crate) const ALL_UDFRW_PAGES_LEN: usize = CACHING_PAGE.len()
-    + VENDOR_PAGE.len()
-    + CDROM_PARAMS.len()
-    + CDROM_AUDIO.len()
-    + UDFRW_CAPABILITIES.len();
-
-/// All UdfRw mode pages, in MODE SENSE page order (for `0x3F`).
-const ALL_UDFRW_PAGES: [u8; ALL_UDFRW_PAGES_LEN] = concat_pages(&[
-    &VENDOR_PAGE,
-    &CACHING_PAGE,
-    &CDROM_PARAMS,
-    &CDROM_AUDIO,
-    &UDFRW_CAPABILITIES,
-]);
-
-/// MODE SENSE page data for the UdfRw device (`0x3F` = all pages): the
-/// writable 0x2A page replaces the read-only one; everything else matches
-/// [`cdrom_mode_page`].
-pub(crate) fn udfrw_mode_page(page: u8) -> Option<&'static [u8]> {
-    match page {
-        0x2A => Some(&UDFRW_CAPABILITIES),
-        0x3F => Some(&ALL_UDFRW_PAGES),
-        _ => cdrom_mode_page(page),
-    }
-}
-
 /// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
     match page {
@@ -392,14 +282,12 @@ pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
         _ => None,
     }
 }
-
 /// Total byte count of all CD-ROM mode pages (for 0x3F sizing).
 pub(crate) const ALL_CDROM_PAGES_LEN: usize = CACHING_PAGE.len()
     + VENDOR_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
     + CDROM_CAPABILITIES.len();
-
 /// Concatenate `parts` into a `[u8; N]` (const, for building 0x3F).
 const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
     let mut out = [0u8; N];
@@ -416,7 +304,6 @@ const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
     }
     out
 }
-
 /// All CD-ROM mode pages, in MODE SENSE page order (for `0x3F`).
 const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
     &VENDOR_PAGE,
@@ -425,9 +312,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
     &CDROM_AUDIO,
     &CDROM_CAPABILITIES,
 ]);
-
 // ── GET CONFIGURATION common features builder ───────────────────────
-
 /// Build GET CONFIGURATION feature descriptors common to all CD-ROM
 /// devices.  Writes into `buf[off..]` and returns the new
 /// offset.  `profile` is the current profile; `last_lba` feeds the Random
@@ -464,7 +349,6 @@ pub fn build_get_config_features(
     // every RT). So always start the response at the requested feature;
     // RT=0 + start 0 yields everything.
     let include = |code: u16| code >= start_feature;
-
     // Profile List (0x0000) is required in EVERY GET CONFIGURATION response
     // per MMC-6 §5.4.2. It identifies the profiles supported by the drive;
     // the mounted profile is marked current (or 0000h when no media).
@@ -492,7 +376,6 @@ pub fn build_get_config_features(
         if profiles.is_empty() {
             let _ = profiles.push(0x0008);
         }
-
         // Feature header: feature code 0x0000, version 0, persistent + current.
         buf[off] = 0x00;
         buf[off + 1] = 0x00;
@@ -512,7 +395,6 @@ pub fn build_get_config_features(
             off += 1;
         }
     }
-
     // Core (0x0001)
     if include(0x0001) {
         buf[off] = 0x00;
@@ -523,7 +405,6 @@ pub fn build_get_config_features(
         buf[off + 8] = 0x06; // INQ2 | DBE
         off += 12;
     }
-
     // Removable Medium (0x0003)
     if include(0x0003) {
         buf[off] = 0x00;
@@ -538,7 +419,6 @@ pub fn build_get_config_features(
             | bit(caps.lock);
         off += 8;
     }
-
     // Write Protect (0x0004) — reports the media write-protect state.
     // Windows expects this feature; without it the disc is treated as
     // write-protected. All protection bits are clear (not protected); the
@@ -553,7 +433,6 @@ pub fn build_get_config_features(
         buf[off + 4..off + 8].copy_from_slice(&[0x00, 0, 0, 0]);
         off += 8;
     }
-
     // Random Readable (0x0010) — current only when media is readable.
     if include(0x0010) {
         buf[off] = 0x00;
@@ -565,7 +444,6 @@ pub fn build_get_config_features(
         buf[off + 9] = 0x01; // blocking = 1
         off += 12;
     }
-
     // Multi-Read (0x001D) — current only when media is readable.
     if include(0x001D) {
         buf[off] = 0x00;
@@ -573,7 +451,6 @@ pub fn build_get_config_features(
         buf[off + 2] = if media_current { 0x01 } else { 0x00 }; // current bit
         off += 4;
     }
-
     // CD Read (0x001E) — current only when media is readable.
     if include(0x001E) {
         buf[off] = 0x00;
@@ -582,7 +459,6 @@ pub fn build_get_config_features(
         buf[off + 3] = 0x04; // additional length
         off += 8;
     }
-
     // DVD Read (0x001F) — only for DVD profiles, current when media readable.
     if matches!(profile, CurrentProfile::DvdRom | CurrentProfile::DvdRw) && include(0x001F) {
         buf[off] = 0x00;
@@ -590,7 +466,6 @@ pub fn build_get_config_features(
         buf[off + 2] = if media_current { 0x01 } else { 0x00 }; // current bit
         off += 4;
     }
-
     // Random Writable (0x0020) — formatted random-writable media (UdfRw).
     if caps.random_writable && include(0x0020) {
         buf[off] = 0x00;
@@ -604,7 +479,6 @@ pub fn build_get_config_features(
         buf[off + 15] = 0x00;
         off += 16;
     }
-
     // Formattable (0x0023). DVD+RW drives that report the DVD+RW feature as
     // current also advertise the basic background-format capability.
     if caps.dvd_plus_rw && include(0x0023) {
@@ -615,7 +489,6 @@ pub fn build_get_config_features(
         buf[off + 4..off + 12].fill(0);
         off += 12;
     }
-
     // Defect Management (0x0008) — required by Windows' `IOCTL_DISK_IS_WRITABLE`
     // to report optical media as writable. Real DVD+RW drives do NOT have this
     // feature (it belongs to DVD-RAM), but the Windows cdrom class driver gates
@@ -628,14 +501,12 @@ pub fn build_get_config_features(
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-
     // MRW (Mount Rainier, 0x0028) is deliberately NOT reported: it is a
     // sequential packet-write format with drive-side remapping that this
     // byte-plane emulation does not implement, and Windows treats an
     // MRW-formatted disc as read-only. A DVD+RW with plain UDF needs no MRW
     // claim — the kernel's cdrom_open_write() allows a writable open for
     // profile 0x1A via cdrom_is_dvd_rw()/cdrom_dvdram_open_write().
-
     // DVD+RW (0x002A) — write capable (UdfRw).
     if caps.dvd_plus_rw && include(0x002A) {
         buf[off] = 0x00;
@@ -648,7 +519,6 @@ pub fn build_get_config_features(
         buf[off + 7] = 0x00;
         off += 8;
     }
-
     // Disc Control Block (0x010A). The WDCB itself is readable through
     // READ DISC STRUCTURE format 30h; advertise the standard FDC/SDC/TOC
     // descriptors used by DVD+RW drives.
@@ -660,10 +530,8 @@ pub fn build_get_config_features(
         buf[off + 4..off + 16].copy_from_slice(b"FDC\0SDC\0TOC\0");
         off += 16;
     }
-
     off
 }
-
 /// Build a GET CONFIGURATION response into `data[0..]`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_get_config_response<'a>(
@@ -683,7 +551,6 @@ pub fn build_get_config_response<'a>(
     // Header: bytes 0-3 = data length (placeholder), 6-7 = current profile.
     buf[6] = (profile.code() >> 8) as u8;
     buf[7] = profile.code() as u8;
-
     let off = build_get_config_features(
         &mut buf,
         8,
@@ -694,11 +561,9 @@ pub fn build_get_config_response<'a>(
         last_lba,
         media_current,
     );
-
     // Data length = bytes following the 4-byte data-length field itself.
     let data_len = (off - 4) as u32;
     buf[0..4].copy_from_slice(&data_len.to_be_bytes());
-
     let n = off.min(alloc as usize);
     data[0..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
@@ -707,7 +572,6 @@ pub fn build_get_config_response<'a>(
         immediate: &data[0..n],
     }
 }
-
 /// Build the READ BUFFER CAPACITY response (MMC-6 , Table 342):
 /// 12-byte structure with Data Length = 10. `buffer_len` / `blank_len` are
 /// the whole / unused buffer bytes (0 for a drive without a write buffer).
@@ -729,7 +593,6 @@ pub fn build_read_buffer_capacity<'a>(
         immediate: &data[0..n],
     }
 }
-
 /// Disc state parameters for the Standard Disc Information response
 /// (MMC-6 ). Each device feeds its own state — this struct only
 /// transports values, it never reads device state.
@@ -755,7 +618,6 @@ pub struct DiscInfo {
     /// Last Possible Lead-out Start Address (bytes 20-23, LBA).
     pub lead_out_lba: u32,
 }
-
 /// Build the Standard Disc Information response (MMC-6 ) into
 /// `data`, bounded by `alloc`. Returns a Data-In outcome carrying the
 /// synthesized bytes (`immediate`). An `alloc` of zero is not an error and
@@ -787,7 +649,6 @@ pub fn build_read_disc_info<'a>(
     // Bytes 12-19: Disc Identification, Last Session Lead-in Start (0).
     buf[20..24].copy_from_slice(&info.lead_out_lba.to_be_bytes());
     // Bytes 24-51: Disc Bar Code, Disc Application Code, OPC tables (0).
-
     let n = buf.len().min(alloc as usize).min(data.len());
     data[..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
@@ -796,35 +657,24 @@ pub fn build_read_disc_info<'a>(
         immediate: &data[0..n],
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scsi::device::CommandOutcome;
-    use crate::scsi::scsi::op;
-    use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity};
-
-    /// Minimal CD-ROM test device wrapping CdromDeviceCommon.
-    struct CdTestDev {
-        common: CdromDeviceCommon,
-        capacity: u64,
+    use crate::scsi::device::{CommandOutcome, DeviceType};
+    use crate::scsi::scsi::{op, Sense, SenseKey};
+    use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
+    /// Minimal test device for exercising SPC commands through execute_spc.
+    struct TestDev {
+        sense: Sense,
     }
-
-    impl CdTestDev {
-        fn new(capacity: u64) -> Self {
-            let profile = CurrentProfile::from_capacity(capacity);
+    impl TestDev {
+        fn new() -> Self {
             Self {
-                common: CdromDeviceCommon::new(profile),
-                capacity,
+                sense: Sense::clear(),
             }
         }
     }
-
-    /// Wrapper implementing SpcDevice that delegates to common but
-    /// overrides `id()` with the device capacity.
-    struct CdDev<'a>(&'a mut CdTestDev);
-
-    impl SpcDevice for CdDev<'_> {
+    impl SpcDevice for TestDev {
         fn device_type(&self) -> DeviceType {
             DeviceType::Cdrom
         }
@@ -832,29 +682,25 @@ mod tests {
             &CDROM_IDENTITY
         }
         fn id(&self) -> u64 {
-            self.0.capacity
+            0
         }
         fn mode_page(&self, page: u8) -> Option<&[u8]> {
             cdrom_mode_page(page)
         }
         fn sense(&self) -> &Sense {
-            &self.0.common.sense
+            &self.sense
         }
         fn sense_mut(&mut self) -> &mut Sense {
-            &mut self.0.common.sense
+            &mut self.sense
         }
-        fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
-            self.0.common.start_stop(loej, load)
+        fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
+            SpcEffect::Good
         }
-        fn set_prevent(&mut self, prevent: bool) {
-            self.0.common.set_prevent(prevent);
-        }
+        fn set_prevent(&mut self, _prevent: bool) {}
     }
-
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
     }
-
     fn data_in(outcome: CommandOutcome<'_>, buf: &mut [u8]) -> usize {
         match outcome {
             CommandOutcome::DataIn {
@@ -869,24 +715,18 @@ mod tests {
             _ => panic!("expected DataIn"),
         }
     }
-
-    fn run<'a>(dev: &mut CdDev<'_>, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn run<'a>(dev: &mut TestDev, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
         execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
     }
-
-    fn run_data(dev: &mut CdDev<'_>, cdb: &[u8], buf: &mut [u8]) -> usize {
+    fn run_data(dev: &mut TestDev, cdb: &[u8], buf: &mut [u8]) -> usize {
         let mut w = work();
         data_in(run(dev, cdb, &mut w), buf)
     }
-
     // ── INQUIRY ─────────────────────────────────────────────────────
-
     // ── MODE SENSE ──────────────────────────────────────────────────
-
     #[test]
     fn cdrom_mode_sense_6_cd_params_page() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
+        let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::MODE_SENSE_6;
         cdb[2] = 0x0D;
@@ -901,11 +741,9 @@ mod tests {
         assert_eq!(buf[6], 0x08);
         assert_eq!(buf[7], 0x00);
     }
-
     #[test]
     fn cdrom_mode_sense_6_audio_control_page() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
+        let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::MODE_SENSE_6;
         cdb[2] = 0x0E;
@@ -916,11 +754,9 @@ mod tests {
         assert_eq!(buf[4], 0x0E); /* page code */
         assert_eq!(buf[5], 0x0E); /* page length = 14 */
     }
-
     #[test]
     fn cdrom_mode_sense_6_capabilities_page() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
+        let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::MODE_SENSE_6;
         cdb[2] = 0x2A;
@@ -931,11 +767,9 @@ mod tests {
         assert_eq!(buf[4], 0x2A); /* page code */
         assert_eq!(buf[5], 54); /* page length = 54 */
     }
-
     #[test]
     fn cdrom_mode_sense_10_all_pages() {
-        let mut td = CdTestDev::new(1024 * 1024);
-        let mut dev = CdDev(&mut td);
+        let mut dev = TestDev::new();
         let mut cdb = [0u8; 10];
         cdb[0] = op::MODE_SENSE_10;
         cdb[2] = 0x3F;
@@ -952,7 +786,6 @@ mod tests {
         assert_eq!(buf[36] & 0x3F, 0x0E);
         assert_eq!(buf[52] & 0x3F, 0x2A);
     }
-
     #[test]
     fn cdrom_mode_page_all_pages_contains_each_page() {
         let all = cdrom_mode_page(0x3F).expect("0x3F must return all pages");
@@ -967,9 +800,7 @@ mod tests {
         }
         assert_eq!(codes, vec![0x00, 0x08, 0x0D, 0x0E, 0x2A]);
     }
-
     // ── GET CONFIGURATION common features ───────────────────────────
-
     #[test]
     fn cdrom_get_config_cd_profile() {
         let mut w = work();
@@ -991,7 +822,6 @@ mod tests {
         assert_eq!(buf[6], 0x00);
         assert_eq!(buf[7], 0x08);
     }
-
     #[test]
     fn cdrom_get_config_dvd_profile() {
         let mut w = work();
@@ -1012,7 +842,6 @@ mod tests {
         assert_eq!(buf[6], 0x00);
         assert_eq!(buf[7], 0x10); /* DVD-ROM */
     }
-
     #[test]
     fn cdrom_get_config_features_present() {
         let mut w = work();
@@ -1046,7 +875,6 @@ mod tests {
         // | Load << 4 | Eject << 3 | Lock.
         assert_eq!(buf[32], 0x39);
     }
-
     #[test]
     fn cdrom_get_config_udfrw_features_no_mrw() {
         let mut w = work();
@@ -1079,7 +907,6 @@ mod tests {
         }
         assert!(saw_random && saw_formattable && saw_dvdrw);
     }
-
     #[test]
     fn cdrom_get_config_udfrw_write_protect_clear() {
         let mut w = work();
@@ -1113,7 +940,6 @@ mod tests {
         }
         assert!(found, "Write Protect feature must be present for Windows");
     }
-
     #[test]
     fn cdrom_get_config_starting_feature_filters() {
         let mut w = work();
@@ -1137,7 +963,6 @@ mod tests {
         assert_eq!(buf[8], 0x00);
         assert_eq!(buf[9], 0x10);
     }
-
     #[test]
     fn cdrom_get_config_alloc_clamp() {
         let mut w = work();
@@ -1158,9 +983,7 @@ mod tests {
         assert_eq!(n, 8); // only header fits
         assert_eq!(buf[7], 0x08); // CD-ROM profile still set
     }
-
     // ── READ DISC INFORMATION ───────────────────────────────────────
-
     fn finalized_disc_info(lead_out_lba: u32) -> DiscInfo {
         DiscInfo {
             disc_status: 2,           // finalized
@@ -1174,7 +997,6 @@ mod tests {
             lead_out_lba,
         }
     }
-
     #[test]
     fn disc_info_finalized_cd_rom_layout() {
         let mut w = work();
@@ -1196,7 +1018,6 @@ mod tests {
                                                             // All other fields (bar code, application code, OPC) are zero.
         assert!(buf[24..52].iter().all(|&b| b == 0));
     }
-
     #[test]
     fn disc_info_alloc_clamps_response() {
         let mut w = work();
@@ -1213,7 +1034,6 @@ mod tests {
             other => panic!("expected DataIn, got {other:?}"),
         }
     }
-
     #[test]
     fn disc_info_cdrw_sets_erasable() {
         let mut w = work();
@@ -1228,9 +1048,7 @@ mod tests {
         // = 0b00010101.
         assert_eq!(buf[2], 0x15);
     }
-
     // ── Capabilities page (0x2A) ────────────────────────────────────
-
     #[test]
     fn capabilities_page_read_only_cd_rom_layout() {
         let p = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
@@ -1248,7 +1066,6 @@ mod tests {
         assert_eq!(&p[14..16], &[0, 0]);
         assert_eq!(&p[18..20], &[0, 0]);
     }
-
     #[test]
     fn capabilities_page_parameterized_by_model() {
         let mut caps = READ_ONLY_CDROM_CAPS;
@@ -1266,9 +1083,7 @@ mod tests {
         assert_eq!(&p[10..12], &[0x10, 0x00]); // buffer 4096
         assert_eq!(&p[14..16], &[0x0D, 0xC8]); // max read 3528
     }
-
     // ── READ BUFFER CAPACITY ────────────────────────────────────────
-
     #[test]
     fn read_buffer_capacity_structure() {
         let mut w = work();
@@ -1278,16 +1093,13 @@ mod tests {
         assert_eq!(&buf[0..2], &[0x00, 0x0A]); // Data Length = 10
         assert_eq!(&buf[4..8], &[0x00, 0x00, 0x10, 0x00]); // buffer 4096
         assert_eq!(&buf[8..12], &[0x00, 0x00, 0x08, 0x00]); // blank 2048
-
-        // Allocation clamp and zero-alloc (not an error).
+                                                            // Allocation clamp and zero-alloc (not an error).
         let mut small = [0u8; 2];
         let n = data_in(build_read_buffer_capacity(&mut w, 2, 0, 0), &mut small);
         assert_eq!(n, 2);
         assert_eq!(&small, &[0x00, 0x0A]);
     }
-
     // ── Profile selection ───────────────────────────────────────────
-
     #[test]
     fn current_profile_from_capacity() {
         assert_eq!(CurrentProfile::from_capacity(0), CurrentProfile::CdRom);
@@ -1300,7 +1112,6 @@ mod tests {
             CurrentProfile::DvdRom
         );
     }
-
     #[test]
     fn current_profile_codes() {
         assert_eq!(CurrentProfile::CdRom.code(), 0x0008);
@@ -1309,7 +1120,6 @@ mod tests {
         assert_eq!(CurrentProfile::CdRw.code(), 0x000A);
         assert_eq!(CurrentProfile::DvdRw.code(), 0x001A);
     }
-
     #[test]
     fn get_config_dvd_rw_features() {
         let mut w = work();
