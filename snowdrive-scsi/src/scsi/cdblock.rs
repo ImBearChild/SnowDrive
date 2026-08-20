@@ -518,6 +518,11 @@ impl ScsiDevice for CDBlockDevice {
     fn device_type(&self) -> DeviceType {
         DeviceType::Cdrom
     }
+
+    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome<'static> {
+        // CDBlock accepts MODE SELECT as no-op.
+        CommandOutcome::Status
+    }
 }
 
 #[cfg(test)]

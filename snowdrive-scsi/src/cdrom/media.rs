@@ -361,6 +361,25 @@ impl<'a> CdMedia<'a> {
         }
     }
 
+    /// Reinitialize a writable medium using its native format.
+    pub fn format_unit(&mut self) -> Result<(), MediaError> {
+        match self {
+            #[cfg(feature = "udf_void")]
+            Self::UdfRw(m) => m.format_unit().map_err(|_| MediaError::Io),
+            _ => Err(MediaError::WriteProtected),
+        }
+    }
+
+    /// Whether the medium contains a valid UDF volume (AVDP at sector 256).
+    /// Only relevant for `UdfRw`; other variants always return `false`.
+    pub fn has_udf(&mut self) -> bool {
+        match self {
+            #[cfg(feature = "udf_void")]
+            Self::UdfRw(m) => UdfRwMedia::has_udf(m.backend()),
+            _ => false,
+        }
+    }
+
     // ── GESN ──────────────────────────────────────────────
 
     /// Media event status for GET EVENT STATUS NOTIFICATION.
@@ -396,7 +415,8 @@ impl<'a> CdMedia<'a> {
     pub fn supports_dvd_structure_format(&self, format: u8) -> bool {
         #[cfg(feature = "udf_void")]
         {
-            matches!(self, Self::UdfRw(_)) && matches!(format, 0 | 0x30 | 0xC0)
+            matches!(self, Self::UdfRw(_))
+                && matches!(format, 0 | 0x08 | 0x09 | 0x0A | 0x0B | 0x30 | 0xC0)
         }
         #[cfg(not(feature = "udf_void"))]
         {

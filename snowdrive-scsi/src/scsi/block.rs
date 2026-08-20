@@ -335,6 +335,11 @@ impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
     fn device_type(&self) -> DeviceType {
         self.device_type()
     }
+
+    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome<'static> {
+        // Block device accepts any MODE SELECT parameter (no-op).
+        CommandOutcome::Status
+    }
 }
 
 #[cfg(test)]

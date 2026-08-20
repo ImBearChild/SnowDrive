@@ -581,6 +581,70 @@ impl Session {
                 }
                 self.send_write_flow(conn, work, dev, itt, transfer_len, byte_offset, received)
             }
+            CommandOutcome::ParamOut {
+                expected_len,
+                immediate,
+            } => {
+                let expected = expected_len as u64;
+                let received = immediate.len() as u64;
+                crate::debug!("  -> ParamOut expected={} immediate={}", expected, received);
+                if expected > 0 && !w_bit {
+                    return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+                }
+                if received > expected {
+                    return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+                }
+                if expected as usize > work.len() - BHS_SIZE {
+                    return StepResult::Error(TargetError::WorkBufTooSmall);
+                }
+                // `immediate` already resides at work[BHS_SIZE..BHS_SIZE+received].
+                // Drop the borrow before the R2T loop mutably reuses `work`.
+                let cdb_owned = {
+                    let mut tmp = [0u8; 16];
+                    let c = bhs.cdb();
+                    tmp[..c.len()].copy_from_slice(c);
+                    tmp
+                };
+                let cdb_len = bhs.cdb().len();
+                // If not all received, drive R2T/Data-Out to collect the remainder.
+                let mut cur = received;
+                if cur < expected {
+                    // Use a dedicated param R2T flow that accumulates into work.
+                    match self.collect_param_out(conn, work, itt, expected, &mut cur) {
+                        Ok(()) => {}
+                        Err(r) => return r,
+                    }
+                }
+                let param_data = &work[BHS_SIZE..BHS_SIZE + expected as usize];
+                let cdb_slice = &cdb_owned[..cdb_len];
+                match dev.complete_param(cdb_slice, param_data) {
+                    CommandOutcome::Status => {
+                        crate::debug!("  -> Param complete Status");
+                        self.send_scsi_response(conn, work, itt, status::GOOD, None)
+                    }
+                    CommandOutcome::CheckCondition(sense) => {
+                        crate::debug!("  -> Param complete CheckCondition asc=0x{:02X}", sense.asc);
+                        self.send_scsi_response(
+                            conn,
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            Some(&sense),
+                        )
+                    }
+                    other => {
+                        crate::warn!("  -> Param complete unexpected outcome {:?}", other);
+                        let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+                        self.send_scsi_response(
+                            conn,
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            Some(&sense),
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -808,6 +872,105 @@ impl Session {
             r2t_sn = r2t_sn.wrapping_add(1);
         }
         self.send_scsi_response(conn, work, itt, status::GOOD, None)
+    }
+
+    /// Collect a ParamOut's remaining Data-Out bytes via R2T.
+    /// `received` is in-out: on entry the already-present prefix length,
+    /// on exit the total collected length (== `expected`). Data is accumulated
+    /// in a separate buffer to avoid clobbering the immediate prefix that
+    /// resides at `work[BHS_SIZE..]` (recv_pdu always writes new Data-Out
+    /// segments there). On success the full param is copied back to
+    /// `work[BHS_SIZE..BHS_SIZE+expected]` for `complete_param`.
+    fn collect_param_out<C: Conn + ?Sized>(
+        &mut self,
+        conn: &mut C,
+        work: &mut [u8],
+        itt: u32,
+        expected: u64,
+        received: &mut u64,
+    ) -> Result<(), StepResult> {
+        let exp = expected as usize;
+        let mut rec = *received as usize;
+        // Stash the immediate prefix that is currently at work[BHS_SIZE..].
+        let mut buf = vec![0u8; exp];
+        if rec > 0 {
+            buf[..rec].copy_from_slice(&work[BHS_SIZE..BHS_SIZE + rec]);
+        }
+        let mut r2t_sn = 0u32;
+        while rec < exp {
+            let burst = (u64::from(self.neg.max_burst_len)).min((exp - rec) as u64);
+            let mut bhs = Bhs::new();
+            bhs.set_opcode(op::R2T);
+            bhs.set_flags(flag::F_BIT);
+            bhs.set_itt(itt);
+            bhs.set_ttt(TTT);
+            bhs.set_stat_sn(self.stat_sn);
+            bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+            bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+            bhs.set_r2t_sn(r2t_sn);
+            bhs.set_buffer_offset(rec as u32);
+            bhs.set_desired_data_len(burst as u32);
+            crate::trace!(
+                "Param R2T: R2TSN={} BO={} DesiredLen={}",
+                r2t_sn,
+                rec,
+                burst
+            );
+            if send_pdu(conn, work, &bhs, 0).is_err() {
+                return Err(StepResult::Closed);
+            }
+            let mut burst_received = 0u64;
+            let mut expected_bo = rec as u64;
+            let mut data_sn = 0u32;
+            while burst_received < burst {
+                let pdu = match recv_pdu(conn, work) {
+                    Ok(p) => p,
+                    Err(()) => return Err(StepResult::Closed),
+                };
+                let obhs = &pdu.bhs;
+                if obhs.opcode() != op::SCSI_DATA_OUT {
+                    return Err(self.reject(conn, work, reject::PROTOCOL_ERROR, obhs));
+                }
+                if obhs.itt() != itt || obhs.ttt() != TTT {
+                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
+                }
+                if obhs.buffer_offset() as u64 != expected_bo {
+                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
+                }
+                if obhs.data_sn() != data_sn {
+                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
+                }
+                if pdu.dsl > self.max_recv_data_segment as usize {
+                    return Err(self.reject(conn, work, reject::PROTOCOL_ERROR, obhs));
+                }
+                if pdu.dsl as u64 > burst - burst_received {
+                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
+                }
+                if pdu.dsl > 0 {
+                    // Data is at work[BHS_SIZE..BHS_SIZE+dsl] (recv_pdu placement).
+                    buf[expected_bo as usize..expected_bo as usize + pdu.dsl]
+                        .copy_from_slice(&work[BHS_SIZE..BHS_SIZE + pdu.dsl]);
+                }
+                crate::trace!(
+                    "  Param Data-Out: BO={} DataSN={} len={}",
+                    expected_bo,
+                    data_sn,
+                    pdu.dsl
+                );
+                expected_bo += pdu.dsl as u64;
+                burst_received += pdu.dsl as u64;
+                data_sn = data_sn.wrapping_add(1);
+                rec += pdu.dsl;
+            }
+            if rec == exp {
+                break;
+            }
+            r2t_sn = r2t_sn.wrapping_add(1);
+        }
+        // Copy full param back to work for complete_param's snapshot.
+        work[BHS_SIZE..BHS_SIZE + exp].copy_from_slice(&buf);
+        *received = rec as u64;
+        Ok(())
     }
 
     // ── Full Feature: Task Management / NOP / Logout ─────────────

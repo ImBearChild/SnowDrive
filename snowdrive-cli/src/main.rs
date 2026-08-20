@@ -20,8 +20,8 @@
 //! - `--cdrom udfrw=<path>[,size=…][,mkfs=true]` or `--cdrom udfrw=ram:<size>`:
 //!   a random-writable DVD+RW (empty UDF 2.01 volume). `size=` creates a new
 //!   file (K/M/G suffixes) and writes the volume structure; `mkfs=true`
-//!   forces the structure into an existing blank file; `ram:<size>` uses
-//!   memory. An existing formatted volume opens as-is.
+//!   forces a fresh UDF volume (destructive); `ram:<size>` uses memory.
+//!   Without `mkfs=true`, the backend is opened as-is (no UDF detection).
 //!
 //! LUN numbering: all `--disk` devices first, then all `--cdrom` devices
 //! (the two planes cannot interleave). The same file path may appear on
@@ -520,10 +520,8 @@ fn build_devices<'a>(
 }
 
 /// Build a `--cdrom udfrw=` device (file or RAM).
-/// An existing formatted volume opens as-is, `size=` creates a new
-/// file + structure, `mkfs=true` forces the structure into an existing
-/// blank file, `ram:<size>` uses memory. Consumes the next `udfrw=ram:`
-/// slot from `ram_rest` and returns the remaining tail.
+/// `mkfs=true` forces a fresh UDF volume (destructive). Without `mkfs=true`,
+/// the backend is opened as-is (no UDF detection).
 #[cfg(feature = "udf_void")]
 fn build_udfrw<'a>(
     mut ram_rest: &'a mut [Vec<u8>],
@@ -595,30 +593,19 @@ fn build_udfrw<'a>(
     Ok(ram_rest)
 }
 
-/// Open (or materialize) a UdfRw volume, applying the CLI policy
-///: refuse `mkfs=true` over an existing
-/// formatted volume; require `mkfs=true` for an existing non-udfrw file.
+/// Open (or materialize) a UdfRw volume, applying the CLI policy:
+/// `mkfs=true` forces a fresh UDF volume (destructive); `mkfs=false`
+/// opens the backend as-is (no UDF detection — the layout is computed
+/// from capacity).
 #[cfg(feature = "udf_void")]
 fn udfrw_open<B: BlockStorage>(
-    mut backend: B,
+    backend: B,
     label: &str,
     mkfs: bool,
-    existed: bool,
+    _existed: bool,
     scratch: &mut [u8],
 ) -> Result<UdfRwMedia<B>, String> {
-    let formatted = UdfRwMedia::formatted(&mut backend);
-    if formatted && mkfs {
-        return Err(format!(
-            "udfrw: '{label}' is already a UdfRw volume; refusing mkfs=true (delete it first)"
-        ));
-    }
-    if !formatted && existed && !mkfs {
-        return Err(format!(
-            "udfrw: '{label}' is not a UdfRw volume; use mkfs=true to format it"
-        ));
-    }
-    let force = mkfs || !existed || !formatted;
-    UdfRwMedia::open_or_materialize(backend, label, force, scratch)
+    UdfRwMedia::open_or_materialize(backend, label, mkfs, scratch)
         .map_err(|e| format!("udfrw: {e}"))
 }
 

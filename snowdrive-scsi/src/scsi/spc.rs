@@ -190,7 +190,7 @@ pub fn execute_spc<'a, D: SpcDevice>(
     dev: &mut D,
     cmd: SpcCommand,
     data: &'a mut [u8],
-    _dsl: usize,
+    dsl: usize,
 ) -> CommandOutcome<'a> {
     match cmd {
         SpcCommand::TestUnitReady => CommandOutcome::Status,
@@ -217,8 +217,8 @@ pub fn execute_spc<'a, D: SpcDevice>(
             let total = header_len + page_bytes.len();
             let mode_len = if long { total - 2 } else { total - 1 };
             // Large enough for the CD-ROM all-pages (0x3F) response:
-            // 8-byte header + 68 bytes of pages = 76.
-            let mut buf = [0u8; 128];
+            // 8-byte header + 142 bytes of pages = 150 (with 0x01/0x1A/0x1D).
+            let mut buf = [0u8; 256];
             if long {
                 buf[0] = (mode_len >> 8) as u8;
                 buf[1] = mode_len as u8;
@@ -240,7 +240,20 @@ pub fn execute_spc<'a, D: SpcDevice>(
             }
         }
 
-        SpcCommand::ModeSelect { .. } => CommandOutcome::Status,
+        SpcCommand::ModeSelect { long: _, alloc } => {
+            if alloc == 0 {
+                return CommandOutcome::Status;
+            }
+            let expected = alloc as usize;
+            let imm = dsl.min(expected).min(data.len());
+            if imm < expected {
+                return CommandOutcome::ParamOut {
+                    expected_len: expected,
+                    immediate: &data[..imm],
+                };
+            }
+            return CommandOutcome::Status;
+        }
 
         SpcCommand::PreventAllow { prevent } => {
             dev.set_prevent(prevent);

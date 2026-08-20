@@ -131,6 +131,21 @@ const WRITE_PARAMS_PAGE: [u8; 52] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00,
 ];
+/// Read/Write Error Recovery page (0x01, SPC-3): AWRE=1 ARRE=1, minimum for
+/// Hardware Defect Management Feature (MMC-6 Table 125).
+const READ_WRITE_ERROR_RECOVERY_PAGE: [u8; 12] = [
+    0x01, 0x0A, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// Power Condition page (0x1A, SPC-3): minimal, timers disabled.
+const POWER_CONDITION_PAGE: [u8; 12] = [
+    0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// Timeout and Protect page (0x1D, MMC-6 Table 679): TMOE=0, G3Enable=0, timeouts 0.
+const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+pub(crate) fn default_write_params_page() -> &'static [u8] {
+    &WRITE_PARAMS_PAGE
+}
 /// Device-declared capability set — the single model every
 /// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
 /// 0x2A page) is built from. Devices feed their capabilities;
@@ -163,12 +178,13 @@ pub struct CdromCapabilities {
     /// protected; the UdfRw drive reports it with all protection bits
     /// clear (not write-protected).
     pub write_protect: bool,
-    /// Defect Management feature (0x0008): indicates the drive performs
-    /// hardware-level defect management. Windows' `IOCTL_DISK_IS_WRITABLE`
-    /// requires this feature to be Current alongside FeatureRandomWritable
-    /// in order to report the media as writable. Real DVD+RW drives do NOT
-    /// have this feature (it belongs to DVD-RAM), but the Windows cdrom
-    /// class driver gates all optical formatting on it.
+    /// Hardware Defect Management feature (0x0024, MMC-6 Table 123
+    /// Ver 0001b AddLen 04h, SSA=0, Mode Page 01h): indicates the
+    /// drive/media system provides a defect-free logical space. Windows'
+    /// `IOCTL_DISK_IS_WRITABLE` requires this feature Current alongside
+    /// RandomWritable to report the media as writable. Real DVD+RW drives
+    /// do NOT have this feature (it belongs to DVD-RAM), but the Windows
+    /// cdrom class driver gates all optical formatting on it.
     pub defect_management: bool,
     /// Write-side extras (CD-R/CD-RW).
     pub write_cdr: bool,
@@ -283,7 +299,7 @@ impl CdromCapabilities {
 /// The capabilities of the read-only CD-ROM devices (flat / livefs).
 pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
 /// Capabilities of the UdfRw device: reads DVD media and presents a
-/// formatted, random-writable DVD-RAM (features 0x0008 + 0x0020).
+/// formatted, random-writable DVD-RAM (features 0x0024 + 0x0020).
 pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     tray: true,
     load: true,
@@ -488,10 +504,13 @@ pub(crate) fn cdrom_mode_page_for_caps(
 ) -> Option<&'static [u8]> {
     match page {
         0x05 => Some(&WRITE_PARAMS_PAGE),
+        0x01 => Some(&READ_WRITE_ERROR_RECOVERY_PAGE),
         0x08 => Some(&CACHING_PAGE),
         0x00 => Some(&VENDOR_PAGE),
         0x0D => Some(&CDROM_PARAMS),
         0x0E => Some(&CDROM_AUDIO),
+        0x1A => Some(&POWER_CONDITION_PAGE),
+        0x1D => Some(&TIMEOUT_PROTECT_PAGE),
         0x2A if caps.random_writable && !caps.dvd_plus_rw => Some(&UDFRW_CAPABILITIES),
         0x2A => Some(&CDROM_CAPABILITIES),
         0x3F => Some(&ALL_CDROM_PAGES),
@@ -499,10 +518,13 @@ pub(crate) fn cdrom_mode_page_for_caps(
     }
 }
 /// Total byte count of all CD-ROM mode pages (for 0x3F sizing).
-pub(crate) const ALL_CDROM_PAGES_LEN: usize = CACHING_PAGE.len()
-    + VENDOR_PAGE.len()
+pub(crate) const ALL_CDROM_PAGES_LEN: usize = VENDOR_PAGE.len()
+    + READ_WRITE_ERROR_RECOVERY_PAGE.len()
+    + CACHING_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
+    + POWER_CONDITION_PAGE.len()
+    + TIMEOUT_PROTECT_PAGE.len()
     + CDROM_CAPABILITIES.len();
 /// Concatenate `parts` into a `[u8; N]` (const, for building 0x3F).
 const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
@@ -523,9 +545,12 @@ const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
 /// All CD-ROM mode pages, in MODE SENSE page order (for `0x3F`).
 const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
     &VENDOR_PAGE,
+    &READ_WRITE_ERROR_RECOVERY_PAGE,
     &CACHING_PAGE,
     &CDROM_PARAMS,
     &CDROM_AUDIO,
+    &POWER_CONDITION_PAGE,
+    &TIMEOUT_PROTECT_PAGE,
     &CDROM_CAPABILITIES,
 ]);
 // ── GET CONFIGURATION common features builder ───────────────────────
@@ -537,6 +562,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// Features included when supported by the drive. Media-dependent Current
 /// bits are derived from `media`; the Profile List remains drive-derived.
 /// - 0x0001 Core (version 2, persistent, additional length 8)
+/// - 0x0002 Morphing (Version 0001b, OCEvent)
 /// - 0x0003 Removable Medium (tray type)
 /// - 0x0004 Write Protect (only if `caps.write_protect`)
 /// - 0x0010 Random Readable (block size 2048)
@@ -546,10 +572,14 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x0020 Random Writable (only if `caps.random_writable`)
 /// - 0x0021 Incremental Streaming Writable (only if `caps.write_dvd_r`)
 /// - 0x0023 Formattable (for DVD+RW media)
+/// - 0x0024 Hardware Defect Management (Ver 0001b, SSA=0, Mode Page 01h)
 /// - 0x0026 Restricted Overwrite (only if `caps.write_dvd_rw`)
 /// - 0x002A DVD+RW (only if `caps.dvd_plus_rw`)
 /// - 0x002B DVD+R (only if `caps.read_dvd_plus_r`/`write_dvd_plus_r`)
 /// - 0x002F DVD-R/-RW Write (only if `caps.write_dvd_r`/`write_dvd_rw`)
+/// - 0x0100 Power Management (Version 0000b)
+/// - 0x0105 Timeout (Version 0001b, Group3=0)
+/// - 0x0107 Real-Time Streaming (Version 0101b, RBCB/SCS/MP2A)
 /// - 0x010A Disc Control Block (for DVD+RW media)
 #[allow(clippy::too_many_arguments)]
 pub fn build_get_config_features_for_media(
@@ -650,6 +680,18 @@ pub fn build_get_config_features_for_media(
         buf[off + 8] = 0x06; // INQ2 | DBE
         off += 12;
     }
+    // Morphing (0x0002) — MMC-6 Table 96 Version 0001b Persistent+Current
+    if include(0x0002) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x02;
+        buf[off + 2] = 0x07; // Version 0001b + persistent + current
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x02; // OCEvent=1 ASYNC=0
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
     // Removable Medium (0x0003)
     if include(0x0003) {
         buf[off] = 0x00;
@@ -677,14 +719,6 @@ pub fn build_get_config_features_for_media(
         buf[off + 3] = 0x04; // additional length
         buf[off + 4..off + 8].copy_from_slice(&[0x00, 0, 0, 0]);
         off += 8;
-    }
-    // Defect Management (0x0008) — after 0x0004 for ascending order
-    if caps.defect_management && include(0x0008) {
-        buf[off] = 0x00;
-        buf[off + 1] = 0x08;
-        buf[off + 2] = 0x02 | u8::from(media.defect_management);
-        buf[off + 3] = 0x00; // additional length
-        off += 4;
     }
     // Random Readable (0x0010) — persistent+current
     if include(0x0010) {
@@ -762,6 +796,19 @@ pub fn build_get_config_features_for_media(
         buf[off + 4..off + 12].fill(0);
         off += 12;
     }
+    // Hardware Defect Management (0x0024) — MMC-6 Table 123 Ver 0001b AddLen 04h
+    // Current when defect_management media, SSA=0, Mode Page 01h
+    if caps.defect_management && include(0x0024) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x24;
+        buf[off + 2] = 0x06 | u8::from(media.defect_management);
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x00; // SSA=0, no spare area
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
     // Restricted Overwrite (0x0026)
     if caps.write_dvd_rw && include(0x0026) {
         buf[off] = 0x00;
@@ -810,6 +857,38 @@ pub fn build_get_config_features_for_media(
         buf[off + 3] = 0x04; // additional length 4
         buf[off + 4] = 0x00; // reserved
         buf[off + 5] = 0x0F; // multi|high|ultra|ultra+
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // Power Management (0x0100) — MMC-6 Table 178 Version 0000b
+    if include(0x0100) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x00;
+        buf[off + 2] = 0x03; // Version 0000b + persistent + current
+        buf[off + 3] = 0x00; // additional length
+        off += 4;
+    }
+    // Timeout (0x0105) — MMC-6 Table 186 Version 0001b AddLen 04h
+    if include(0x0105) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x05;
+        buf[off + 2] = 0x07; // Version 0001b + persistent + current
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x00; // Group3=0
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00; // Unit Length
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // Real-Time Streaming (0x0107) — MMC-6 Table 190 Version 0101b
+    if include(0x0107) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x07;
+        buf[off + 2] = 0x17; // Version 0101b + persistent + current
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x1C; // RBCB=1 SCS=1 MP2A=1
+        buf[off + 5] = 0x00;
         buf[off + 6] = 0x00;
         buf[off + 7] = 0x00;
         off += 8;
@@ -1145,12 +1224,15 @@ mod tests {
         assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + pages */
         assert_eq!(buf[0], ((n - 2) >> 8) as u8);
         assert_eq!(buf[1], (n - 2) as u8); /* mode data length */
-        // Page codes in order: 0x00, 0x08 (caching), 0x0D, 0x0E, 0x2A.
-        assert_eq!(buf[8] & 0x3F, 0x00);
-        assert_eq!(buf[12] & 0x3F, 0x08);
-        assert_eq!(buf[32] & 0x3F, 0x0D);
-        assert_eq!(buf[36] & 0x3F, 0x0E);
-        assert_eq!(buf[52] & 0x3F, 0x2A);
+        // Walk pages by length fields and collect codes — order: 0x00,0x01,0x08,0x0D,0x0E,0x1A,0x1D,0x2A.
+        let mut codes = Vec::new();
+        let mut off = 8;
+        while off + 2 <= n {
+            let page_len = buf[off + 1] as usize;
+            codes.push(buf[off] & 0x3F);
+            off += page_len + 2;
+        }
+        assert_eq!(codes, vec![0x00, 0x01, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
     }
     #[test]
     fn cdrom_mode_page_all_pages_contains_each_page() {
@@ -1164,7 +1246,7 @@ mod tests {
             codes.push(all[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x00, 0x08, 0x0D, 0x0E, 0x2A]);
+        assert_eq!(codes, vec![0x00, 0x01, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
     }
     // ── GET CONFIGURATION common features ───────────────────────────
     #[test]
@@ -1224,22 +1306,41 @@ mod tests {
         );
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &mut buf);
-        // Profile List (0x0000) at 8, then Core (0x0001) at 16, Removable
-        // (0x0003) at 28, Random Readable (0x0010), Multi-Read (0x001D),
-        // CD Read (0x001E).
-        assert!(n >= 48);
-        // Profile List header at byte 8.
-        assert_eq!(buf[8], 0x00);
-        assert_eq!(buf[9], 0x00);
-        // Core feature at byte 16.
-        assert_eq!(buf[16], 0x00);
-        assert_eq!(buf[17], 0x01);
-        // Removable Medium at byte 28.
-        assert_eq!(buf[28], 0x00);
-        assert_eq!(buf[29], 0x03);
+        // Features now include Morphing (0x0002) between Core and Removable,
+        // so offsets shifted by 8. Walk descriptors instead of fixed offsets.
+        assert!(n >= 56);
+        let mut off = 8;
+        let mut found = [false; 4]; // 0:0000, 1:0001, 2:0002, 3:0003
+        let mut removable_payload = 0;
+        while off + 4 <= n {
+            let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let add_len = buf[off + 3] as usize;
+            match code {
+                0x0000 => {
+                    assert_eq!(buf[off + 1], 0x00);
+                    found[0] = true;
+                }
+                0x0001 => {
+                    assert_eq!(buf[off + 1], 0x01);
+                    found[1] = true;
+                }
+                0x0002 => {
+                    assert_eq!(buf[off + 1], 0x02);
+                    found[2] = true;
+                }
+                0x0003 => {
+                    assert_eq!(buf[off + 1], 0x03);
+                    found[3] = true;
+                    removable_payload = buf[off + 4];
+                }
+                _ => {}
+            }
+            off += 4 + add_len;
+        }
+        assert!(found.iter().all(|&b| b));
         // Removable feature byte 4: Loading Mechanism Type (001b tray) << 5
         // | Load << 4 | Eject << 3 | Lock.
-        assert_eq!(buf[32], 0x39);
+        assert_eq!(removable_payload, 0x39);
     }
     #[test]
     fn cdrom_get_config_udfrw_features_no_mrw() {
@@ -1541,5 +1642,131 @@ mod tests {
         }
         assert!(saw_rw, "Random Writable feature must be present");
         assert!(saw_dvdram, "DVD-RAM feature must be present");
+    }
+    #[test]
+    fn dvd_ram_mandatory_features_table212() {
+        // MMC-6 Table 212 mandatory for DVD-RAM: 0000,0001,0002,0003,0010,001F,0020,0023,0024,0100,0105,0107
+        let media = MediaState {
+            profile: CurrentProfile::DvdRam,
+            present: true,
+            ready: true,
+            formatted: true,
+            formattable: true,
+            erasable: true,
+            write_protected: false,
+            random_writable: true,
+            defect_management: true,
+            max_lba: 0x1234,
+            block_size: SECTOR_SIZE,
+        };
+        let mut tmp = [0u8; 512];
+        // Also test via build_get_config_response_for_media path
+        let outcome =
+            build_get_config_response_for_media(&mut tmp, &UDFRW_CAPS, &media, 0x00, 0x0000, 512);
+        let mut check = [0u8; 512];
+        let n = data_in(outcome, &mut check);
+        // Walk and collect codes and header checks
+        let mut codes = Vec::new();
+        let mut off = 8;
+        let mut saw_0024_ver = None;
+        let mut saw_0024_len = None;
+        let mut saw_0024_ssa = None;
+        let mut saw_0002 = false;
+        let mut saw_0100 = false;
+        let mut saw_0105 = false;
+        let mut saw_0107 = false;
+        while off + 4 <= n {
+            let code = u16::from_be_bytes([check[off], check[off + 1]]);
+            let ver_pers_cur = check[off + 2];
+            let add_len = check[off + 3] as usize;
+            codes.push(code);
+            match code {
+                0x0002 => {
+                    saw_0002 = true;
+                    assert_eq!(ver_pers_cur, 0x07, "Morphing Version 0001b + P+C");
+                    assert_eq!(add_len, 0x04);
+                    assert_eq!(check[off + 4], 0x02, "OCEvent=1");
+                }
+                0x0024 => {
+                    saw_0024_ver = Some(ver_pers_cur);
+                    saw_0024_len = Some(add_len);
+                    saw_0024_ssa = Some(check[off + 4]);
+                    assert_eq!(add_len, 0x04);
+                    // Version 0001b (0x04) + Persistent 1 (0x02) + Current 1 =0x07
+                    assert_eq!(ver_pers_cur, 0x07, "0024 ver 0001b + P + Current");
+                    assert_eq!(check[off + 4] & 0x80, 0x00, "SSA=0");
+                }
+                0x0100 => {
+                    saw_0100 = true;
+                    assert_eq!(ver_pers_cur, 0x03);
+                    assert_eq!(add_len, 0x00);
+                }
+                0x0105 => {
+                    saw_0105 = true;
+                    assert_eq!(ver_pers_cur, 0x07);
+                    assert_eq!(add_len, 0x04);
+                }
+                0x0107 => {
+                    saw_0107 = true;
+                    assert_eq!(ver_pers_cur, 0x17);
+                    assert_eq!(add_len, 0x04);
+                }
+                0x0008 => panic!("old defect code 0x0008 must not be emitted, should be 0x0024"),
+                _ => {}
+            }
+            off += 4 + add_len;
+        }
+        // Check mandatory presence
+        for &need in &[
+            0x0000u16, 0x0001, 0x0002, 0x0003, 0x0010, 0x001F, 0x0020, 0x0023, 0x0024, 0x0100,
+            0x0105, 0x0107,
+        ] {
+            assert!(
+                codes.contains(&need),
+                "mandatory DVD-RAM feature {:04X} missing",
+                need
+            );
+        }
+        assert!(saw_0002, "Morphing 0002 missing");
+        assert!(saw_0100, "Power Management 0100 missing");
+        assert!(saw_0105, "Timeout 0105 missing");
+        assert!(saw_0107, "Real-Time Streaming 0107 missing");
+        assert_eq!(saw_0024_ver, Some(0x07));
+        assert_eq!(saw_0024_len, Some(0x04));
+        assert_eq!(saw_0024_ssa, Some(0x00));
+        // Defect management must be Current when media defect_management true
+        assert!(codes.contains(&0x0024));
+        // Also verify not-current case: defect_management false -> Current 0 -> byte2 0x06
+        let media_off = MediaState {
+            defect_management: false,
+            ..media
+        };
+        let mut tmp2 = [0u8; 512];
+        let out2 = build_get_config_response_for_media(
+            &mut tmp2,
+            &UDFRW_CAPS,
+            &media_off,
+            0x00,
+            0x0000,
+            512,
+        );
+        let mut buf2 = [0u8; 512];
+        let n2 = data_in(out2, &mut buf2);
+        let mut off2 = 8;
+        let mut ver_off = None;
+        while off2 + 4 <= n2 {
+            let code = u16::from_be_bytes([buf2[off2], buf2[off2 + 1]]);
+            let add_len = buf2[off2 + 3] as usize;
+            if code == 0x0024 {
+                ver_off = Some(buf2[off2 + 2]);
+                break;
+            }
+            off2 += 4 + add_len;
+        }
+        assert_eq!(
+            ver_off,
+            Some(0x06),
+            "defect_management false -> Current 0 => 0x06"
+        );
     }
 }

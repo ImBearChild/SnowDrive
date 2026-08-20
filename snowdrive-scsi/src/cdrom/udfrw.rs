@@ -3,13 +3,18 @@
 //! A random-writable DVD-RAM over any [`BlockStorage`] backend, built on the
 //! pure volume skeleton of [`crate::udf_void`].
 //!
-//! - **Materialize** the empty UDF 2.01 volume into the backend (once, on
-//!   first use) by streaming the structured sectors from
-//!   [`udf_void::gen_sector`] and patching the multi-sector SBD CRC.
-//! - **Detect** an already-formatted volume (valid AVDP at sector 256) so
-//!   reopening a persistent image does not rewrite it.
+//! - **Materialize** an empty UDF 2.01 volume into the backend (only when
+//!   `mkfs=true` is specified at CLI open time) by streaming the structured
+//!   sectors from [`udf_void::gen_sector`] and patching the multi-sector SBD
+//!   CRC.
+//! - **Detect** an existing UDF volume (valid AVDP at sector 256) via
+//!   [`Self::has_udf`] — used only by CLI `mkfs` policy, not by FORMAT UNIT.
 //! - **Data plane**: random byte-plane reads/writes through the backend.
 //! - **Geometry**: capacity / last LBA / lead-out for the device layer.
+//!
+//! FORMAT UNIT clears all logical blocks (zero-fill) without creating or
+//! rebuilding any file system. The host OS creates file systems (e.g. UDF)
+//! on top of the empty logical blocks.
 //!
 //! Free space is left as zeros; the OS filesystem (`udf`) allocates and
 //! writes it later. This layer never parses UDF contents.
@@ -29,7 +34,12 @@ pub struct UdfRwMedia<B: BlockStorage> {
 impl<B: BlockStorage> UdfRwMedia<B> {
     /// Whether `backend` already holds a formatted UdfRw volume — a valid
     /// AVDP at sector 256 (tag id 2 + checksum + CRC).
-    pub fn formatted(backend: &mut B) -> bool {
+    ///
+    /// This detects UDF structure presence, not logical format state.
+    /// The logical medium is always formatted (logical blocks always exist).
+    /// This function is used only by CLI `mkfs` policy to decide whether
+    /// to materialize a new UDF volume.
+    pub fn has_udf(backend: &mut B) -> bool {
         let mut sector = [0u8; SECTOR_SIZE as usize];
         let off = u64::from(crate::udf_void::AVDP_LBA) * u64::from(SECTOR_SIZE);
         if backend.seek(embedded_io::SeekFrom::Start(off)).is_err()
@@ -45,19 +55,25 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     /// `force_mkfs` re-formats even when a valid volume is present (the
     /// `mkfs=true` CLI contract). `scratch` (≥ 1 byte) backs the space
     /// bitmap CRC computation.
+    ///
+    /// When `force_mkfs` is false, the existing backend content is used as-is
+    /// (no UDF detection — the layout is computed from capacity). When
+    /// `force_mkfs` is true, a new UDF 2.01 volume is materialized
+    /// (destructive).
     pub fn open_or_materialize(
         backend: B,
         label: &str,
         force_mkfs: bool,
         scratch: &mut [u8],
     ) -> Result<Self, UdfRwError> {
-        let mut b = backend;
-        if !force_mkfs && Self::formatted(&mut b) {
+        let b = backend;
+        if force_mkfs {
+            Self::materialize(b, label, scratch)
+        } else {
             let layout =
                 compute_layout(sectors_of(b.capacity())?, label).map_err(UdfRwError::Layout)?;
-            return Ok(Self { backend: b, layout });
+            Ok(Self { backend: b, layout })
         }
-        Self::materialize(b, label, scratch)
     }
 
     /// Materialize the empty UDF 2.01 volume into `backend` unconditionally
@@ -163,6 +179,15 @@ impl<B: BlockStorage> UdfRwMedia<B> {
             .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
     }
 
+    /// FORMAT UNIT for the emulated DVD-RAM medium.
+    ///
+    /// Clears all logical blocks (zero-fill). Does **not** create or rebuild
+    /// any file system — UDF volume creation is the host OS's responsibility
+    /// and is triggered only by `mkfs=true` at CLI device open time.
+    pub fn format_unit(&mut self) -> Result<(), BlockStorageError> {
+        self.clear()
+    }
+
     /// Clear the logical medium as the destructive part of FORMAT UNIT.
     /// Formatting is completed logically by the command handler; the host
     /// writes the filesystem structures afterwards.
@@ -205,6 +230,30 @@ fn write_sector<B: BlockStorage>(
     backend
         .write_all(sector)
         .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))
+}
+
+fn write_at<B: BlockStorage>(
+    backend: &mut B,
+    lba: u32,
+    sector: &[u8; SECTOR_SIZE as usize],
+) -> Result<(), BlockStorageError> {
+    let off = u64::from(lba) * u64::from(SECTOR_SIZE);
+    backend
+        .seek(embedded_io::SeekFrom::Start(off))
+        .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
+    backend
+        .write_all(sector)
+        .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
+}
+
+fn write_sector_io<B: BlockStorage>(
+    backend: &mut B,
+    layout: &Layout,
+    lba: u32,
+    sector: &mut [u8; SECTOR_SIZE as usize],
+) -> Result<(), BlockStorageError> {
+    gen_sector(layout, lba, sector);
+    write_at(backend, lba, sector)
 }
 
 // ── Error type ──────────────────────────────────────────────────────
@@ -261,16 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn formatted_detects_blank() {
+    fn has_udf_detects_blank() {
         let mut img = ram(2048 * 4096);
-        assert!(!UdfRwMedia::formatted(&mut RamBackend::new(&mut img)));
+        assert!(!UdfRwMedia::has_udf(&mut RamBackend::new(&mut img)));
     }
 
     #[test]
     fn materialize_creates_valid_volume() {
         let mut img = ram(2048 * 4096);
         let mut m = materialize_into(&mut img);
-        assert!(UdfRwMedia::formatted(m.backend()));
+        assert!(UdfRwMedia::has_udf(m.backend()));
         let mut s = [0u8; 2048];
         m.read_data(16 * 2048, &mut s).unwrap();
         assert_eq!(&s[1..6], b"BEA01");
@@ -287,6 +336,19 @@ mod tests {
         let mut out = [0u8; 2048];
         m.read_data(off, &mut out).unwrap();
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn format_unit_clears_medium() {
+        let mut img = ram(2048 * 4096);
+        let mut m = materialize_into(&mut img);
+        m.write_data(300 * 2048, &[0xA5; 2048]).unwrap();
+        m.format_unit().unwrap();
+        // FORMAT UNIT clears all logical blocks — no UDF structures remain.
+        assert!(!UdfRwMedia::has_udf(m.backend()));
+        let mut sector = [0u8; 2048];
+        m.read_data(16 * 2048, &mut sector).unwrap();
+        assert_eq!(sector, [0u8; 2048]);
     }
 
     #[test]

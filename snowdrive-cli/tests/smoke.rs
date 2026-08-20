@@ -494,11 +494,11 @@ fn serve_starts_with_udfrw_ram() {
     assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 }
 
-/// `udfrw=<file>` on a blank existing file is refused ("use mkfs=true");
-/// with `mkfs=true` it materializes and the server starts.
+/// `udfrw=<file>` on a blank existing file opens as-is (no UDF detection);
+/// `mkfs=true` materializes a fresh UDF volume.
 #[cfg(all(unix, feature = "udf_void"))]
 #[test]
-fn serve_udfrw_file_requires_mkfs() {
+fn serve_udfrw_file_opens_as_is() {
     use std::io::BufRead;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -510,24 +510,12 @@ fn serve_udfrw_file_requires_mkfs() {
     drop(f);
     let path = img.to_string_lossy().to_string();
 
-    // Blank file + no mkfs → refused before bind.
-    let out = run(&[
-        "serve",
-        "--cdrom",
-        &format!("udfrw={path}"),
-        "--iscsi",
-        "127.0.0.1:0",
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("mkfs=true"), "got: {err}");
-
-    // mkfs=true → materializes, announces 'listening', exits 0 on SIGINT.
+    // Blank file + no mkfs → opens as-is, announces 'listening'.
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
             "--cdrom",
-            &format!("udfrw={path},mkfs=true"),
+            &format!("udfrw={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -573,13 +561,68 @@ fn serve_udfrw_file_requires_mkfs() {
     let status = child.wait().expect("wait for snowdrive");
     assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 
+    // mkfs=true → materializes a fresh UDF volume.
+    let mut child2 = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
+        .args([
+            "serve",
+            "--cdrom",
+            &format!("udfrw={path},mkfs=true"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowdrive");
+
+    let (ready_tx2, ready_rx2) = mpsc::channel();
+    {
+        let stderr = child2.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("listening") {
+                    let _ = ready_tx2.send(());
+                    return;
+                }
+                line.clear();
+            }
+        });
+    }
+
+    if ready_rx2.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child2.id().to_string())
+            .status();
+        let _ = child2.wait();
+        panic!("snowdrive did not announce 'listening' with mkfs=true");
+    }
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child2.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child2.wait().expect("wait for snowdrive");
+    assert!(
+        status.success(),
+        "snowdrive should exit 0 after SIGINT with mkfs=true"
+    );
+
     let _ = std::fs::remove_file(&img);
 }
 
-/// `udfrw=<file>,mkfs=true` on an already-formatted volume is refused.
+/// `udfrw=<file>,mkfs=true` on an already-formatted volume is accepted
+/// (forced rewrite — the UDF volume is re-materialized).
 #[cfg(all(unix, feature = "udf_void"))]
 #[test]
-fn serve_udfrw_refuses_mkfs_on_formatted() {
+fn serve_udfrw_mkfs_forced_rewrite() {
     use std::io::BufRead;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -591,7 +634,7 @@ fn serve_udfrw_refuses_mkfs_on_formatted() {
     drop(f);
     let path = img.to_string_lossy().to_string();
 
-    // Format first via mkfs=true, then refuse a second mkfs=true.
+    // Format first via mkfs=true.
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
@@ -639,17 +682,53 @@ fn serve_udfrw_refuses_mkfs_on_formatted() {
     assert!(sent, "kill -INT failed");
     assert!(child.wait().expect("wait for snowdrive").success());
 
-    // Second mkfs=true on the now-formatted file → refused.
-    let out = run(&[
-        "serve",
-        "--cdrom",
-        &format!("udfrw={path},mkfs=true"),
-        "--iscsi",
-        "127.0.0.1:0",
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("refusing mkfs=true"), "got: {err}");
+    // Second mkfs=true on the now-formatted file → accepted (forced rewrite).
+    let mut child2 = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
+        .args([
+            "serve",
+            "--cdrom",
+            &format!("udfrw={path},mkfs=true"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowdrive");
+
+    let (ready_tx2, ready_rx2) = mpsc::channel();
+    {
+        let stderr = child2.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("listening") {
+                    let _ = ready_tx2.send(());
+                    return;
+                }
+                line.clear();
+            }
+        });
+    }
+
+    if ready_rx2.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child2.id().to_string())
+            .status();
+        let _ = child2.wait();
+        panic!("snowdrive did not announce 'listening' on second mkfs=true");
+    }
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child2.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+    assert!(child2.wait().expect("wait for snowdrive").success());
 
     let _ = std::fs::remove_file(&img);
 }

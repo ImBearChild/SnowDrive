@@ -7,7 +7,7 @@ use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
-use crate::scsi::scsi::Sense;
+use crate::scsi::scsi::{asc, Sense, SenseKey};
 
 /// Device type reported via INQUIRY (device.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,17 @@ pub enum CommandOutcome<'a> {
     },
     /// Command failed, sense data in `Sense`.
     CheckCondition(Sense),
+    /// Host → device: parameter list (MODE SELECT, FORMAT UNIT, …).
+    /// `expected_len` is the total parameter length the device expects
+    /// (from the CDB's allocation field); `immediate` is the already
+    /// received prefix borrowed from `data[0..dsl]`. The transport must
+    /// receive the remaining `expected_len - immediate.len()` bytes via
+    /// its Data-Out phase (iSCSI R2T / USB bulk OUT) and then call
+    /// [`ScsiDevice::complete_param`].
+    ParamOut {
+        expected_len: usize,
+        immediate: &'a [u8],
+    },
 }
 
 /// Core command-processing error (no_std, `core::error::Error`).
@@ -113,6 +124,16 @@ pub trait ScsiDevice {
     fn sense(&self) -> &Sense;
 
     fn device_type(&self) -> DeviceType;
+
+    /// Complete a parameter-list Data-Out phase (`ParamOut`).
+    ///
+    /// `cdb` is the original CDB, `data` the full parameter list
+    /// (`expected_len` bytes) already collected in the transport's
+    /// work buffer. Returns `Status` on success or `CheckCondition`.
+    fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome<'static> {
+        let _ = (cdb, data);
+        CommandOutcome::CheckCondition(Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0))
+    }
 }
 
 /// Borrowed, type-erased device container.
@@ -189,6 +210,16 @@ impl ScsiDevice for Device<'_> {
             Self::CdBlock(dev) => <CDBlockDevice as ScsiDevice>::device_type(dev),
             #[cfg(feature = "cdrom")]
             Self::Cdrom(dev) => <CdromDrive<'_> as ScsiDevice>::device_type(dev),
+        }
+    }
+
+    fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome<'static> {
+        match self {
+            Self::Block(dev) => dev.complete_param(cdb, data),
+            #[cfg(feature = "std")]
+            Self::CdBlock(dev) => dev.complete_param(cdb, data),
+            #[cfg(feature = "cdrom")]
+            Self::Cdrom(dev) => dev.complete_param(cdb, data),
         }
     }
 }

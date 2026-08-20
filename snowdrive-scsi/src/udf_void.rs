@@ -370,10 +370,11 @@ pub fn crc16(data: &[u8], crc: u16) -> u16 {
 /// descriptor version 3, valid tag checksum and a matching descriptor CRC
 /// over the 16-byte body (AVDP size 32 − tag 16).
 ///
-/// Used by the media layer to detect an already-formatted UdfRw volume
-///   . Accepts any valid AVDP: the compact
-/// UdfRw anchor (crc_len = 16, CRC over the two extents) or a standard
-/// full-sector anchor (crc_len = 496, CRC over the rest of the sector).
+/// Used by `UdfRwMedia::has_udf` to detect an existing UDF volume in the
+/// backend. This is used only by CLI `mkfs` policy, not by FORMAT UNIT.
+/// Accepts any valid AVDP: the compact UdfRw anchor (crc_len = 16, CRC over
+/// the two extents) or a standard full-sector anchor (crc_len = 496, CRC
+/// over the rest of the sector).
 pub fn is_avdp(sector: &[u8]) -> bool {
     if sector.len() < 32 {
         return false;

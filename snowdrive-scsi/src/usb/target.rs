@@ -144,6 +144,17 @@ enum BotState {
         status: CswStatus,
         chunk: usize,
     },
+    /// Parameter-list Data-Out: receive `expected` bytes contiguously
+    /// into `data[0..expected]` then call `complete_param`.
+    ParamOut {
+        expected: u64,
+        received: u64,
+        tag: u32,
+        lun: usize,
+        cdb: [u8; 16],
+        cdb_len: usize,
+        chunk: usize,
+    },
     /// Data-Out host overrun: read-and-discard until a short packet.
     DataOutOverrun {
         tag: u32,
@@ -212,6 +223,10 @@ impl BotSession {
                 len: chunk,
                 probe: false,
             },
+            BotState::ParamOut { chunk, .. } => BotNeed::NeedOut {
+                len: chunk,
+                probe: false,
+            },
             BotState::DataOutOverrun { chunk, .. } => BotNeed::NeedOut {
                 len: chunk,
                 probe: true,
@@ -263,6 +278,7 @@ impl BotSession {
             BotState::Command { got } => self.poll_command(ev, data, devs, got),
             BotState::DataIn { .. } => self.poll_data_in(ev, data, devs),
             BotState::DataOut { .. } => self.poll_data_out(ev, data, devs),
+            BotState::ParamOut { .. } => self.poll_param_out(ev, data, devs),
             BotState::DataOutOverrun { .. } => self.poll_overrun(ev),
             BotState::Csw => self.poll_csw(ev),
             BotState::CswZlp => self.poll_csw_zlp(ev),
@@ -513,6 +529,72 @@ impl BotSession {
                 };
                 BotStep::NeedOut {
                     len: chunk,
+                    probe: false,
+                }
+            }
+            CommandOutcome::ParamOut {
+                expected_len,
+                immediate,
+            } => {
+                let expected = expected_len as u64;
+                if expected == 0 {
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                }
+                if cbw.dir != BotDir::DataOut {
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                }
+                if declared != expected {
+                    // CBW declares a different length than the CDB: drain and fail.
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                }
+                let imm_len = immediate.len() as u64;
+                if imm_len > expected {
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                }
+                // `immediate` is already `&data[..imm_len]`; no copy needed — it
+                // already resides at the start of the accumulation buffer.
+                let imm_len_copy = imm_len;
+                let _ = immediate;
+                let imm_len = imm_len_copy;
+                if imm_len == expected {
+                    // All present (e.g., test calling do_cmd with full dsl). No Data-Out.
+                    let mut cdb_buf = [0u8; 16];
+                    let cdb_len = cdb.len().min(16);
+                    cdb_buf[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
+                    let outcome2 =
+                        devs[lun].complete_param(&cdb_buf[..cdb_len], &data[..expected as usize]);
+                    let status = match outcome2 {
+                        CommandOutcome::Status => CswStatus::Passed,
+                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        _ => CswStatus::Failed,
+                    };
+                    return self.finish_cmd(cbw, 0, status, data.len());
+                }
+                // Need to receive remaining.
+                let mut cdb_buf = [0u8; 16];
+                let cdb_len = cdb.len().min(16);
+                cdb_buf[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
+                let chunk = ((expected - imm_len) as usize).min(data.len() - imm_len as usize);
+                // Also ensure chunk covers remaining, but driver will loop.
+                // Use declared remaining as chunk for first NeedOut.
+                let first_chunk = (expected - imm_len) as usize;
+                let first_chunk = first_chunk.min(data.len());
+                self.state = BotState::ParamOut {
+                    expected,
+                    received: imm_len,
+                    tag: cbw.tag,
+                    lun,
+                    cdb: cdb_buf,
+                    cdb_len,
+                    chunk: first_chunk,
+                };
+                // We have already placed immediate at data[0..imm_len]; the next
+                // OutRecv will be appended at data[received..].
+                // Need to request the remaining bytes.
+                // If chunk is computed from remaining, use it.
+                let _ = chunk; // keep for debug
+                BotStep::NeedOut {
+                    len: first_chunk,
                     probe: false,
                 }
             }
@@ -769,6 +851,108 @@ impl BotSession {
                     probe: false,
                 }
             }
+            BotEvent::InSent => BotStep::Done(BotStepResult::Error(BotTargetError::Internal)),
+        }
+    }
+
+    // ── Parameter-list Data-Out ─────────────────────────────────────
+
+    fn poll_param_out<'a, 'e, D: ScsiDevice>(
+        &'a mut self,
+        ev: BotEvent<'e>,
+        data: &'a mut [u8],
+        devs: &mut [D],
+    ) -> BotStep<'a> {
+        let st = self.state;
+        let BotState::ParamOut {
+            expected,
+            received,
+            tag,
+            lun,
+            cdb,
+            cdb_len,
+            chunk,
+        } = st
+        else {
+            unreachable!("poll_param_out entered outside ParamOut state")
+        };
+        match ev {
+            BotEvent::OutRecv { data: recv } => {
+                let remaining = expected - received;
+                if recv.len() as u64 > remaining {
+                    // Host overran declared length: copy what fits, drain rest.
+                    let fit = remaining as usize;
+                    if fit > 0 {
+                        data[received as usize..received as usize + fit]
+                            .copy_from_slice(&recv[..fit]);
+                    }
+                    let status = match devs[lun]
+                        .complete_param(&cdb[..cdb_len], &data[..expected as usize])
+                    {
+                        CommandOutcome::Status => CswStatus::Passed,
+                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        _ => CswStatus::Failed,
+                    };
+                    // Extra bytes beyond declared are already in recv[fit..]; treat as overrun.
+                    // If extra exactly fills a packet, we still need to probe.
+                    self.state = BotState::DataOutOverrun {
+                        tag,
+                        residue: 0,
+                        status,
+                        chunk: data.len(),
+                    };
+                    // If recv had extra and was short packet (< chunk), we can go straight to CSW.
+                    // For now, enter overrun probe to drain any further excess.
+                    return BotStep::NeedOut {
+                        len: data.len(),
+                        probe: true,
+                    };
+                }
+                // Normal case: copy recv into param buffer.
+                data[received as usize..received as usize + recv.len()].copy_from_slice(recv);
+                let received = received + recv.len() as u64;
+                if received >= expected {
+                    let cdb_slice = &cdb[..cdb_len];
+                    let outcome = devs[lun].complete_param(cdb_slice, &data[..expected as usize]);
+                    let status = match outcome {
+                        CommandOutcome::Status => CswStatus::Passed,
+                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        _ => CswStatus::Failed,
+                    };
+                    if received > expected {
+                        return self.finish_csw_bot(tag, 0, status);
+                    }
+                    // Exact: probe for host overrun before CSW (like DataOut).
+                    self.state = BotState::DataOutOverrun {
+                        tag,
+                        residue: 0,
+                        status,
+                        chunk: data.len(),
+                    };
+                    return BotStep::NeedOut {
+                        len: data.len(),
+                        probe: true,
+                    };
+                }
+                let next = ((expected - received) as usize).min(data.len() - received as usize);
+                self.state = BotState::ParamOut {
+                    expected,
+                    received,
+                    tag,
+                    lun,
+                    cdb,
+                    cdb_len,
+                    chunk: next,
+                };
+                BotStep::NeedOut {
+                    len: next,
+                    probe: false,
+                }
+            }
+            BotEvent::OutIdle => BotStep::NeedOut {
+                len: chunk,
+                probe: false,
+            },
             BotEvent::InSent => BotStep::Done(BotStepResult::Error(BotTargetError::Internal)),
         }
     }

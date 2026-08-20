@@ -10,7 +10,8 @@
 
 use crate::cdrom::common::{
     build_get_config_response_for_media, build_read_buffer_capacity, build_read_disc_info,
-    cdrom_mode_page_for_caps, CdromCapabilities, DiscInfo, MediaState, CDROM_IDENTITY, SECTOR_SIZE,
+    cdrom_mode_page_for_caps, default_write_params_page, CdromCapabilities, DiscInfo, MediaState,
+    CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::cdrom::media::CdMedia;
 use crate::scsi::device::{CommandOutcome, DeviceType};
@@ -44,7 +45,7 @@ pub struct CdromDrive<'a> {
     pub(crate) tray_open: bool,
     /// Page 0x05 write parameter cache (plan /).
     #[allow(dead_code)] // used in later milestones
-    pub(crate) mode_page_05: [u8; 16],
+    pub(crate) mode_page_05: [u8; 52],
     #[allow(dead_code)]
     pub(crate) mode_page_05_valid: bool,
     /// `true` when `load()` was requested by START STOP Load=1 on empty tray
@@ -232,6 +233,18 @@ impl<'a> CdromDrive<'a> {
             return Ok(self.not_ready());
         }
 
+        if let Some(SpcCommand::ModeSense {
+            long,
+            page: 0x05,
+            alloc,
+        }) = spc
+        {
+            return Ok(self.mode_sense_write_params(long, alloc, data));
+        }
+        if let Some(SpcCommand::ModeSelect { long, alloc }) = spc {
+            return Ok(self.mode_select_cmd(long, alloc, data, dsl));
+        }
+
         let outcome = if let Some(cmd) = spc {
             execute_spc(self, cmd, data, dsl)
         } else {
@@ -242,6 +255,7 @@ impl<'a> CdromDrive<'a> {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
             }
             match op {
+                op::FORMAT_UNIT => self.format_unit_cmd(cdb, data, dsl),
                 // ── READ(6/10/12/16) ────────────────────────────
                 op::READ_6 | op::READ_10 | op::READ_12 | op::READ_16 => {
                     let Some((lba, count)) = cdb_read_args(op, cdb) else {
@@ -373,6 +387,36 @@ impl<'a> CdromDrive<'a> {
                 // ── CLOSE TRACK (0x5B) ───────────────────────────
                 op::CLOSE_TRACK => CommandOutcome::Status,
 
+                // ── BLANK (0xA1) — for DVD-RAM alias to FORMAT (BurnAware clear)
+                0xA1 => {
+                    if self.is_random_writable() {
+                        #[cfg(feature = "udf_void")]
+                        {
+                            if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
+                                match media.format_unit() {
+                                    Ok(()) => {
+                                        self.pending_ua = Some(Sense::new(
+                                            SenseKey::UnitAttention,
+                                            asc::MEDIUM_MAY_HAVE_CHANGED,
+                                            0,
+                                        ));
+                                        CommandOutcome::Status
+                                    }
+                                    Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
+                                }
+                            } else {
+                                self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
+                            }
+                        }
+                        #[cfg(not(feature = "udf_void"))]
+                        {
+                            self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
+                        }
+                    } else {
+                        self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+                    }
+                }
+
                 // ── Unknown → INVALID COMMAND ─────────────────────
                 _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND),
             }
@@ -382,6 +426,160 @@ impl<'a> CdromDrive<'a> {
             self.sense = Sense::clear();
         }
         Ok(outcome)
+    }
+
+    fn mode_sense_write_params<'b>(
+        &self,
+        long: bool,
+        alloc: u16,
+        data: &'b mut [u8],
+    ) -> CommandOutcome<'b> {
+        let page = if self.mode_page_05_valid {
+            &self.mode_page_05[..]
+        } else {
+            default_write_params_page()
+        };
+        let header_len = if long { 8 } else { 4 };
+        let total = header_len + page.len();
+        let mode_len = if long { total - 2 } else { total - 1 };
+        let mut buf = [0u8; 64];
+        if long {
+            buf[0..2].copy_from_slice(&(mode_len as u16).to_be_bytes());
+            buf[2] = self.medium_type();
+        } else {
+            buf[0] = mode_len as u8;
+            buf[1] = self.medium_type();
+        }
+        buf[header_len..total].copy_from_slice(page);
+        let n = total.min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::DataIn {
+            transfer_len: n as u64,
+            byte_offset: 0,
+            immediate: &data[..n],
+        }
+    }
+
+    fn mode_select_cmd<'b>(
+        &mut self,
+        long: bool,
+        alloc: u16,
+        data: &'b mut [u8],
+        dsl: usize,
+    ) -> CommandOutcome<'b> {
+        let expected = alloc as usize;
+        if expected == 0 {
+            return CommandOutcome::Status;
+        }
+        let imm = dsl.min(expected).min(data.len());
+        if imm < expected {
+            return CommandOutcome::ParamOut {
+                expected_len: expected,
+                immediate: &data[..imm],
+            };
+        }
+        // Full parameter already present (iSCSI Immediate or direct test).
+        return self.complete_mode_select(long, alloc, &data[..expected]);
+    }
+
+    fn complete_mode_select(
+        &mut self,
+        long: bool,
+        _alloc: u16,
+        data: &[u8],
+    ) -> CommandOutcome<'static> {
+        let header_len = if long { 8 } else { 4 };
+        if data.len() < header_len {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let block_len = if long {
+            usize::from(u16::from_be_bytes([data[6], data[7]]))
+        } else {
+            usize::from(data[3])
+        };
+        let page_start = header_len + block_len;
+        if page_start + 2 > data.len() {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let page_code = data[page_start] & 0x3F;
+        let page_len = usize::from(data[page_start + 1]);
+        let end = page_start + 2 + page_len;
+        if page_code != 0x05
+            || page_len < 2
+            || end > data.len()
+            || page_len + 2 > self.mode_page_05.len()
+        {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        self.mode_page_05.fill(0);
+        self.mode_page_05[..2 + page_len].copy_from_slice(&data[page_start..end]);
+        self.mode_page_05_valid = true;
+        CommandOutcome::Status
+    }
+
+    fn format_unit_cmd<'b>(
+        &mut self,
+        cdb: &[u8],
+        data: &'b mut [u8],
+        dsl: usize,
+    ) -> CommandOutcome<'b> {
+        if self.media.is_none() {
+            return self.not_ready();
+        }
+        if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let expected = 12usize;
+        let imm = dsl.min(expected).min(data.len());
+        if imm < expected {
+            return CommandOutcome::ParamOut {
+                expected_len: expected,
+                immediate: &data[..imm],
+            };
+        }
+        return self.complete_format_unit(cdb, &data[..expected]);
+    }
+
+    fn complete_format_unit(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome<'static> {
+        if self.media.is_none() {
+            return self.not_ready();
+        }
+        if data.len() != 12 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let options = data[1];
+        if options & (0x40 | 0x10 | 0x04) != 0
+            || u16::from_be_bytes([data[2], data[3]]) != 8
+            || data[4..8] != [0, 0, 0, 0]
+        {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let format_type = data[8];
+        if format_type != 0x00 || u16::from_be_bytes([data[10], data[11]]) != 2048 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        if options & 0x02 != 0 {
+            return CommandOutcome::Status;
+        }
+        #[cfg(feature = "udf_void")]
+        if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
+            return match media.format_unit() {
+                Ok(()) => {
+                    // Signal media change so host re-reads DiscInfo/TOC/Capacity.
+                    self.pending_ua = Some(Sense::new(
+                        SenseKey::UnitAttention,
+                        asc::MEDIUM_MAY_HAVE_CHANGED,
+                        0,
+                    ));
+                    CommandOutcome::Status
+                }
+                Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
+            };
+        }
+        self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
     }
 
     // ── READ handler ────────────────────────────────────────────────
@@ -540,10 +738,24 @@ impl<'a> CdromDrive<'a> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+        // For DVD-RAM, reflect actual UDF presence: blank (no AVDP) -> empty,
+        // otherwise complete. This makes Windows not prompt “needs format” when
+        // a valid mkudffs image is already present, and makes post-WRITE
+        // verification see a change after the host creates a new filesystem.
+        let has_udf = self.media.as_mut().map(|m| m.has_udf()).unwrap_or(false);
+        let (disc_status, state_of_last_session, erasable) = if self.is_random_writable() {
+            if has_udf {
+                (2, 3, true) // complete, erasable — has valid UDF
+            } else {
+                (0, 0, true) // empty, erasable — blank formatted
+            }
+        } else {
+            (2, 3, false)
+        };
         let info = DiscInfo {
-            disc_status: if self.is_random_writable() { 0 } else { 2 },
-            state_of_last_session: if self.is_random_writable() { 0 } else { 3 },
-            erasable: self.is_random_writable(),
+            disc_status,
+            state_of_last_session,
+            erasable,
             sessions: 1,
             first_track: 1,
             last_track: 1,
@@ -615,6 +827,82 @@ impl<'a> CdromDrive<'a> {
                         buf[9..13].copy_from_slice(&pf.data_start.to_be_bytes());
                         buf[13..17].copy_from_slice(&pf.data_end.to_be_bytes());
                         buf[17..21].copy_from_slice(&pf.next_writable.to_be_bytes());
+                        let n = buf.len().min(alloc as usize).min(data.len());
+                        data[..n].copy_from_slice(&buf[..n]);
+                        return CommandOutcome::DataIn {
+                            transfer_len: n as u64,
+                            byte_offset: 0,
+                            immediate: &data[..n],
+                        };
+                    }
+                }
+                self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+            }
+            0x08 => {
+                // DVD-RAM DDS — synthetic 2048-byte DDS info (MMC-6 Table 414)
+                #[cfg(feature = "udf_void")]
+                if let Some(ref m) = self.media {
+                    if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
+                        let mut buf = [0u8; 2052];
+                        buf[0..2].copy_from_slice(&0x0802u16.to_be_bytes());
+                        let n = buf.len().min(alloc as usize).min(data.len());
+                        data[..n].copy_from_slice(&buf[..n]);
+                        return CommandOutcome::DataIn {
+                            transfer_len: n as u64,
+                            byte_offset: 0,
+                            immediate: &data[..n],
+                        };
+                    }
+                }
+                self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+            }
+            0x09 => {
+                // DVD-RAM Medium Status — 4-byte payload (Table 415)
+                #[cfg(feature = "udf_void")]
+                if let Some(ref m) = self.media {
+                    if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
+                        let mut buf = [0u8; 8];
+                        buf[0..2].copy_from_slice(&0x0006u16.to_be_bytes());
+                        // bytes 4..8: Cartridge=0, MSWI=0, no write protect
+                        let n = buf.len().min(alloc as usize).min(data.len());
+                        data[..n].copy_from_slice(&buf[..n]);
+                        return CommandOutcome::DataIn {
+                            transfer_len: n as u64,
+                            byte_offset: 0,
+                            immediate: &data[..n],
+                        };
+                    }
+                }
+                self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+            }
+            0x0A => {
+                // DVD-RAM Spare Area Information — 12-byte payload (Table 417)
+                // SSA=0 logical model: zero spare counts, no allocation.
+                #[cfg(feature = "udf_void")]
+                if let Some(ref m) = self.media {
+                    if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
+                        let mut buf = [0u8; 16];
+                        buf[0..2].copy_from_slice(&0x000Eu16.to_be_bytes());
+                        // bytes 4..7 primary unused, 8..11 supplementary unused, 12..15 allocated
+                        let n = buf.len().min(alloc as usize).min(data.len());
+                        data[..n].copy_from_slice(&buf[..n]);
+                        return CommandOutcome::DataIn {
+                            transfer_len: n as u64,
+                            byte_offset: 0,
+                            immediate: &data[..n],
+                        };
+                    }
+                }
+                self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+            }
+            0x0B => {
+                // DVD-RAM Recording Type — 4-byte payload, Recording Type 0 = general data
+                #[cfg(feature = "udf_void")]
+                if let Some(ref m) = self.media {
+                    if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
+                        let mut buf = [0u8; 8];
+                        buf[0..2].copy_from_slice(&0x0006u16.to_be_bytes());
+                        // payload Recording Type bit 0
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
@@ -853,6 +1141,25 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
     fn device_type(&self) -> DeviceType {
         DeviceType::Cdrom
     }
+
+    fn complete_param(
+        &mut self,
+        cdb: &[u8],
+        data: &[u8],
+    ) -> crate::scsi::device::CommandOutcome<'static> {
+        match cdb.first().copied() {
+            Some(op::MODE_SELECT_6) => {
+                let alloc = u16::from(cdb[4]);
+                self.complete_mode_select(false, alloc, data)
+            }
+            Some(op::MODE_SELECT_10) => {
+                let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
+                self.complete_mode_select(true, alloc, data)
+            }
+            Some(op::FORMAT_UNIT) => self.complete_format_unit(cdb, data),
+            _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
+        }
+    }
 }
 
 // ── Builder ───────────────────────────────────────────
@@ -910,7 +1217,7 @@ impl CdromDriveBuilder {
             identity: self.identity,
             media: None,
             tray_open: false,
-            mode_page_05: [0u8; 16],
+            mode_page_05: [0u8; 52],
             mode_page_05_valid: false,
             media_requested: false,
             _phantom: core::marker::PhantomData,
@@ -1041,6 +1348,69 @@ mod tests {
         // 4-byte MODE SENSE(6) header + 64-byte 0x2A page.
         assert_eq!(n, 4 + 64);
         assert_eq!(buf[4], 0x2A);
+    }
+
+    #[test]
+    fn drive_mode_select_write_parameters_roundtrip() {
+        let mut dev = CdromDrive::new();
+        let mut w = work();
+        let mut select = [0u8; 6];
+        select[0] = op::MODE_SELECT_6;
+        select[1] = 0x10; // PF=1
+        select[4] = 56;
+        w[4] = 0x05;
+        w[5] = 0x32;
+        w[6] = 0x41;
+        w[7] = 0xC4;
+        assert_eq!(
+            dev.do_cmd(&select, &mut w, 56).unwrap(),
+            CommandOutcome::Status
+        );
+        assert!(dev.mode_page_05_valid);
+
+        let mut sense = [0u8; 6];
+        sense[0] = op::MODE_SENSE_6;
+        sense[2] = 0x05;
+        sense[4] = 60;
+        let outcome = dev.do_cmd(&sense, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+                ..
+            } => {
+                assert_eq!(transfer_len, 4 + 52);
+                assert_eq!(&immediate[4..8], &[0x05, 0x32, 0x41, 0xC4]);
+            }
+            _ => panic!("expected MODE SENSE data"),
+        }
+    }
+
+    #[test]
+    fn drive_format_unit_rejects_read_only_media() {
+        let mut dev = CdromDrive::new();
+        let mut img = vec![0u8; 2048];
+        let flat = FlatMedia::new(
+            BlockBackend::Ram(RamBackend::new(&mut img)),
+            CurrentProfile::CdRom,
+        );
+        dev.load_quiet(CdMedia::Flat(flat));
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::FORMAT_UNIT;
+        cdb[1] = 0x11; // FmtData + format code 1
+        let mut w = work();
+        w[2..4].copy_from_slice(&8u16.to_be_bytes());
+        w[8] = 0x00; // full format
+        w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+        let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+        assert!(matches!(
+            outcome,
+            CommandOutcome::CheckCondition(Sense {
+                key: SenseKey::DataProtect,
+                asc: asc::WRITE_PROTECTED,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1223,5 +1593,292 @@ mod tests {
         dev.set_prevent(true);
         let effect = dev.start_stop(true, false); // loej=true, load=false
         assert_eq!(effect, SpcEffect::RemovalPrevented);
+    }
+
+    #[test]
+    fn drive_format_unit_rejects_type_01() {
+        let mut dev = CdromDrive::new();
+        let mut img = vec![0u8; 4096 * 2048];
+        // UdfRw requires udf_void feature
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut cdb = [0u8; 6];
+            cdb[0] = op::FORMAT_UNIT;
+            cdb[1] = 0x11;
+            let mut w = work();
+            w[1] = 0x00; // options zero
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[8] = 0x01; // Spare Area Expansion — must be rejected
+            w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+            assert!(matches!(
+                outcome,
+                CommandOutcome::CheckCondition(Sense {
+                    key: SenseKey::IllegalRequest,
+                    asc: asc::INVALID_FIELD,
+                    ..
+                })
+            ));
+        }
+        #[cfg(not(feature = "udf_void"))]
+        {
+            let _ = (dev, img);
+        }
+    }
+
+    #[test]
+    fn drive_format_unit_rejects_init_pattern() {
+        let mut dev = CdromDrive::new();
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut cdb = [0u8; 6];
+            cdb[0] = op::FORMAT_UNIT;
+            cdb[1] = 0x11;
+            let mut w = work();
+            w[1] = 0x00;
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[4..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // non-zero init pattern with IP=0
+            w[8] = 0x00;
+            w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+            assert!(matches!(
+                outcome,
+                CommandOutcome::CheckCondition(Sense {
+                    key: SenseKey::IllegalRequest,
+                    asc: asc::INVALID_FIELD,
+                    ..
+                })
+            ));
+        }
+        #[cfg(not(feature = "udf_void"))]
+        {
+            let _ = (dev, img);
+        }
+    }
+
+    #[test]
+    fn drive_format_unit_tryout_does_not_clear() {
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            // Write pattern
+            dev.media
+                .as_mut()
+                .unwrap()
+                .write_data(0, &[0xA5; 2048])
+                .unwrap();
+            // Try-out format (byte1 bit1 = 0x02) should validate and return GOOD without clearing
+            let mut cdb = [0u8; 6];
+            cdb[0] = op::FORMAT_UNIT;
+            cdb[1] = 0x11;
+            let mut w = work();
+            w[1] = 0x02; // Try-out
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[8] = 0x00;
+            w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+            assert_eq!(outcome, CommandOutcome::Status);
+            // Verify data still present (not cleared)
+            let mut out = [0u8; 2048];
+            dev.media.as_mut().unwrap().read_data(0, &mut out).unwrap();
+            assert_eq!(out, [0xA5; 2048]);
+        }
+    }
+
+    #[test]
+    fn drive_format_unit_clears_logical_blocks() {
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            // Write some data
+            let mut pattern = [0x5A; 2048];
+            dev.media
+                .as_mut()
+                .unwrap()
+                .write_data(2048, &pattern)
+                .unwrap();
+            // Normal format (not try-out) should clear
+            let mut cdb = [0u8; 6];
+            cdb[0] = op::FORMAT_UNIT;
+            cdb[1] = 0x11;
+            let mut w = work();
+            w[1] = 0x00;
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[8] = 0x00;
+            w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+            assert_eq!(outcome, CommandOutcome::Status);
+            let mut out = [0u8; 2048];
+            dev.media
+                .as_mut()
+                .unwrap()
+                .read_data(2048, &mut out)
+                .unwrap();
+            assert_eq!(out, [0u8; 2048]);
+            // UDF structures should be zeroed — check BEA sector
+            let mut sec = [0u8; 2048];
+            dev.media
+                .as_mut()
+                .unwrap()
+                .read_data(16 * 2048, &mut sec)
+                .unwrap();
+            assert_eq!(sec, [0u8; 2048]);
+        }
+    }
+
+    #[test]
+    fn drive_read_dvd_structure_08_09_0a_0b_for_dvdram() {
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut w = work();
+            for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
+                let mut cdb = [0u8; 12];
+                cdb[0] = op::READ_DVD_STRUCTURE;
+                cdb[7] = fmt;
+                cdb[8] = 0x08; // alloc 2048
+                cdb[9] = 0x00;
+                let mut out = [0u8; 4096];
+                let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut out);
+                assert!(n >= 4, "format {:02X} should succeed", fmt);
+                let len = u16::from_be_bytes([out[0], out[1]]) as usize;
+                if fmt == 0x08 {
+                    assert_eq!(len, 0x0802);
+                } else if fmt == 0x0A {
+                    assert_eq!(len, 0x000E);
+                } else {
+                    assert_eq!(len, 0x0006);
+                }
+            }
+            // Same formats must fail for CD-ROM flat media
+            let mut img2 = vec![0u8; 2048];
+            let flat = FlatMedia::new(
+                BlockBackend::Ram(RamBackend::new(&mut img2)),
+                CurrentProfile::CdRom,
+            );
+            let mut dev2 = CdromDrive::new();
+            dev2.load_quiet(CdMedia::Flat(flat));
+            for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
+                let mut cdb = [0u8; 12];
+                cdb[0] = op::READ_DVD_STRUCTURE;
+                cdb[7] = fmt;
+                cdb[8] = 0x08;
+                let outcome = dev2.do_cmd(&cdb, &mut w, 0).unwrap();
+                assert!(matches!(
+                    outcome,
+                    CommandOutcome::CheckCondition(Sense {
+                        key: SenseKey::IllegalRequest,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn dvd_ram_always_formatted_no_medium_not_formatted() {
+        // Logical DVD-RAM never returns NOT READY/MEDIUM NOT FORMATTED per §2.1
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+            // Immediately after load, TUR is GOOD (no format needed)
+            let mut w = work();
+            let mut cdb = [0u8; 6];
+            cdb[0] = op::TEST_UNIT_READY;
+            assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+            // READ/WRITE should not return MEDIUM NOT FORMATTED
+            let mut cdb10 = [0u8; 10];
+            cdb10[0] = op::READ_10;
+            cdb10[8] = 0x01;
+            let out = dev.do_cmd(&cdb10, &mut w, 0).unwrap();
+            assert!(matches!(out, CommandOutcome::DataIn { .. }));
+            cdb10[0] = op::WRITE_10;
+            let out2 = dev.do_cmd(&cdb10, &mut w, 0).unwrap();
+            assert!(matches!(out2, CommandOutcome::DataOut { .. }));
+            // Format then TUR should be UA 28h (media changed), then GOOD after REQUEST SENSE
+            let mut cdbf = [0u8; 6];
+            cdbf[0] = op::FORMAT_UNIT;
+            cdbf[1] = 0x11;
+            let mut w2 = work();
+            w2[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w2[8] = 0x00;
+            w2[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            assert_eq!(
+                dev.do_cmd(&cdbf, &mut w2, 12).unwrap(),
+                CommandOutcome::Status
+            );
+            assert!(matches!(
+                dev.do_cmd(&cdb, &mut w, 0).unwrap(),
+                CommandOutcome::CheckCondition(Sense {
+                    key: SenseKey::UnitAttention,
+                    asc: 0x28,
+                    ..
+                })
+            ));
+            let mut cdb_rs = [0u8; 6];
+            cdb_rs[0] = op::REQUEST_SENSE;
+            cdb_rs[4] = 18;
+            let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
+            assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        }
     }
 }
