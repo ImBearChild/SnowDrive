@@ -36,7 +36,7 @@ pub const SECTOR_SIZE: u32 = 2048;
 /// the SPC-4 and MMC-6 version descriptors replacing the block device's SBC.
 pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
-    product: *b"Virtual CD-ROM  ",
+    product: *b"HyperMulti DVD  ",
     revision: *b"0100",
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
 };

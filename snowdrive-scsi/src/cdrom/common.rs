@@ -21,13 +21,15 @@ pub const SECTOR_SIZE: u32 = 2048;
 /// SPC-4 and MMC-6 version descriptors.
 pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
-    product: *b"Virtual CD-ROM  ",
+    product: *b"HyperMulti DVD  ",
     revision: *b"0100",
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
 };
 /// Current Profile code for GET CONFIGURATION (MMC-6 §5.4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentProfile {
+    /// 0x0000 — No media / tray empty.
+    Empty,
     /// 0x0008 — CD-ROM (images ≤ 700 MiB).
     CdRom,
     /// 0x0010 — DVD-ROM (images > 700 MiB).
@@ -43,6 +45,7 @@ impl CurrentProfile {
     /// Numeric profile code (MMC-6 Table 64).
     pub fn code(self) -> u16 {
         match self {
+            Self::Empty => 0x0000,
             Self::CdRom => 0x0008,
             Self::DvdRom => 0x0010,
             Self::CdR => 0x0009,
@@ -79,6 +82,16 @@ const CDROM_AUDIO: [u8; 16] = [
     0x00, 0x00, // output port 0: volume = 0
     0x02, 0x00, // output port 1: channel selection = 0x02 (channel 1)
     0x00, 0x00, // output port 1: volume = 0
+];
+/// Write Parameters page (0x05, MMC-6): page_length=0x32 (50), for `wodim`
+/// `check_writemodes` probing. Minimal zeroed page with SAO/TAO defaults;
+/// `MODE SELECT` is accepted unconditionally in `spc.rs`, so any
+/// `write_type` probe succeeds and `wodim` prints `TAO PACKET SAO …`.
+const WRITE_PARAMS_PAGE: [u8; 52] = [
+    0x05, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 /// Device-declared capability set — the single model every
 /// capability-reporting channel (GET CONFIGURATION features, MODE SENSE
@@ -124,6 +137,26 @@ pub struct CdromCapabilities {
     pub write_cdrw: bool,
     pub test_write: bool,
     pub burn_proof: bool,
+    /// Read DVD-R media.
+    pub read_dvd_r: bool,
+    /// Read DVD-RAM media.
+    pub read_dvd_ram: bool,
+    /// Read DVD-RW media.
+    pub read_dvd_rw: bool,
+    /// Read DVD+R media.
+    pub read_dvd_plus_r: bool,
+    /// Write DVD-R media.
+    pub write_dvd_r: bool,
+    /// Write DVD-RAM media.
+    pub write_dvd_ram: bool,
+    /// Write DVD-RW media.
+    pub write_dvd_rw: bool,
+    /// Write DVD+R media.
+    pub write_dvd_plus_r: bool,
+    /// Drive supports dual-layer (DL) media for the disc types it can
+    /// handle.  Double-sided media are deliberately NOT supported — the
+    /// "changing side of disk" capability stays clear.
+    pub dual_layer: bool,
     pub num_volume_levels: u8,
     pub buffer_size: u16,
     pub max_read_speed: u16,  // KB/s
@@ -153,10 +186,59 @@ impl CdromCapabilities {
             write_cdrw: false,
             test_write: false,
             burn_proof: false,
+            read_dvd_r: false,
+            read_dvd_ram: false,
+            read_dvd_rw: false,
+            read_dvd_plus_r: false,
+            write_dvd_r: false,
+            write_dvd_ram: false,
+            write_dvd_rw: false,
+            write_dvd_plus_r: false,
+            dual_layer: false,
             num_volume_levels: 0,
             buffer_size: 0,
             max_read_speed: 0,
             max_write_speed: 0,
+        }
+    }
+    /// A full HyperMulti recorder: reads and writes every CD/DVD variant
+    /// (CD-R/RW, DVD-ROM/R/RAM/RW/+R/+RW, including dual-layer), backed by a
+    /// writable UDFRW plane.  Capabilities are intrinsic to the drive and do
+    /// NOT depend on the inserted media or the storage backend.
+    pub const fn hyper_multi() -> Self {
+        Self {
+            tray: true,
+            load: true,
+            eject: true,
+            lock: true,
+            mode2_form1: true,
+            mode2_form2: true,
+            multi_session: true,
+            cd_da: true,
+            read_cdr: true,
+            read_cdrw: true,
+            read_dvd_rom: true,
+            random_writable: true,
+            dvd_plus_rw: true,
+            write_protect: true,
+            defect_management: true,
+            write_cdr: true,
+            write_cdrw: true,
+            test_write: true,
+            burn_proof: true,
+            read_dvd_r: true,
+            read_dvd_ram: true,
+            read_dvd_rw: true,
+            read_dvd_plus_r: true,
+            write_dvd_r: true,
+            write_dvd_ram: true,
+            write_dvd_rw: true,
+            write_dvd_plus_r: true,
+            dual_layer: true,
+            num_volume_levels: 0xFF,
+            buffer_size: 8192,
+            max_read_speed: 22160,  // ≈ DVD 16x
+            max_write_speed: 22160, // ≈ DVD 16x
         }
     }
 }
@@ -188,11 +270,37 @@ pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
     write_cdrw: true,
     test_write: true,
     burn_proof: true,
+    read_dvd_r: true,
+    read_dvd_ram: true,
+    read_dvd_rw: true,
+    read_dvd_plus_r: true,
+    write_dvd_r: true,
+    write_dvd_ram: true,
+    write_dvd_rw: true,
+    write_dvd_plus_r: true,
+    dual_layer: true,
     num_volume_levels: 0,
     buffer_size: 0,
     max_read_speed: 0x2B48,
     max_write_speed: 0x2B48,
 };
+/// Full HyperMulti recorder capabilities — the default for the SnowDrive
+/// CD/DVD device.  Reads and writes every CD/DVD variant including
+/// dual-layer; capabilities are intrinsic to the drive and never depend on
+/// the mounted media or the storage backend.
+pub const HYPER_MULTI_CAPS: CdromCapabilities = CdromCapabilities::hyper_multi();
+/// Write-speed performance descriptors advertised in the page 2A table:
+/// (read speed KB/s, write speed KB/s).  CD first, then DVD.
+pub const HYPER_MULTI_DESCS: [(u16, u16); 8] = [
+    (706, 706),    // CD  4x
+    (1411, 1411),  // CD  8x
+    (2822, 2822),  // CD 16x
+    (5645, 5645),  // CD 32x
+    (9173, 9173),  // CD 52x
+    (5540, 5540),  // DVD  4x
+    (11080, 11080), // DVD  8x
+    (22160, 22160), // DVD 16x
+];
 /// `true` → 1 (const bit packing).
 const fn bit(b: bool) -> u8 {
     b as u8
@@ -211,68 +319,131 @@ const fn loading_type_bits(tray: bool) -> u8 {
 /// CONFIGURATION is the authoritative channel — so this is the 0x2A "view"
 /// of the same capability model the features are built from.
 ///
-/// Returns a 56-byte page: 24-byte base + 32 bytes of CD write speed
-/// performance descriptors (16 KB/s granularity per MMC-6 Table 105).
-pub const fn build_capabilities_page(caps: &CdromCapabilities) -> [u8; 56] {
-    let mut p = [0u8; 56];
+/// `descs` is the list of (read speed KB/s, write speed KB/s) write-speed
+/// performance descriptors advertised in the table.  Each descriptor is
+/// 4 bytes (2-byte read speed + 2-byte write speed, MMC-3 Table 105).  The
+/// returned page is a fixed 64-byte buffer (max 8 descriptors + 32-byte base);
+/// the page-length field at byte 1 reflects the actual populated size and any
+/// trailing bytes are zero.
+///
+/// Layout (MMC-3, the variant `wodim`/`cdrkit` parse, LTOH bit order):
+/// - 0   : page code (0x2A)
+/// - 1   : page length (= 30 + 4·N)
+/// - 2   : read  (R-CD-R@0,R-CD-RW@1,Method2@2,R-DVD-ROM@3,R-DVD-R@4,R-DVD-RAM@5)
+/// - 3   : write (W-CD-R@0,W-CD-RW@1,Test@2,W-DVD-R@4,W-DVD-RAM@5)
+/// - 4   : misc  (mode2_form1@4,mode2_form2@5,multi@6,BUF@7)
+/// - 5   : CD-DA (cd_da@0,accurate@1)
+/// - 6   : lock/eject/loading (lock@0,eject@3,loading@5-7)
+/// - 7   : changer
+/// - 8-9 : maximum read speed (KB/s)
+/// - 10-11: number of volume levels
+/// - 12-13: buffer size (KB)
+/// - 14-15: current read speed (KB/s)
+/// - 16  : reserved
+/// - 17  : BCK/RCK/LSBF
+/// - 18-19: maximum write speed (KB/s)
+/// - 20-21: current write speed (MMC-2 legacy slot)
+/// - 22-23: Copy Management Revision Supported
+/// - 26  : reserved
+/// - 27  : Rotation Control (0 = CLV, low 2 bits)
+/// - 28-29: current write speed (MMC-3 v3 slot)
+/// - 30-31: number of write-speed performance descriptors
+/// - 32.. : descriptors, 4 bytes each (res0,rot,speed)
+pub const fn build_capabilities_page(caps: &CdromCapabilities, descs: &[(u16, u16)]) -> [u8; 64] {
+    let n = descs.len();
+    let mut p = [0u8; 64];
     p[0] = 0x2A;
-    p[1] = 54; // page length (56 - 2)
-    p[2] = (bit(caps.read_cdrw) << 7)
-        | (bit(caps.read_cdr) << 6)
-        | (bit(caps.mode2_form2) << 5)
+    p[1] = (30 + 4 * n) as u8; // page length (total - 2)
+    // Byte 2: read caps (LTOH low-bit order as cdrkit/wodim expects)
+    p[2] = (bit(caps.read_cdr) << 0)
+        | (bit(caps.read_cdrw) << 1)
+        | (0 << 2) // Method2 — not modelled
+        | (bit(caps.read_dvd_rom) << 3)
+        | (bit(caps.read_dvd_r) << 4)
+        | (bit(caps.read_dvd_ram) << 5);
+    // Byte 3: write caps
+    p[3] = (bit(caps.write_cdr) << 0)
+        | (bit(caps.write_cdrw) << 1)
+        | (bit(caps.test_write) << 2)
+        | (0 << 3)
+        | (bit(caps.write_dvd_r) << 4)
+        | (bit(caps.write_dvd_ram) << 5);
+    // Byte 4: audio/composite/mode2/multi/BUF
+    p[4] = (0 << 0) // audio_play — not modelled
+        | (0 << 1) // composite
+        | (0 << 2) // digital_port_2
+        | (0 << 3) // digital_port_1
         | (bit(caps.mode2_form1) << 4)
-        | (bit(caps.multi_session) << 3)
-        | (bit(caps.cd_da) << 2);
-    p[3] = bit(caps.read_dvd_rom) << 3;
-    p[4] = (bit(caps.write_cdrw) << 7)
-        | (bit(caps.write_cdr) << 6)
-        | (bit(caps.test_write) << 5)
-        | (bit(caps.burn_proof) << 4);
-    // Byte 8: Loading Mechanism Type (bits 2-0) | Load | Eject.
-    p[8] = loading_type_bits(caps.tray) | (bit(caps.load) << 3) | (bit(caps.eject) << 4);
-    p[9] = caps.num_volume_levels;
-    p[10] = (caps.buffer_size >> 8) as u8;
-    p[11] = caps.buffer_size as u8;
+        | (bit(caps.mode2_form2) << 5)
+        | (bit(caps.multi_session) << 6)
+        | (bit(caps.burn_proof) << 7);
+    // Byte 5: CD-DA / subchannel
+    p[5] = (bit(caps.cd_da) << 0)
+        | (bit(caps.cd_da) << 1) // cd_da_accurate follows cd_da
+        | (0 << 2)
+        | (0 << 3)
+        | (0 << 4)
+        | (0 << 5)
+        | (0 << 6)
+        | (0 << 7);
+    // Byte 6: lock / eject / loading
+    p[6] = (bit(caps.lock) << 0)
+        | (0 << 1) // lock_state
+        | (0 << 2) // prevent_jumper
+        | (bit(caps.eject) << 3)
+        | (0 << 4)
+        | (loading_type_bits(caps.tray) << 5);
+    // Byte 7: sep / changer
+    p[7] = 0;
+    p[8] = (caps.max_read_speed >> 8) as u8;
+    p[9] = caps.max_read_speed as u8;
+    p[10] = ((caps.num_volume_levels as u16) >> 8) as u8;
+    p[11] = caps.num_volume_levels as u8;
+    p[12] = (caps.buffer_size >> 8) as u8;
+    p[13] = caps.buffer_size as u8;
     p[14] = (caps.max_read_speed >> 8) as u8;
     p[15] = caps.max_read_speed as u8;
+    p[16] = 0;
+    p[17] = 0;
     p[18] = (caps.max_write_speed >> 8) as u8;
     p[19] = caps.max_write_speed as u8;
-    // CD write speed performance descriptors (bytes 22-55, MMC-6 Table 105).
-    // Each descriptor: 2-byte read speed (KB/s ÷ 16) + 2-byte write speed.
-    // Standard CD-RW speeds: 2x(352), 4x(704), 8x(1408), 16x(2816), 32x(5632).
-    // Descriptor 1: 2x
-    p[22] = (352 / 16) as u8;
-    p[23] = 0;
-    p[24] = (352 / 16) as u8;
-    p[25] = 0;
-    // Descriptor 2: 4x
-    p[26] = (704 / 16) as u8;
-    p[27] = 0;
-    p[28] = (704 / 16) as u8;
-    p[29] = 0;
-    // Descriptor 3: 8x
-    p[30] = (1408 / 16) as u8;
-    p[31] = 0;
-    p[32] = (1408 / 16) as u8;
-    p[33] = 0;
-    // Descriptor 4: 16x
-    p[34] = (2816 / 16) as u8;
-    p[35] = 0;
-    p[36] = (2816 / 16) as u8;
-    p[37] = 0;
-    // Descriptor 5: 32x (max)
-    p[38] = (5632 / 16) as u8;
-    p[39] = 0;
-    p[40] = (5632 / 16) as u8;
-    p[41] = 0;
+    p[20] = (caps.max_write_speed >> 8) as u8;
+    p[21] = caps.max_write_speed as u8;
+    // 22-23: Copy Management Revision Supported (0x0001 = recorder capable).
+    p[22] = 0x00;
+    p[23] = 0x01;
+    // 24-25 reserved
+    // 26: reserved, 27: rot_ctl (low 2 bits = CLV)
+    p[26] = 0x00;
+    p[27] = 0x00;
+    // 28-29: current write speed (MMC-3 v3 slot).
+    p[28] = (caps.max_write_speed >> 8) as u8;
+    p[29] = caps.max_write_speed as u8;
+    // 30-31: number of write-speed performance descriptors.
+    p[30] = ((n as u16) >> 8) as u8;
+    p[31] = n as u8;
+    // 32..: descriptors — single write speed per descriptor (res0, rot, speed)
+    let mut i = 0;
+    while i < n {
+        let base = 32 + i * 4;
+        let (_, ws) = descs[i];
+        p[base] = 0x00;
+        p[base + 1] = 0x00; // rot = CLV/PCAV
+        p[base + 2] = (ws >> 8) as u8;
+        p[base + 3] = ws as u8;
+        i += 1;
+    }
     p
 }
-/// CD/DVD Capabilities & Mechanical Status page (0x2A) for the read-only
-/// devices, built from the capability model rather than hardcoded bytes.
-const CDROM_CAPABILITIES: [u8; 56] = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
+/// CD/DVD Capabilities & Mechanical Status page (0x2A) for the SnowDrive
+/// CD/DVD device.  Built from the fixed HyperMulti capability model — the
+/// drive's abilities are intrinsic and never depend on the mounted media.
+const CDROM_CAPABILITIES: [u8; 64] =
+    build_capabilities_page(&HYPER_MULTI_CAPS, &HYPER_MULTI_DESCS);
 /// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
     match page {
+        0x05 => Some(&WRITE_PARAMS_PAGE),
         0x08 => Some(&CACHING_PAGE),
         0x00 => Some(&VENDOR_PAGE),
         0x0D => Some(&CDROM_PARAMS),
@@ -327,8 +498,12 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x001E CD Read (version 2)
 /// - 0x001F DVD Read (only for DVD profiles)
 /// - 0x0020 Random Writable (only if `caps.random_writable`)
+/// - 0x0021 Incremental Streaming Writable (only if `caps.write_dvd_r`)
 /// - 0x0023 Formattable (for DVD+RW media)
+/// - 0x0026 Restricted Overwrite (only if `caps.write_dvd_rw`)
 /// - 0x002A DVD+RW (only if `caps.dvd_plus_rw`)
+/// - 0x002B DVD+R (only if `caps.read_dvd_plus_r`/`write_dvd_plus_r`)
+/// - 0x002F DVD-R/-RW Write (only if `caps.write_dvd_r`/`write_dvd_rw`)
 /// - 0x010A Disc Control Block (for DVD+RW media)
 #[allow(clippy::too_many_arguments)]
 pub fn build_get_config_features(
@@ -339,7 +514,7 @@ pub fn build_get_config_features(
     _rt: u8,
     start_feature: u16,
     last_lba: u32,
-    media_current: bool,
+    _media_current: bool,
 ) -> usize {
     // The kernel's cdrom_is_random_writable() (and cdrom_is_mrw(), which
     // gracefully finds no MRW feature here) issue GET CONFIGURATION with
@@ -365,8 +540,32 @@ pub fn build_get_config_features(
         if caps.read_dvd_rom {
             let _ = profiles.push(0x0010); // DVD-ROM
         }
+        if caps.read_dvd_r || caps.write_dvd_r {
+            let _ = profiles.push(0x0011); // DVD-R
+            if caps.dual_layer {
+                let _ = profiles.push(0x0016); // DVD-R Dual Layer
+            }
+        }
+        if caps.read_dvd_ram || caps.write_dvd_ram {
+            let _ = profiles.push(0x0012); // DVD-RAM
+        }
+        if caps.read_dvd_rw || caps.write_dvd_rw {
+            let _ = profiles.push(0x0013); // DVD-RW
+            if caps.dual_layer {
+                let _ = profiles.push(0x0017); // DVD-RW Dual Layer
+            }
+        }
+        if caps.read_dvd_plus_r || caps.write_dvd_plus_r {
+            let _ = profiles.push(0x001B); // DVD+R
+            if caps.dual_layer {
+                let _ = profiles.push(0x002B); // DVD+R Dual Layer
+            }
+        }
         if caps.random_writable || caps.dvd_plus_rw {
             let _ = profiles.push(0x001A); // DVD+RW
+            if caps.dual_layer {
+                let _ = profiles.push(0x0018); // DVD+RW Dual Layer
+            }
         }
         // Always include CD-ROM as a baseline profile.
         if profiles.iter().all(|&p| p != 0x0008) {
@@ -433,44 +632,52 @@ pub fn build_get_config_features(
         buf[off + 4..off + 8].copy_from_slice(&[0x00, 0, 0, 0]);
         off += 8;
     }
-    // Random Readable (0x0010) — current only when media is readable.
+    // Defect Management (0x0008) — after 0x0004 for ascending order
+    if caps.defect_management && include(0x0008) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x08;
+        buf[off + 2] = 0x03; // version 0 + current + persistent
+        buf[off + 3] = 0x00; // additional length
+        off += 4;
+    }
+    // Random Readable (0x0010) — persistent+current
     if include(0x0010) {
         buf[off] = 0x00;
         buf[off + 1] = 0x10;
-        buf[off + 2] = if media_current { 0x01 } else { 0x00 }; // current bit
+        buf[off + 2] = 0x03; // version 0, persistent+current
         buf[off + 3] = 0x08; // additional length
         buf[off + 4..off + 8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         buf[off + 8] = 0x00;
         buf[off + 9] = 0x01; // blocking = 1
         off += 12;
     }
-    // Multi-Read (0x001D) — current only when media is readable.
+    // Multi-Read (0x001D)
     if include(0x001D) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1D;
-        buf[off + 2] = if media_current { 0x01 } else { 0x00 }; // current bit
+        buf[off + 2] = 0x03; // persistent+current
         off += 4;
     }
-    // CD Read (0x001E) — current only when media is readable.
+    // CD Read (0x001E)
     if include(0x001E) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1E;
-        buf[off + 2] = if media_current { 0x03 } else { 0x00 }; // version 2 + current
+        buf[off + 2] = 0x03; // version 0, persistent+current
         buf[off + 3] = 0x04; // additional length
         off += 8;
     }
-    // DVD Read (0x001F) — only for DVD profiles, current when media readable.
-    if matches!(profile, CurrentProfile::DvdRom | CurrentProfile::DvdRw) && include(0x001F) {
+    // DVD Read (0x001F) — caps-based, persistent+current
+    if caps.read_dvd_rom && include(0x001F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1F;
-        buf[off + 2] = if media_current { 0x01 } else { 0x00 }; // current bit
+        buf[off + 2] = 0x03; // persistent+current
         off += 4;
     }
-    // Random Writable (0x0020) — formatted random-writable media (UdfRw).
+    // Random Writable (0x0020)
     if caps.random_writable && include(0x0020) {
         buf[off] = 0x00;
         buf[off + 1] = 0x20;
-        buf[off + 2] = 0x05; // version 1 + current (sg3_utils convention)
+        buf[off + 2] = 0x07; // version 1, persistent+current
         buf[off + 3] = 0x0C; // additional length
         buf[off + 4..off + 8].copy_from_slice(&last_lba.to_be_bytes());
         buf[off + 8..off + 12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
@@ -479,39 +686,37 @@ pub fn build_get_config_features(
         buf[off + 15] = 0x00;
         off += 16;
     }
-    // Formattable (0x0023). DVD+RW drives that report the DVD+RW feature as
-    // current also advertise the basic background-format capability.
+    // Incremental Streaming Writable (0x0021)
+    if caps.write_dvd_r && include(0x0021) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x21;
+        buf[off + 2] = 0x07; // version 1, persistent+current
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4..off + 8].fill(0);
+        off += 8;
+    }
+    // Formattable (0x0023)
     if caps.dvd_plus_rw && include(0x0023) {
         buf[off] = 0x00;
         buf[off + 1] = 0x23;
-        buf[off + 2] = 0x09; // version 2 + current
+        buf[off + 2] = 0x0B; // version 2, persistent+current
         buf[off + 3] = 0x08;
         buf[off + 4..off + 12].fill(0);
         off += 12;
     }
-    // Defect Management (0x0008) — required by Windows' `IOCTL_DISK_IS_WRITABLE`
-    // to report optical media as writable. Real DVD+RW drives do NOT have this
-    // feature (it belongs to DVD-RAM), but the Windows cdrom class driver gates
-    // all optical formatting on `ValidationSchema == FeatureDefectManagement`.
-    // No additional data beyond the feature header.
-    if caps.defect_management && include(0x0008) {
+    // Restricted Overwrite (0x0026)
+    if caps.write_dvd_rw && include(0x0026) {
         buf[off] = 0x00;
-        buf[off + 1] = 0x08;
-        buf[off + 2] = 0x03; // version 0 + current + persistent
+        buf[off + 1] = 0x26;
+        buf[off + 2] = 0x07; // version 1, persistent+current
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // MRW (Mount Rainier, 0x0028) is deliberately NOT reported: it is a
-    // sequential packet-write format with drive-side remapping that this
-    // byte-plane emulation does not implement, and Windows treats an
-    // MRW-formatted disc as read-only. A DVD+RW with plain UDF needs no MRW
-    // claim — the kernel's cdrom_open_write() allows a writable open for
-    // profile 0x1A via cdrom_is_dvd_rw()/cdrom_dvdram_open_write().
-    // DVD+RW (0x002A) — write capable (UdfRw).
+    // DVD+RW (0x002A)
     if caps.dvd_plus_rw && include(0x002A) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2A;
-        buf[off + 2] = 0x05; // version 1 + current
+        buf[off + 2] = 0x07; // version 1, persistent+current
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x01; // Write
         buf[off + 5] = 0x00; // Quick Start / Close Only clear
@@ -519,13 +724,44 @@ pub fn build_get_config_features(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Disc Control Block (0x010A). The WDCB itself is readable through
-    // READ DISC STRUCTURE format 30h; advertise the standard FDC/SDC/TOC
-    // descriptors used by DVD+RW drives.
+    // DVD+R (0x002B)
+    if (caps.read_dvd_plus_r || caps.write_dvd_plus_r) && include(0x002B) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2B;
+        buf[off + 2] = 0x07; // version 1, persistent+current
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x01; // Write
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // DVD-R/-RW Write (0x002F)
+    if (caps.write_dvd_r || caps.write_dvd_rw) && include(0x002F) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2F;
+        buf[off + 2] = 0x07; // version 1, persistent+current
+        buf[off + 3] = 0x00; // additional length
+        off += 4;
+    }
+    // CD-RW Media Write Support (0x0037) — MMC-4 Table 163.
+    if caps.write_cdrw && include(0x0037) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x37;
+        buf[off + 2] = 0x03; // version 0, persistent+current
+        buf[off + 3] = 0x04; // additional length 4
+        buf[off + 4] = 0x00; // reserved
+        buf[off + 5] = 0x0F; // multi|high|ultra|ultra+
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // MRW (Mount Rainier, 0x0028) is deliberately NOT reported
+    // Disc Control Block (0x010A)
     if caps.dvd_plus_rw && include(0x010A) {
         buf[off] = 0x01;
         buf[off + 1] = 0x0A;
-        buf[off + 2] = 0x01; // current
+        buf[off + 2] = 0x03; // persistent+current
         buf[off + 3] = 0x0C;
         buf[off + 4..off + 16].copy_from_slice(b"FDC\0SDC\0TOC\0");
         off += 16;
@@ -760,12 +996,12 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::MODE_SENSE_6;
         cdb[2] = 0x2A;
-        cdb[4] = 64;
-        let mut buf = [0u8; 64];
+        cdb[4] = 100;
+        let mut buf = [0u8; 128];
         let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 60); /* 4 header + 56 page */
+        assert_eq!(n, 4 + 64); /* 4 header + 64 page */
         assert_eq!(buf[4], 0x2A); /* page code */
-        assert_eq!(buf[5], 54); /* page length = 54 */
+        assert_eq!(buf[5], 62); /* page length = 62 */
     }
     #[test]
     fn cdrom_mode_sense_10_all_pages() {
@@ -1051,20 +1287,26 @@ mod tests {
     // ── Capabilities page (0x2A) ────────────────────────────────────
     #[test]
     fn capabilities_page_read_only_cd_rom_layout() {
-        let p = build_capabilities_page(&READ_ONLY_CDROM_CAPS);
-        assert_eq!(p.len(), 56);
+        let p = build_capabilities_page(&READ_ONLY_CDROM_CAPS, &[]);
+        assert_eq!(p.len(), 64);
         assert_eq!(p[0], 0x2A);
-        assert_eq!(p[1], 54); // page length
+        assert_eq!(p[1], 30); // page length (32 - 2), tail zeroed
                               // Read-only, Mode-1 baseline only: no extra read/write bits.
         assert_eq!(p[2], 0x00);
         assert_eq!(p[3], 0x00);
         assert_eq!(p[4], 0x00);
-        // Loading mechanism = tray (001b) + Load=1 + Eject=1.
-        assert_eq!(p[8], 0b011001);
-        // No buffer, no speeds.
-        assert_eq!(&p[10..12], &[0, 0]);
-        assert_eq!(&p[14..16], &[0, 0]);
-        assert_eq!(&p[18..20], &[0, 0]);
+        assert_eq!(p[5], 0x00);
+        // Loading mechanism = tray (001b<<5) | lock@0 | eject@3 = 0x29
+        assert_eq!(p[6], 0x29);
+        assert_eq!(p[7], 0x00);
+        // max_read/cur_read/max_write/cur_write are at 8-9/14-15/18-19/20-21
+        assert_eq!(&p[8..10], &[0, 0]);
+        assert_eq!(&p[12..14], &[0, 0]); // buffer
+        assert_eq!(&p[14..16], &[0, 0]); // cur_read
+        assert_eq!(&p[18..20], &[0, 0]); // max_write
+        // Copy Management Revision (recorder) and descriptor count = 0.
+        assert_eq!(&p[22..24], &[0x00, 0x01]);
+        assert_eq!(&p[30..32], &[0x00, 0x00]);
     }
     #[test]
     fn capabilities_page_parameterized_by_model() {
@@ -1075,13 +1317,14 @@ mod tests {
         caps.eject = true;
         caps.buffer_size = 4096;
         caps.max_read_speed = 3528; // 20x
-        let p = build_capabilities_page(&caps);
-        assert_eq!(p[2] & 0x40, 0x40); // CD-R read
-        assert_eq!(p[2] & 0x04, 0x04); // CD-DA accurate
-        assert_eq!(p[4] & 0x40, 0x40); // CD-R write
-        assert_eq!(p[8] & 0x10, 0x10); // eject
-        assert_eq!(&p[10..12], &[0x10, 0x00]); // buffer 4096
-        assert_eq!(&p[14..16], &[0x0D, 0xC8]); // max read 3528
+        let p = build_capabilities_page(&caps, &[]);
+        assert_eq!(p[2] & 0x01, 0x01); // CD-R read @bit0
+        assert_eq!(p[5] & 0x01, 0x01); // CD-DA
+        assert_eq!(p[3] & 0x01, 0x01); // CD-R write @bit0
+        assert_eq!(p[6] & 0x08, 0x08); // eject @bit3
+        assert_eq!(&p[12..14], &[0x10, 0x00]); // buffer 4096 at 12-13
+        assert_eq!(&p[8..10], &[0x0D, 0xC8]); // max read 3528 at 8-9
+        assert_eq!(&p[14..16], &[0x0D, 0xC8]); // cur_read mirrored
     }
     // ── READ BUFFER CAPACITY ────────────────────────────────────────
     #[test]
@@ -1147,7 +1390,7 @@ mod tests {
             match code {
                 0x0020 => {
                     saw_rw = true;
-                    assert_eq!(buf[off + 2], 0x05); // version 1 + current
+                    assert_eq!(buf[off + 2], 0x07); // version 1, persistent+current
                     assert_eq!(add_len, 12);
                     assert_eq!(&buf[off + 4..off + 8], &0x1234u32.to_be_bytes());
                     assert_eq!(&buf[off + 8..off + 12], &2048u32.to_be_bytes());

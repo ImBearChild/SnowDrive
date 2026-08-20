@@ -68,7 +68,7 @@ impl<'a> CdromDrive<'a> {
     pub fn builder() -> CdromDriveBuilder {
         CdromDriveBuilder {
             identity: CDROM_IDENTITY,
-            caps: CdromCapabilities::read_only_cd_rom(),
+            caps: CdromCapabilities::hyper_multi(),
             drive_id: 0,
         }
     }
@@ -512,12 +512,17 @@ impl<'a> CdromDrive<'a> {
         // (Random Readable, Multi-Read, CD/DVD Read, write features)
         // are current only when media is present and readable (§6.4).
         let media_current = self.media.is_some();
+        let current_profile = if self.media.is_some() {
+            self.media_profile()
+        } else {
+            CurrentProfile::Empty
+        };
         // Build into a local scratch buffer, patch profile code, then copy.
         let mut scratch = [0u8; 512];
         {
             let _outcome = build_get_config_response(
                 &mut scratch,
-                CurrentProfile::CdRom, // placeholder
+                current_profile,
                 &self.caps,
                 rt,
                 start,
@@ -1036,10 +1041,11 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::MODE_SENSE_6;
         cdb[2] = 0x2A;
-        cdb[4] = 64;
-        let mut buf = [0u8; 64];
+        cdb[4] = 100;
+        let mut buf = [0u8; 128];
         let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
-        assert_eq!(n, 60);
+        // 4-byte MODE SENSE(6) header + 64-byte 0x2A page.
+        assert_eq!(n, 4 + 64);
         assert_eq!(buf[4], 0x2A);
     }
 
