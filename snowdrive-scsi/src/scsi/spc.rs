@@ -252,7 +252,7 @@ pub fn execute_spc<'a, D: SpcDevice>(
                     immediate: &data[..imm],
                 };
             }
-            return CommandOutcome::Status;
+            CommandOutcome::Status
         }
 
         SpcCommand::PreventAllow { prevent } => {

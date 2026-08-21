@@ -20,7 +20,7 @@ use std::thread;
 
 use snowdrive_scsi::common::block_storage::RamBackend;
 use snowdrive_scsi::iscsi::pdu::BHS_SIZE;
-use snowdrive_scsi::iscsi::target::{serve_conn, LoginStage, Session, StepResult, TargetError};
+use snowdrive_scsi::iscsi::target::{serve_conn, Session, TargetError};
 use snowdrive_scsi::iscsi::transport::TcpConn;
 use snowdrive_scsi::iscsi::transport::DEFAULT_READ_TIMEOUT;
 use snowdrive_scsi::scsi::block::BlockDevice;

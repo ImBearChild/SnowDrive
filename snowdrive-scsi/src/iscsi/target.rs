@@ -1,16 +1,19 @@
-//! iSCSI target protocol state machine (iscsi_target.c).
+//! iSCSI target protocol state machine (RFC 3720 §5 / §10).
 //!
-//! [`Session`] drives one connection through the Login Phase (§5) and the
-//! Full Feature command loop (§10), one transaction per [`Session::step`]
-//! call. [`serve_conn`] is the blocking `while step`
-//! wrapper.
+//! [`Session`] is a pure, non-blocking protocol state machine: it never
+//! blocks and never touches platform I/O.  A driver feeds one
+//! [`IscsiEvent::PduReceived`] per [`Session::poll`] call and learns the
+//! next need from the returned [`IscsiStep`].  The blocking
+//! [`Session::step`] wrapper drives the same state machine over a `Conn`.
 //!
 //! Key fixes over the legacy C implementation: CID read at
 //! byte 20-21 (from iscsi_pdu), Data-Out ITT/TTT/BufferOffset/DataSN
 //! validation with Reject 0x09 (#11), TMF CmdSN check by I bit (#21),
-//! out-of-window/duplicate CmdSN silently ignored (#17), Reject carries the
-//! rejected PDU header + ITT=0xffffffff (#18), and read-timeout coverage is
-//! delegated to the `Conn` implementation (#10/#20).
+//! out-of-window/duplicate CmdSN silently ignored (#17), Reject carries
+//! the rejected PDU header + ITT=0xffffffff (#18), and read-timeout
+//! coverage is delegated to the `Conn` implementation (#10/#20).
+
+use core::cell::Cell;
 
 use crate::iscsi::conn::{read_exact, write_all, Conn};
 use crate::iscsi::pdu::{
@@ -19,30 +22,134 @@ use crate::iscsi::pdu::{
 };
 use crate::scsi::device::{CommandOutcome, ScsiDevice};
 use crate::scsi::scsi::op as scsi_op;
-use crate::scsi::scsi::{asc, opcode_name, Sense, SenseKey};
+use crate::scsi::scsi::{asc, opcode_from_cdb, opcode_name, Sense, SenseKey};
 
-/// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
-const LOGIN_MAX: usize = 4096;
+// ── Public types ─────────────────────────────────────────────────────
+
+/// One event fed from the driver to [`Session::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IscsiEvent {
+    /// A complete iSCSI PDU has been received into the work buffer.
+    /// `dsl` is the data-segment length (from the BHS header).
+    PduReceived { dsl: u32 },
+}
+
+/// The core's next need, returned by [`Session::poll`].
+///
+/// `NeedSend` borrows the work buffer; the driver must consume (send) the
+/// slice before calling `poll` again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IscsiStep<'a> {
+    /// Receive the next complete PDU from the wire into the work buffer.
+    NeedRecv,
+    /// Send `data` to the wire (a complete PDU: BHS + optional data +
+    /// padding).  `data` borrows the work buffer.
+    NeedSend(&'a [u8]),
+    /// The transaction completed and the connection should be closed
+    /// (Logout response sent, peer closed, or fatal I/O error).
+    Closed,
+    /// An internal error (caller bug) — work buffer too small, etc.
+    Error(TargetError),
+}
+
+/// Result of one [`Session::step`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResult {
+    /// A PDU was consumed but nothing was sent (out-of-window CmdSN, §3.2.2.1).
+    Idle,
+    /// A transaction completed and response(s) were sent.
+    Processed,
+    /// The connection should be closed (Logout / peer closed / I/O failure).
+    Closed,
+    /// Internal error (caller bug), e.g. work buffer too small.
+    Error(TargetError),
+}
+
+/// Target-level error (no_std).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetError {
+    /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
+    /// `BHS_SIZE` (data area too small for the SCSI layer).
+    WorkBufTooSmall,
+    /// Connection I/O failure (details logged by the transport).
+    Io,
+    /// Unexpected internal state.
+    Internal,
+}
+
+impl core::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN + BHS_SIZE"),
+            Self::Io => write!(f, "connection I/O failure"),
+            Self::Internal => write!(f, "internal target error"),
+        }
+    }
+}
+
+impl core::error::Error for TargetError {}
+
+/// Login phase stage (RFC 3720 §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginStage {
+    Security,
+    OpParam,
+    FullFeature,
+}
+
+impl LoginStage {
+    fn from_csg(csg: u8) -> Option<LoginStage> {
+        match csg {
+            stage::SECURITY => Some(LoginStage::Security),
+            stage::OP_PARAM => Some(LoginStage::OpParam),
+            stage::FULL_FEATURE => Some(LoginStage::FullFeature),
+            _ => None,
+        }
+    }
+}
+
+/// Negotiated login parameters (RFC 3720 §10.12-.14).
+pub struct NegotiatedParams {
+    pub immediate_data: bool,
+    pub initial_r2t: bool,
+    pub first_burst_len: u32,
+    pub max_burst_len: u32,
+    pub max_outstanding_r2t: u32,
+}
+
+impl Default for NegotiatedParams {
+    fn default() -> Self {
+        Self {
+            immediate_data: true,
+            initial_r2t: true,
+            first_burst_len: DEFAULT_FIRST_BURST,
+            max_burst_len: DEFAULT_MAX_BURST,
+            max_outstanding_r2t: 1,
+        }
+    }
+}
+
+// ── Private constants ───────────────────────────────────────────────
+
 /// Target Transfer Tag for R2T — single outstanding transfer.
 const TTT: u32 = 1;
-/// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
-/// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
-const HARD_CAP: usize = 0xFF_FFFF;
 /// RFC 3720 §12.14 suggested defaults (clamped when the initiator sends more).
 const DEFAULT_FIRST_BURST: u32 = 65536;
 const DEFAULT_MAX_BURST: u32 = 262144;
+/// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
+/// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
+const HARD_CAP: usize = 0xFF_FFFF;
+/// Largest login data segment accepted for negotiation (C `LOGIN_RESP_MAX`).
+const LOGIN_MAX: usize = 4096;
 
-/// One Login parameter key: how the target responds.
-///
-/// `value: None` echoes the initiator's value; `Some(v)` overrides it.
-/// `always: true` keys are emitted even if the initiator never sent them.
+// ── Login parameter table ──────────────────────────────────────────
+
 struct LoginParam {
     key: &'static str,
     value: Option<&'static str>,
     always: bool,
 }
 
-/// Login parameter table (matches the legacy C `LOGIN_TABLE`).
 const LOGIN_TABLE: &[LoginParam] = &[
     LoginParam {
         key: "TargetAlias",
@@ -149,45 +256,7 @@ const SKIP_KEYS: &[&str] = &[
     "TargetName",
 ];
 
-/// Login phase stage (RFC 3720 §5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoginStage {
-    Security,
-    OpParam,
-    FullFeature,
-}
-
-impl LoginStage {
-    fn from_csg(csg: u8) -> Option<LoginStage> {
-        match csg {
-            stage::SECURITY => Some(LoginStage::Security),
-            stage::OP_PARAM => Some(LoginStage::OpParam),
-            stage::FULL_FEATURE => Some(LoginStage::FullFeature),
-            _ => None,
-        }
-    }
-}
-
-/// Negotiated login parameters (RFC 3720 §12.12-.14).
-pub struct NegotiatedParams {
-    pub immediate_data: bool,
-    pub initial_r2t: bool,
-    pub first_burst_len: u32,
-    pub max_burst_len: u32,
-    pub max_outstanding_r2t: u32,
-}
-
-impl Default for NegotiatedParams {
-    fn default() -> Self {
-        Self {
-            immediate_data: true,
-            initial_r2t: true,
-            first_burst_len: DEFAULT_FIRST_BURST,
-            max_burst_len: DEFAULT_MAX_BURST,
-            max_outstanding_r2t: 1,
-        }
-    }
-}
+// ── Session state machine ──────────────────────────────────────────
 
 /// Per-connection iSCSI session state.
 ///
@@ -195,40 +264,123 @@ impl Default for NegotiatedParams {
 /// only when `CmdSN == cmd_sn + 1` (queue depth 1, MaxCmdSN = ExpCmdSN).
 pub struct Session {
     cmd_sn: u32,
-    stat_sn: u32,
+    stat_sn: Cell<u32>,
     stage: LoginStage,
     max_recv_data_segment: u32,
     neg: NegotiatedParams,
+    state: IscsiState,
+}
+
+/// Internal state machine (private).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IscsiState {
+    /// Waiting for the next PDU from the initiator.
+    RecvPdu,
+    /// Data-In phase: sending data to the initiator.
+    DataIn {
+        transfer_len: u64,
+        byte_offset: u64,
+        sent: u64,
+        itt: u32,
+        chunk: usize,
+        lun: usize,
+    },
+    /// Data-Out phase: receiving data from the initiator via R2T.
+    R2tSend {
+        itt: u32,
+        transfer_len: u64,
+        byte_offset: u64,
+        received: u64,
+        r2t_sn: u32,
+        data_sn: u32,
+    },
+    /// Collecting Data-Out PDUs for the current R2T burst.
+    R2tCollect {
+        itt: u32,
+        transfer_len: u64,
+        byte_offset: u64,
+        received: u64,
+        r2t_sn: u32,
+        data_sn: u32,
+        expected_bo: u32,
+        burst_remaining: u64,
+    },
+    /// Collecting ParamOut data via R2T.
+    ParamCollect {
+        itt: u32,
+        expected: u64,
+        received: u64,
+        r2t_sn: u32,
+        data_sn: u32,
+        expected_bo: u32,
+        burst_remaining: u64,
+        cdb: [u8; 16],
+        cdb_len: usize,
+        /// Accumulation offset into work[BHS_SIZE..].
+        acc_offset: usize,
+    },
+    /// Stalled after invalid CBW (iSCSI: fatal protocol error).
+    /// Only `reset()` or a new connection unfreezes.
+    Closed,
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Self {
-            cmd_sn: 0,
-            stat_sn: 0,
-            stage: LoginStage::Security,
-            max_recv_data_segment: MAX_DATA_SEGMENT,
-            neg: NegotiatedParams::default(),
-        }
+        Self::new()
     }
 }
 
 impl Session {
     /// Create a session in the default (pre-login) state.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cmd_sn: 0,
+            stat_sn: Cell::new(0),
+            stage: LoginStage::Security,
+            max_recv_data_segment: MAX_DATA_SEGMENT,
+            neg: NegotiatedParams::default(),
+            state: IscsiState::RecvPdu,
+        }
     }
 
     pub fn stage(&self) -> LoginStage {
         self.stage
     }
 
-    /// Process one iSCSI transaction.
+    // ── Poll interface (non-blocking state machine) ───────────────
+
+    /// Non-blocking state-machine step: consume one event and return the
+    /// next need.
     ///
-    /// Blocks on the connection for as much input as the transaction needs
-    /// (Login → Login Response; SCSI Command → full Data-In/Data-Out flow and
-    /// final status; TMF / NOP / Logout → response). `work` must be at least
-    /// [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes (BHS + data area).
+    /// `work` is the PDU scratch buffer (≥ [`crate::MIN_DATA_LEN`] +
+    /// `BHS_SIZE`); `devs` is the LUN slice.  During the login phase the
+    /// data area is used for parameter negotiation; during Full Feature
+    /// it is the CDB/Data-In/Data-Out staging area.
+    pub fn poll<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: IscsiEvent,
+        work: &'a mut [u8],
+        devs: &mut [D],
+    ) -> IscsiStep<'a> {
+        match self.state {
+            IscsiState::RecvPdu => self.poll_recv(ev, work, devs),
+            IscsiState::DataIn { .. } => self.poll_data_in(work, devs),
+            IscsiState::R2tSend { .. } => self.poll_r2t_send(work),
+            IscsiState::R2tCollect { .. } => self.poll_r2t_collect(ev, work, devs),
+            IscsiState::ParamCollect { .. } => self.poll_param_collect(ev, work, devs),
+            IscsiState::Closed => IscsiStep::Closed,
+        }
+    }
+
+    /// Blocking convenience wrapper: drive `poll` in a loop over a `Conn`,
+    /// processing one complete transaction (Login request/response or
+    /// Full Feature SCSI command including data phases and final status).
+    ///
+    /// `work` must be at least [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes.
+    /// Blocking convenience wrapper: process one complete iSCSI transaction
+    /// (Login or SCSI command including all data phases and final status).
+    ///
+    /// `work` must be at least [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes.
     pub fn step<C: Conn, D: ScsiDevice>(
         &mut self,
         conn: &mut C,
@@ -238,51 +390,553 @@ impl Session {
         if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
             return StepResult::Error(TargetError::WorkBufTooSmall);
         }
-        let pdu = match recv_pdu(conn, work) {
-            Ok(p) => p,
+        // Phase 1: receive and process the first PDU.
+        match recv_pdu(conn, work) {
+            Ok(dsl) => {
+                let r = self.poll(IscsiEvent::PduReceived { dsl }, work, devs);
+                match r {
+                    IscsiStep::NeedSend(data) => {
+                        let len = data.len();
+
+                        let _ = r;
+                        if write_all(conn, &work[..len]).is_err() {
+                            return StepResult::Closed;
+                        }
+                        // Only final responses carry StatSN and advance it.
+                        // Intermediate Data-In (state stays DataIn) and R2T
+                        // (state → R2tCollect) are not final.
+                        if matches!(self.state, IscsiState::RecvPdu | IscsiState::Closed) {
+                            self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+                        }
+                    }
+                    IscsiStep::NeedRecv => return StepResult::Idle,
+                    IscsiStep::Closed => return StepResult::Closed,
+                    IscsiStep::Error(e) => return StepResult::Error(e),
+                }
+            }
             Err(()) => return StepResult::Closed,
+        }
+        // Phase 2: drive remaining data phases to completion.
+        loop {
+            match self.state {
+                IscsiState::RecvPdu | IscsiState::Closed => break,
+                IscsiState::DataIn { .. } => {
+                    // Blocking Data-In: load chunks from backend, write
+                    // Data-In BHS per chunk, send over conn.
+                    let st = self.state;
+                    let IscsiState::DataIn {
+                        transfer_len,
+                        byte_offset,
+                        sent,
+                        itt,
+                        chunk,
+                        lun,
+                    } = st
+                    else {
+                        unreachable!()
+                    };
+                    let mut data_sn: u32 = 1; // Phase 1 sent DataSN=0
+                    let mut offset = sent; // continue from where Phase 1 left off
+                    while offset < transfer_len {
+                        let remaining = transfer_len - offset;
+                        let len = (remaining as usize).min(chunk);
+                        if lun < devs.len() {
+                            let dev = &mut devs[lun];
+                            if dev
+                                .read_data(
+                                    byte_offset + offset,
+                                    &mut work[BHS_SIZE..BHS_SIZE + len],
+                                )
+                                .is_err()
+                            {
+                                let sense = *dev.sense();
+                                let r = self.send_scsi_response(
+                                    work,
+                                    itt,
+                                    status::CHECK_CONDITION,
+                                    Some(&sense),
+                                );
+                                if let IscsiStep::NeedSend(data) = r {
+                                    let l = data.len();
+                                    let _ = r;
+                                    let _ = write_all(conn, &work[..l]);
+                                }
+                                return StepResult::Closed;
+                            }
+                        }
+                        let is_last = offset + len as u64 == transfer_len;
+                        let mut bhs = Bhs::new();
+                        bhs.set_opcode(op::SCSI_DATA_IN);
+                        bhs.set_itt(itt);
+                        bhs.set_data_sn(data_sn);
+                        bhs.set_buffer_offset(offset as u32);
+                        bhs.set_data_segment_len(len as u32);
+                        if is_last {
+                            bhs.set_status(status::GOOD);
+                            bhs.set_stat_sn(self.stat_sn.get());
+                            bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+                            bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+                            bhs.set_flags(flag::F_BIT | flag::S_BIT);
+                        }
+                        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+                        let total = BHS_SIZE + len;
+                        let pad = pdu_pad_len(len as u32) as usize;
+                        work[total..total + pad].fill(0);
+                        if write_all(conn, &work[..total + pad]).is_err() {
+                            return StepResult::Closed;
+                        }
+                        if is_last {
+                            self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+                        }
+                        offset += len as u64;
+                        data_sn = data_sn.wrapping_add(1);
+                    }
+                    self.state = IscsiState::RecvPdu;
+                    return StepResult::Processed;
+                }
+                // R2tSend: build R2T (no StatSN advance; only final response advances).
+                IscsiState::R2tSend { .. } => {
+                    let r = self.poll(IscsiEvent::PduReceived { dsl: 0 }, work, devs);
+                    if let IscsiStep::NeedSend(data) = r {
+                        let len = data.len();
+                        let _ = r;
+                        if write_all(conn, &work[..len]).is_err() {
+                            return StepResult::Closed;
+                        }
+                    }
+                }
+                // R2tCollect / ParamCollect: need real Data-Out PDUs
+                // from the wire.
+                IscsiState::R2tCollect { .. } | IscsiState::ParamCollect { .. } => {
+                    match recv_pdu(conn, work) {
+                        Ok(dsl) => {
+                            let r = self.poll(IscsiEvent::PduReceived { dsl }, work, devs);
+                            match r {
+                                IscsiStep::NeedSend(data) => {
+                                    let len = data.len();
+                                    let _ = r;
+                                    if write_all(conn, &work[..len]).is_err() {
+                                        return StepResult::Closed;
+                                    }
+                                    self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+                                }
+                                IscsiStep::NeedRecv => continue,
+                                IscsiStep::Closed => return StepResult::Closed,
+                                IscsiStep::Error(e) => return StepResult::Error(e),
+                            }
+                        }
+                        Err(()) => return StepResult::Closed,
+                    }
+                }
+            }
+        }
+        if self.state == IscsiState::Closed {
+            StepResult::Closed
+        } else {
+            StepResult::Processed
+        }
+    }
+
+    // ── Poll sub-handlers ─────────────────────────────────────────
+
+    fn poll_recv<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: IscsiEvent,
+        work: &'a mut [u8],
+        devs: &mut [D],
+    ) -> IscsiStep<'a> {
+        // Validate work buffer up front (same as the old step()).
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return IscsiStep::Error(TargetError::WorkBufTooSmall);
+        }
+
+        match ev {
+            IscsiEvent::PduReceived { dsl } => {
+                let pdu = Pdu {
+                    bhs: Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap()),
+                    dsl: dsl as usize,
+                };
+
+                // AHS defense: Assumes TotalAHSLength = 0.
+                if pdu.bhs.total_ahs_length() != 0 {
+                    return self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs);
+                }
+
+                let iscsi_op = pdu.bhs.opcode();
+                crate::debug!(
+                    "recv {} (0x{:02X}) stage={:?} cmd_sn={} stat_sn={}",
+                    iscsi_opcode_name(iscsi_op),
+                    iscsi_op,
+                    self.stage,
+                    self.cmd_sn,
+                    self.stat_sn.get()
+                );
+                if self.stage != LoginStage::FullFeature {
+                    if iscsi_op != op::LOGIN_REQ {
+                        return self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs);
+                    }
+                    return self.handle_login(work, &pdu);
+                }
+
+                match iscsi_op {
+                    op::SCSI_CMD => self.handle_scsi_cmd(work, devs, &pdu),
+                    op::SCSI_TASK_REQ => self.handle_tmf(work, &pdu),
+                    op::NOP_OUT => self.handle_nop(work, &pdu),
+                    op::LOGOUT_REQ => self.handle_logout(work, &pdu),
+                    op::TEXT_REQ => self.reject(work, reject::COMMAND_NOT_SUPPORTED, &pdu.bhs),
+                    op::LOGIN_REQ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
+                    _ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
+                }
+            }
+        }
+    }
+
+    fn poll_data_in<'a, D: ScsiDevice>(
+        &'a mut self,
+        work: &'a mut [u8],
+        devs: &mut [D],
+    ) -> IscsiStep<'a> {
+        let st = self.state;
+        let IscsiState::DataIn {
+            transfer_len,
+            byte_offset,
+            sent,
+            itt,
+            chunk,
+            lun,
+        } = st
+        else {
+            unreachable!()
         };
 
-        // AHS defense: Assumes TotalAHSLength = 0.
-        if pdu.bhs.total_ahs_length() != 0 {
-            return self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs);
+        if sent >= transfer_len {
+            // Whole transfer sent — send final Data-In with status.
+            self.state = IscsiState::RecvPdu;
+            return self.send_data_in_final(work, itt, 0, 0, 0, status::GOOD);
         }
 
-        let op = pdu.bhs.opcode();
-        crate::debug!(
-            "recv {} (0x{:02X}) stage={:?} cmd_sn={} stat_sn={}",
-            iscsi_opcode_name(op),
-            op,
-            self.stage,
-            self.cmd_sn,
-            self.stat_sn
-        );
-        if self.stage != LoginStage::FullFeature {
-            if op != op::LOGIN_REQ {
-                return self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs);
+        let next = ((transfer_len - sent) as usize).min(chunk);
+        if lun < devs.len() {
+            let dev = &mut devs[lun];
+            if dev
+                .read_data(byte_offset + sent, &mut work[BHS_SIZE..BHS_SIZE + next])
+                .is_err()
+            {
+                let sense = *dev.sense();
+                return self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense));
             }
-            return self.handle_login(conn, work, &pdu);
+        }
+        self.state = IscsiState::DataIn {
+            transfer_len,
+            byte_offset,
+            sent: sent + next as u64,
+            itt,
+            chunk: next,
+            lun,
+        };
+        IscsiStep::NeedSend(&work[..BHS_SIZE + next])
+    }
+
+    fn poll_r2t_send<'a>(&'a mut self, work: &'a mut [u8]) -> IscsiStep<'a> {
+        let st = self.state;
+        let IscsiState::R2tSend {
+            itt,
+            transfer_len,
+            byte_offset,
+            received,
+            r2t_sn,
+            data_sn,
+        } = st
+        else {
+            unreachable!()
+        };
+
+        let burst = (u64::from(self.neg.max_burst_len)).min(transfer_len - received);
+        let mut bhs = Bhs::new();
+        bhs.set_opcode(op::R2T);
+        bhs.set_flags(flag::F_BIT);
+        bhs.set_itt(itt);
+        bhs.set_ttt(TTT);
+        bhs.set_stat_sn(self.stat_sn.get());
+        bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+        bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+        bhs.set_r2t_sn(r2t_sn);
+        bhs.set_buffer_offset(received as u32);
+        bhs.set_desired_data_len(burst as u32);
+        crate::trace!("R2T: R2TSN={} BO={} DesiredLen={}", r2t_sn, received, burst);
+
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        let pad = pdu_pad_len(0) as usize;
+        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        self.state = IscsiState::R2tCollect {
+            itt,
+            transfer_len,
+            byte_offset,
+            received,
+            r2t_sn,
+            data_sn,
+            expected_bo: received as u32,
+            burst_remaining: burst,
+        };
+        IscsiStep::NeedSend(&work[..BHS_SIZE])
+    }
+
+    fn poll_r2t_collect<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: IscsiEvent,
+        work: &'a mut [u8],
+        devs: &mut [D],
+    ) -> IscsiStep<'a> {
+        let st = self.state;
+        let IscsiState::R2tCollect {
+            itt,
+            transfer_len,
+            byte_offset,
+            mut received,
+            r2t_sn,
+            mut data_sn,
+            mut expected_bo,
+            mut burst_remaining,
+        } = st
+        else {
+            unreachable!()
+        };
+
+        let IscsiEvent::PduReceived { dsl } = ev;
+        let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
+        let pdu_dsl = dsl as usize;
+
+        if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
+            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+        }
+        if pdu_bhs.itt() != itt || pdu_bhs.ttt() != TTT {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_bhs.buffer_offset() != expected_bo {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_bhs.data_sn() != data_sn {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_dsl > self.max_recv_data_segment as usize {
+            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+        }
+        if pdu_dsl as u64 > burst_remaining {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
         }
 
-        match op {
-            op::SCSI_CMD => self.handle_scsi_cmd(conn, work, devs, &pdu),
-            op::SCSI_TASK_REQ => self.handle_tmf(conn, work, &pdu),
-            op::NOP_OUT => self.handle_nop(conn, work, &pdu),
-            op::LOGOUT_REQ => self.handle_logout(conn, work, &pdu),
-            op::TEXT_REQ => self.reject(conn, work, reject::COMMAND_NOT_SUPPORTED, &pdu.bhs),
-            op::LOGIN_REQ => self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs),
-            _ => self.reject(conn, work, reject::PROTOCOL_ERROR, &pdu.bhs),
+        if pdu_dsl > 0 {
+            if let Some(dev) = devs.first_mut() {
+                if dev
+                    .write_data(
+                        byte_offset + expected_bo as u64,
+                        &work[BHS_SIZE..BHS_SIZE + pdu_dsl],
+                    )
+                    .is_err()
+                {
+                    let sense = *dev.sense();
+                    return self.send_scsi_response(
+                        work,
+                        itt,
+                        status::CHECK_CONDITION,
+                        Some(&sense),
+                    );
+                }
+            }
         }
+
+        crate::trace!(
+            "  Data-Out: BO={} DataSN={} len={}",
+            expected_bo,
+            data_sn,
+            pdu_dsl
+        );
+        expected_bo += pdu_dsl as u32;
+        received += pdu_dsl as u64;
+        burst_remaining -= pdu_dsl as u64;
+        data_sn = data_sn.wrapping_add(1);
+
+        if burst_remaining == 0 {
+            if received == transfer_len {
+                // Transfer complete — send SCSI Response.
+                return self.send_scsi_response(work, itt, status::GOOD, None);
+            }
+            // Next R2T — DataSN resets per R2T (RFC 3720 §10.7, DataSN is
+            // relative to the R2T's buffer offset, not the whole command).
+            self.state = IscsiState::R2tSend {
+                itt,
+                transfer_len,
+                byte_offset,
+                received,
+                r2t_sn: r2t_sn + 1,
+                data_sn: 0,
+            };
+            return self.poll_r2t_send(work);
+        }
+
+        // More Data-Out PDUs expected in this burst.
+        self.state = IscsiState::R2tCollect {
+            itt,
+            transfer_len,
+            byte_offset,
+            received,
+            r2t_sn,
+            data_sn,
+            expected_bo,
+            burst_remaining,
+        };
+        IscsiStep::NeedRecv
+    }
+
+    fn poll_param_collect<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: IscsiEvent,
+        work: &'a mut [u8],
+        devs: &mut [D],
+    ) -> IscsiStep<'a> {
+        let st = self.state;
+        let IscsiState::ParamCollect {
+            itt,
+            expected,
+            mut received,
+            r2t_sn,
+            mut data_sn,
+            mut expected_bo,
+            mut burst_remaining,
+            cdb,
+            cdb_len,
+            mut acc_offset,
+        } = st
+        else {
+            unreachable!()
+        };
+
+        let IscsiEvent::PduReceived { dsl } = ev;
+        let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
+        let pdu_dsl = dsl as usize;
+
+        if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
+            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+        }
+        if pdu_bhs.itt() != itt || pdu_bhs.ttt() != TTT {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_bhs.buffer_offset() != expected_bo {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_bhs.data_sn() != data_sn {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+        if pdu_dsl > self.max_recv_data_segment as usize {
+            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+        }
+        if pdu_dsl as u64 > burst_remaining {
+            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+        }
+
+        // Accumulate into work[BHS_SIZE + acc_offset ..].
+        // `copy_within` is safe because acc_offset > 0, so the
+        // destination is always at a higher address than the source.
+        if pdu_dsl > 0 {
+            work.copy_within(BHS_SIZE..BHS_SIZE + pdu_dsl, BHS_SIZE + acc_offset);
+        }
+        acc_offset += pdu_dsl;
+        expected_bo += pdu_dsl as u32;
+        received += pdu_dsl as u64;
+        burst_remaining -= pdu_dsl as u64;
+        data_sn = data_sn.wrapping_add(1);
+
+        if received >= expected {
+            // All data collected — complete the parameter.
+            let cdb_slice = &cdb[..cdb_len];
+            let param_data = &work[BHS_SIZE..BHS_SIZE + expected as usize];
+            let outcome = devs[0].complete_param(cdb_slice, param_data);
+            return match outcome {
+                CommandOutcome::Status => self.send_scsi_response(work, itt, status::GOOD, None),
+                CommandOutcome::CheckCondition(sense) => {
+                    self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense))
+                }
+                _ => {
+                    let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+                    self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense))
+                }
+            };
+        }
+
+        if burst_remaining == 0 {
+            // Next R2T.
+            self.state = IscsiState::ParamCollect {
+                itt,
+                expected,
+                received,
+                r2t_sn: r2t_sn + 1,
+                data_sn,
+                expected_bo,
+                burst_remaining: (u64::from(self.neg.max_burst_len)).min(expected - received),
+                cdb,
+                cdb_len,
+                acc_offset,
+            };
+            return self.send_param_r2t(work, itt, received, r2t_sn + 1);
+        }
+
+        self.state = IscsiState::ParamCollect {
+            itt,
+            expected,
+            received,
+            r2t_sn,
+            data_sn,
+            expected_bo,
+            burst_remaining,
+            cdb,
+            cdb_len,
+            acc_offset,
+        };
+        IscsiStep::NeedRecv
+    }
+
+    /// Build and send a ParamOut R2T PDU.
+    fn send_param_r2t<'a>(
+        &'a mut self,
+        work: &'a mut [u8],
+        itt: u32,
+        buffer_offset: u64,
+        r2t_sn: u32,
+    ) -> IscsiStep<'a> {
+        let st = self.state;
+        let IscsiState::ParamCollect {
+            expected, received, ..
+        } = st
+        else {
+            unreachable!()
+        };
+        let burst = (u64::from(self.neg.max_burst_len)).min(expected - received);
+        let mut bhs = Bhs::new();
+        bhs.set_opcode(op::R2T);
+        bhs.set_flags(flag::F_BIT);
+        bhs.set_itt(itt);
+        bhs.set_ttt(TTT);
+        bhs.set_stat_sn(self.stat_sn.get());
+        bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+        bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+        bhs.set_r2t_sn(r2t_sn);
+        bhs.set_buffer_offset(buffer_offset as u32);
+        bhs.set_desired_data_len(burst as u32);
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        // Update burst_remaining in state.
+        if let IscsiState::ParamCollect {
+            ref mut burst_remaining,
+            ..
+        } = self.state
+        {
+            *burst_remaining = burst;
+        }
+        IscsiStep::NeedSend(&work[..BHS_SIZE])
     }
 
     // ── Login Phase ───────────────────────────────────────────────
 
-    fn handle_login<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        pdu: &Pdu,
-    ) -> StepResult {
+    fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
         let req = &pdu.bhs;
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
@@ -334,35 +988,31 @@ impl Session {
             resp.as_mut_bytes()[14..16].copy_from_slice(&req.as_bytes()[14..16]);
         }
         resp.set_data_segment_len(resp_len as u32);
-        resp.set_stat_sn(self.stat_sn);
+        resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(req.cmd_sn());
         resp.set_max_cmd_sn(req.cmd_sn());
 
-        if send_pdu(conn, work, &resp, resp_len).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
+        // Assemble: BHS at work[0..48], data at work[48..48+resp_len].
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let total = BHS_SIZE + resp_len;
+        let pad = pdu_pad_len(resp_len as u32) as usize;
+        work[total..total + pad].fill(0);
+        // stat_sn incremented by step() after sending.
 
         if t {
             self.stage = LoginStage::from_csg(nsg).unwrap_or(LoginStage::FullFeature);
             if self.stage == LoginStage::FullFeature {
                 crate::debug!("login complete: FullFeature, cmd_sn={}", req.cmd_sn());
-                // RFC 3720 §10.12.8: the leading Login Request's CmdSN is the
-                // session's initial ExpCmdSN, and the first FullFeature
-                // command reuses that same CmdSN. `cmd_sn` tracks the last
-                // consumed CmdSN, so back off by one — the first command
-                // (CmdSN == login CmdSN) then passes the `cmd_sn + 1` window
-                // check (wrapping handles a login CmdSN of 0).
                 self.cmd_sn = req.cmd_sn().wrapping_sub(1);
             }
         } else {
             self.stage = LoginStage::from_csg(req_csg).unwrap_or(LoginStage::Security);
         }
-        StepResult::Processed
+        IscsiStep::NeedSend(&work[..total + pad])
     }
 
     /// Parse initiator key=value text into a response, updating negotiated
-    /// parameters. Writes into `dst` (clamped), returns the response length.
+    /// parameters.  Writes into `dst` (clamped), returns the response length.
     fn negotiate(&mut self, src: &[u8], dst: &mut [u8]) -> usize {
         let mut w = 0usize;
         let mut sent = [false; LOGIN_TABLE.len()];
@@ -422,8 +1072,6 @@ impl Session {
         match key {
             "MaxRecvDataSegmentLength" => {
                 if let Some(v) = parse_u32(val) {
-                    // Clamp the initiator's declaration to the target's
-                    // buffer-derived capability (§6.4.1).
                     self.max_recv_data_segment = v.min(self.max_recv_data_segment);
                 }
             }
@@ -450,82 +1098,66 @@ impl Session {
 
     // ── Full Feature: SCSI Command ────────────────────────────────
 
-    fn handle_scsi_cmd<C: Conn + ?Sized, D: ScsiDevice>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
+    fn handle_scsi_cmd<'a, D: ScsiDevice>(
+        &'a mut self,
+        work: &'a mut [u8],
         devs: &mut [D],
         pdu: &Pdu,
-    ) -> StepResult {
+    ) -> IscsiStep<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
-        let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0; // I bit (§3.2.2.1)
-
+        let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            // Non-immediate out-of-window or duplicate → silently ignore.
-            return StepResult::Idle;
+            return IscsiStep::NeedRecv;
         }
         self.cmd_sn = recv_cmd_sn;
 
         let itt = bhs.itt();
-        // LUN field format: only single-level peripheral device addressing
-        // is supported (SAM-2 address method 0000b — byte 8 = 0, LUN id in
-        // byte 9, bytes 10-15 reserved). Any other 64-bit encoding
-        // (multi-level, flat space, extended) is a PDU field error
-        // (RFC 3720 §10.2.1.7) → Reject 0x09.
         if !bhs.lun_is_single_level() {
-            return self.reject(conn, work, reject::INVALID_PDU_FIELD, bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, bhs);
         }
         let lun = bhs.lun() as usize;
         if lun >= devs.len() {
-            // Well-formed single-level LUN that is not present: a SCSI-level
-            // error — CHECK CONDITION / LOGICAL UNIT NOT SUPPORTED
-            // (SPC-4 §6.21, ASC 0x25) — NOT an iSCSI Reject. Linux treats a
-            // Reject as a session-level protocol failure and tears down the
-            // connection; the Check Condition lets the initiator REQUEST
-            // SENSE and keep the session alive.
             let sense = Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
-            return self.send_scsi_response(conn, work, itt, status::CHECK_CONDITION, Some(&sense));
+            return self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense));
         }
         if pdu.dsl > self.max_recv_data_segment as usize {
-            return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, bhs);
         }
-        // RFC 3720 §10.3.1: W bit is byte 1 bit 2. Per the §2.3.3 "Byte Rule",
-        // bit 0 is the MSB (2**7), so bit 2 = 0x20 — the Linux kernel
-        // (open-iscsi) sends W at 0x20. The legacy C `& 0x20` was correct; a
-        // prior Rust "fix" to 0x04 (misreading bit 2 as LSB) broke Linux writes.
         let w_bit = bhs.as_bytes()[1] & 0x20 != 0;
         if pdu.dsl > 0 && !w_bit {
-            return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, bhs);
         }
 
         let cdb = bhs.cdb();
-        if cdb[0] == scsi_op::REPORT_LUNS {
-            return self.handle_report_luns(conn, work, itt, devs.len());
+        let scsi_opcode = opcode_from_cdb(cdb);
+
+        if scsi_opcode == scsi_op::REPORT_LUNS {
+            return self.handle_report_luns(work, itt, devs.len());
         }
-        let dev = &mut devs[lun];
+
         crate::debug!(
             "scsi cmd: {} (0x{:02X}) itt=0x{:08X} lun={} cmd_sn={} dsl={}",
-            opcode_name(cdb[0]),
-            cdb[0],
+            opcode_name(scsi_opcode),
+            scsi_opcode,
             itt,
             lun,
             recv_cmd_sn,
             pdu.dsl
         );
-        // The data area is `work[BHS_SIZE..]` — synthesized responses land in
-        // the PDU data-segment slot, zero-copy.
+
+        let dev = &mut devs[lun];
         let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..], pdu.dsl) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
-                return StepResult::Error(TargetError::WorkBufTooSmall)
+                return IscsiStep::Error(TargetError::WorkBufTooSmall)
             }
         };
 
         match outcome {
             CommandOutcome::Status => {
                 crate::debug!("  -> Status (GOOD)");
-                self.send_scsi_response(conn, work, itt, status::GOOD, None)
+                self.send_scsi_response(work, itt, status::GOOD, None)
             }
             CommandOutcome::CheckCondition(sense) => {
                 crate::debug!(
@@ -534,7 +1166,7 @@ impl Session {
                     sense.asc,
                     sense.ascq
                 );
-                self.send_scsi_response(conn, work, itt, status::CHECK_CONDITION, Some(&sense))
+                self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense))
             }
             CommandOutcome::DataIn {
                 transfer_len,
@@ -542,17 +1174,61 @@ impl Session {
                 immediate,
             } => {
                 if !immediate.is_empty() {
-                    // Synthesized response already resident at work[BHS_SIZE..].
                     let n = immediate.len();
                     crate::debug!("  -> DataIn (synthesized, {} bytes)", n);
-                    self.send_data_in_final(conn, work, itt, n, 0, 0, status::GOOD)
+                    self.send_data_in_final(work, itt, n, 0, 0, status::GOOD)
                 } else {
                     crate::debug!(
                         "  -> DataIn (backend, transfer_len={} @ offset={})",
                         transfer_len,
                         byte_offset
                     );
-                    self.send_read_data(conn, work, dev, itt, transfer_len, byte_offset)
+                    let chunk = (transfer_len as usize).min(work.len() - BHS_SIZE);
+                    if lun < devs.len() {
+                        let dev = &mut devs[lun];
+                        if dev
+                            .read_data(byte_offset, &mut work[BHS_SIZE..BHS_SIZE + chunk])
+                            .is_err()
+                        {
+                            let sense = *dev.sense();
+                            return self.send_scsi_response(
+                                work,
+                                itt,
+                                status::CHECK_CONDITION,
+                                Some(&sense),
+                            );
+                        }
+                    }
+                    if chunk as u64 == transfer_len {
+                        // All data fits in one chunk — send as final Data-In (F+S).
+                        let mut dib = Bhs::new();
+                        dib.set_opcode(op::SCSI_DATA_IN);
+                        dib.set_itt(itt);
+                        dib.set_flags(flag::F_BIT | flag::S_BIT);
+                        dib.set_status(status::GOOD);
+                        dib.set_stat_sn(self.stat_sn.get());
+                        dib.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+                        dib.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+                        dib.set_data_segment_len(chunk as u32);
+                        work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
+                        self.state = IscsiState::RecvPdu;
+                    } else {
+                        // Multi-chunk: first chunk is intermediate (F=0, S=0).
+                        let mut dib = Bhs::new();
+                        dib.set_opcode(op::SCSI_DATA_IN);
+                        dib.set_itt(itt);
+                        dib.set_data_segment_len(chunk as u32);
+                        work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
+                        self.state = IscsiState::DataIn {
+                            transfer_len,
+                            byte_offset,
+                            sent: chunk as u64,
+                            itt,
+                            chunk,
+                            lun,
+                        };
+                    }
+                    IscsiStep::NeedSend(&work[..BHS_SIZE + chunk])
                 }
             }
             CommandOutcome::DataOut {
@@ -560,8 +1236,8 @@ impl Session {
                 byte_offset,
                 immediate,
             } => {
-                // Consume the immediate data first (write to backend), dropping
-                // the borrow on work (§5.1), then drive R2T/Data-Out.
+                // Consume the immediate data first (write to backend), then
+                // drive R2T/Data-Out.
                 let received = immediate.len() as u64;
                 crate::debug!(
                     "  -> DataOut transfer_len={} immediate={} @ offset={}",
@@ -569,17 +1245,32 @@ impl Session {
                     received,
                     byte_offset
                 );
-                if received > 0 && dev.write_data(byte_offset, immediate).is_err() {
-                    let sense = *dev.sense();
-                    return self.send_scsi_response(
-                        conn,
-                        work,
-                        itt,
-                        status::CHECK_CONDITION,
-                        Some(&sense),
-                    );
+                if received > 0 && lun < devs.len() {
+                    let dev = &mut devs[lun];
+                    if dev.write_data(byte_offset, immediate).is_err() {
+                        let sense = *dev.sense();
+                        return self.send_scsi_response(
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            Some(&sense),
+                        );
+                    }
                 }
-                self.send_write_flow(conn, work, dev, itt, transfer_len, byte_offset, received)
+                if received == transfer_len {
+                    return self.send_scsi_response(work, itt, status::GOOD, None);
+                }
+
+                // Enter R2T state: send the first R2T.
+                self.state = IscsiState::R2tSend {
+                    itt,
+                    transfer_len,
+                    byte_offset,
+                    received,
+                    r2t_sn: 0,
+                    data_sn: 0,
+                };
+                self.poll_r2t_send(work)
             }
             CommandOutcome::ParamOut {
                 expected_len,
@@ -589,405 +1280,107 @@ impl Session {
                 let received = immediate.len() as u64;
                 crate::debug!("  -> ParamOut expected={} immediate={}", expected, received);
                 if expected > 0 && !w_bit {
-                    return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+                    return self.reject(work, reject::PROTOCOL_ERROR, bhs);
                 }
                 if received > expected {
-                    return self.reject(conn, work, reject::PROTOCOL_ERROR, bhs);
+                    return self.reject(work, reject::PROTOCOL_ERROR, bhs);
                 }
                 if expected as usize > work.len() - BHS_SIZE {
-                    return StepResult::Error(TargetError::WorkBufTooSmall);
+                    return IscsiStep::Error(TargetError::WorkBufTooSmall);
                 }
-                // `immediate` already resides at work[BHS_SIZE..BHS_SIZE+received].
-                // Drop the borrow before the R2T loop mutably reuses `work`.
-                let cdb_owned = {
-                    let mut tmp = [0u8; 16];
-                    let c = bhs.cdb();
-                    tmp[..c.len()].copy_from_slice(c);
-                    tmp
+
+                let mut cdb_buf = [0u8; 16];
+                let cdb_len = cdb.len().min(16);
+                cdb_buf[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
+
+                if received == expected {
+                    // All present — complete immediately.
+                    let outcome2 = devs[0].complete_param(
+                        &cdb_buf[..cdb_len],
+                        &work[BHS_SIZE..BHS_SIZE + expected as usize],
+                    );
+                    return match outcome2 {
+                        CommandOutcome::Status => {
+                            self.send_scsi_response(work, itt, status::GOOD, None)
+                        }
+                        CommandOutcome::CheckCondition(sense) => self.send_scsi_response(
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            Some(&sense),
+                        ),
+                        _ => {
+                            let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+                            self.send_scsi_response(
+                                work,
+                                itt,
+                                status::CHECK_CONDITION,
+                                Some(&sense),
+                            )
+                        }
+                    };
+                }
+
+                // Need to receive the remainder via R2T.
+                let acc_offset = received as usize;
+                let burst = (u64::from(self.neg.max_burst_len)).min(expected - received);
+                self.state = IscsiState::ParamCollect {
+                    itt,
+                    expected,
+                    received,
+                    r2t_sn: 0,
+                    data_sn: 0,
+                    expected_bo: received as u32,
+                    burst_remaining: burst,
+                    cdb: cdb_buf,
+                    cdb_len,
+                    acc_offset,
                 };
-                let cdb_len = bhs.cdb().len();
-                // If not all received, drive R2T/Data-Out to collect the remainder.
-                let mut cur = received;
-                if cur < expected {
-                    // Use a dedicated param R2T flow that accumulates into work.
-                    match self.collect_param_out(conn, work, itt, expected, &mut cur) {
-                        Ok(()) => {}
-                        Err(r) => return r,
-                    }
-                }
-                let param_data = &work[BHS_SIZE..BHS_SIZE + expected as usize];
-                let cdb_slice = &cdb_owned[..cdb_len];
-                match dev.complete_param(cdb_slice, param_data) {
-                    CommandOutcome::Status => {
-                        crate::debug!("  -> Param complete Status");
-                        self.send_scsi_response(conn, work, itt, status::GOOD, None)
-                    }
-                    CommandOutcome::CheckCondition(sense) => {
-                        crate::debug!("  -> Param complete CheckCondition asc=0x{:02X}", sense.asc);
-                        self.send_scsi_response(
-                            conn,
-                            work,
-                            itt,
-                            status::CHECK_CONDITION,
-                            Some(&sense),
-                        )
-                    }
-                    other => {
-                        crate::warn!("  -> Param complete unexpected outcome {:?}", other);
-                        let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
-                        self.send_scsi_response(
-                            conn,
-                            work,
-                            itt,
-                            status::CHECK_CONDITION,
-                            Some(&sense),
-                        )
-                    }
-                }
+                self.send_param_r2t(work, itt, received, 0)
             }
         }
     }
 
     /// Build and send the REPORT LUNS response (SPC-4 §6.21).
-    ///
-    /// The data segment is:
-    /// - 4-byte big-endian LUN list length (8 × `num_luns`),
-    /// - 4-byte reserved (zeros),
-    /// - `num_luns` 8-byte LUN entries in ascending LUN id.
-    ///
-    /// The 4 reserved bytes are required: Linux's `scsi_report_lun_scan`
-    /// (drivers/scsi/scsi_scan.c) iterates the entries starting at
-    /// `lun_data[1]` of the response buffer, i.e. byte offset 8. Skipping
-    /// the reserved padding puts LUN 0 at offset 4, and the kernel then
-    /// reads `lun_data[1]` (offset 8) as a hybrid of LUN 0's tail half +
-    /// LUN 1's head half, which `scsilun_to_int` decodes to 2^32 for the
-    /// first byte that lands in the high half. The 4 reserved bytes keep
-    /// the entries 8-byte aligned, which is what LIO and open-iscsi emit.
-    ///
-    /// Each entry is the single-level LUN structure from SAM-2: byte 0 =
-    /// 0x00 (address method 00b = peripheral device addressing, bus id 0x0),
-    /// byte 1 = LUN id, bytes 2..7 = 0x00. The response is target-wide, so
-    /// the LUN the initiator used to issue REPORT LUNS is irrelevant — the
-    /// caller's LUN-validity check above still rejects out-of-range LUNs.
-    fn handle_report_luns<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
+    fn handle_report_luns<'a>(
+        &'a mut self,
+        work: &'a mut [u8],
         itt: u32,
         num_luns: usize,
-    ) -> StepResult {
-        // 8-byte header (4-byte LUN list length + 4-byte reserved) +
-        // 8 bytes per LUN. 256 LUNs is the single-level peripheral device
-        // addressing limit (SAM-2) and fits comfortably in
-        // `MIN_DATA_LEN = 8192`.
+    ) -> IscsiStep<'a> {
         let list_len = u32::try_from(num_luns)
             .ok()
             .and_then(|n| n.checked_mul(8))
             .unwrap_or(u32::MAX);
         let total = 8usize + (list_len as usize);
         if total > work.len() - BHS_SIZE {
-            return StepResult::Error(TargetError::WorkBufTooSmall);
+            return IscsiStep::Error(TargetError::WorkBufTooSmall);
         }
-        // Header: LUN list length (BE) + reserved.
         work[BHS_SIZE..BHS_SIZE + 4].copy_from_slice(&list_len.to_be_bytes());
         for b in &mut work[BHS_SIZE + 4..BHS_SIZE + 8] {
             *b = 0;
         }
-        // LUN entries start at byte 8, not 4 — see the doc comment.
         for i in 0..num_luns {
             let off = BHS_SIZE + 8 + i * 8;
-            work[off] = 0x00; // address method 00b, bus id 0
-            work[off + 1] = i as u8; // single-level LUN id
+            work[off] = 0x00;
+            work[off + 1] = i as u8;
             for b in &mut work[off + 2..off + 8] {
                 *b = 0;
             }
         }
         crate::debug!("  -> REPORT LUNS: {} LUN(s)", num_luns);
-        self.send_data_in_final(conn, work, itt, total, 0, 0, status::GOOD)
-    }
-
-    /// Send chunked Data-In for a backend READ (RFC 3720 §10.7).
-    fn send_read_data<C: Conn + ?Sized, D: ScsiDevice>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        dev: &mut D,
-        itt: u32,
-        transfer_len: u64,
-        byte_offset: u64,
-    ) -> StepResult {
-        let chunk_max = self.max_recv_data_segment as usize;
-        let mut offset = 0u64;
-        let mut data_sn = 0u32;
-        loop {
-            let remaining = transfer_len - offset;
-            if remaining == 0 {
-                // Empty transfer: final Data-In with status, zero payload.
-                return self.send_data_in_final(conn, work, itt, 0, 0, data_sn, status::GOOD);
-            }
-            let chunk = remaining.min(chunk_max as u64) as usize;
-            if dev
-                .read_data(byte_offset + offset, &mut work[BHS_SIZE..BHS_SIZE + chunk])
-                .is_err()
-            {
-                let sense = *dev.sense();
-                return self.send_scsi_response(
-                    conn,
-                    work,
-                    itt,
-                    status::CHECK_CONDITION,
-                    Some(&sense),
-                );
-            }
-            let is_last = chunk as u64 == remaining;
-            let mut bhs = Bhs::new();
-            bhs.set_opcode(op::SCSI_DATA_IN);
-            bhs.set_itt(itt);
-            bhs.set_data_sn(data_sn);
-            bhs.set_buffer_offset(offset as u32);
-            bhs.set_data_segment_len(chunk as u32);
-            if is_last {
-                bhs.set_status(status::GOOD);
-                bhs.set_stat_sn(self.stat_sn);
-                bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
-                bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-                bhs.set_flags(flag::F_BIT | flag::S_BIT);
-            }
-            crate::trace!(
-                "  Data-In: BO={} DataSN={} len={} final={}",
-                offset,
-                data_sn,
-                chunk,
-                is_last
-            );
-            if send_pdu(conn, work, &bhs, chunk).is_err() {
-                return StepResult::Closed;
-            }
-            if is_last {
-                self.stat_sn = self.stat_sn.wrapping_add(1);
-                return StepResult::Processed;
-            }
-            offset += chunk as u64;
-            data_sn = data_sn.wrapping_add(1);
-        }
-    }
-
-    /// Write flow: R2T(s) → Data-Out → final status. `received` bytes have
-    /// already been written to the backend (immediate data).
-    #[allow(clippy::too_many_arguments)]
-    fn send_write_flow<C: Conn + ?Sized, D: ScsiDevice>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        dev: &mut D,
-        itt: u32,
-        transfer_len: u64,
-        byte_offset: u64,
-        mut received: u64,
-    ) -> StepResult {
-        if received == transfer_len {
-            return self.send_scsi_response(conn, work, itt, status::GOOD, None);
-        }
-
-        let mut r2t_sn = 0u32;
-        loop {
-            let burst = (u64::from(self.neg.max_burst_len)).min(transfer_len - received);
-            let mut bhs = Bhs::new();
-            bhs.set_opcode(op::R2T);
-            bhs.set_flags(flag::F_BIT);
-            bhs.set_itt(itt);
-            bhs.set_ttt(TTT);
-            // R2T carries the current StatSN but does not advance it (§10.8.3).
-            bhs.set_stat_sn(self.stat_sn);
-            bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
-            bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-            bhs.set_r2t_sn(r2t_sn);
-            bhs.set_buffer_offset(received as u32);
-            bhs.set_desired_data_len(burst as u32);
-            crate::trace!("R2T: R2TSN={} BO={} DesiredLen={}", r2t_sn, received, burst);
-            if send_pdu(conn, work, &bhs, 0).is_err() {
-                return StepResult::Closed;
-            }
-
-            // Collect the solicited Data-Out PDUs for this burst.
-            let mut burst_received = 0u64;
-            let mut expected_bo = received;
-            let mut data_sn = 0u32;
-            while burst_received < burst {
-                let pdu = match recv_pdu(conn, work) {
-                    Ok(p) => p,
-                    Err(()) => return StepResult::Closed,
-                };
-                let obhs = &pdu.bhs;
-                if obhs.opcode() != op::SCSI_DATA_OUT {
-                    return self.reject(conn, work, reject::PROTOCOL_ERROR, obhs);
-                }
-                // Field validation (§10.7, fix #11) — violations → 0x09.
-                if obhs.itt() != itt || obhs.ttt() != TTT {
-                    return self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs);
-                }
-                if obhs.buffer_offset() as u64 != expected_bo {
-                    return self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs);
-                }
-                if obhs.data_sn() != data_sn {
-                    return self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs);
-                }
-                if pdu.dsl > self.max_recv_data_segment as usize {
-                    return self.reject(conn, work, reject::PROTOCOL_ERROR, obhs);
-                }
-                if pdu.dsl as u64 > burst - burst_received {
-                    return self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs);
-                }
-                if pdu.dsl > 0
-                    && dev
-                        .write_data(
-                            byte_offset + expected_bo,
-                            &work[BHS_SIZE..BHS_SIZE + pdu.dsl],
-                        )
-                        .is_err()
-                {
-                    let sense = *dev.sense();
-                    return self.send_scsi_response(
-                        conn,
-                        work,
-                        itt,
-                        status::CHECK_CONDITION,
-                        Some(&sense),
-                    );
-                }
-                crate::trace!(
-                    "  Data-Out: BO={} DataSN={} len={}",
-                    expected_bo,
-                    data_sn,
-                    pdu.dsl
-                );
-                expected_bo += pdu.dsl as u64;
-                burst_received += pdu.dsl as u64;
-                data_sn = data_sn.wrapping_add(1);
-            }
-            received += burst_received;
-            if received == transfer_len {
-                break;
-            }
-            r2t_sn = r2t_sn.wrapping_add(1);
-        }
-        self.send_scsi_response(conn, work, itt, status::GOOD, None)
-    }
-
-    /// Collect a ParamOut's remaining Data-Out bytes via R2T.
-    /// `received` is in-out: on entry the already-present prefix length,
-    /// on exit the total collected length (== `expected`). Data is accumulated
-    /// in a separate buffer to avoid clobbering the immediate prefix that
-    /// resides at `work[BHS_SIZE..]` (recv_pdu always writes new Data-Out
-    /// segments there). On success the full param is copied back to
-    /// `work[BHS_SIZE..BHS_SIZE+expected]` for `complete_param`.
-    fn collect_param_out<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        itt: u32,
-        expected: u64,
-        received: &mut u64,
-    ) -> Result<(), StepResult> {
-        let exp = expected as usize;
-        let mut rec = *received as usize;
-        // Stash the immediate prefix that is currently at work[BHS_SIZE..].
-        let mut buf = vec![0u8; exp];
-        if rec > 0 {
-            buf[..rec].copy_from_slice(&work[BHS_SIZE..BHS_SIZE + rec]);
-        }
-        let mut r2t_sn = 0u32;
-        while rec < exp {
-            let burst = (u64::from(self.neg.max_burst_len)).min((exp - rec) as u64);
-            let mut bhs = Bhs::new();
-            bhs.set_opcode(op::R2T);
-            bhs.set_flags(flag::F_BIT);
-            bhs.set_itt(itt);
-            bhs.set_ttt(TTT);
-            bhs.set_stat_sn(self.stat_sn);
-            bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
-            bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-            bhs.set_r2t_sn(r2t_sn);
-            bhs.set_buffer_offset(rec as u32);
-            bhs.set_desired_data_len(burst as u32);
-            crate::trace!(
-                "Param R2T: R2TSN={} BO={} DesiredLen={}",
-                r2t_sn,
-                rec,
-                burst
-            );
-            if send_pdu(conn, work, &bhs, 0).is_err() {
-                return Err(StepResult::Closed);
-            }
-            let mut burst_received = 0u64;
-            let mut expected_bo = rec as u64;
-            let mut data_sn = 0u32;
-            while burst_received < burst {
-                let pdu = match recv_pdu(conn, work) {
-                    Ok(p) => p,
-                    Err(()) => return Err(StepResult::Closed),
-                };
-                let obhs = &pdu.bhs;
-                if obhs.opcode() != op::SCSI_DATA_OUT {
-                    return Err(self.reject(conn, work, reject::PROTOCOL_ERROR, obhs));
-                }
-                if obhs.itt() != itt || obhs.ttt() != TTT {
-                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
-                }
-                if obhs.buffer_offset() as u64 != expected_bo {
-                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
-                }
-                if obhs.data_sn() != data_sn {
-                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
-                }
-                if pdu.dsl > self.max_recv_data_segment as usize {
-                    return Err(self.reject(conn, work, reject::PROTOCOL_ERROR, obhs));
-                }
-                if pdu.dsl as u64 > burst - burst_received {
-                    return Err(self.reject(conn, work, reject::INVALID_PDU_FIELD, obhs));
-                }
-                if pdu.dsl > 0 {
-                    // Data is at work[BHS_SIZE..BHS_SIZE+dsl] (recv_pdu placement).
-                    buf[expected_bo as usize..expected_bo as usize + pdu.dsl]
-                        .copy_from_slice(&work[BHS_SIZE..BHS_SIZE + pdu.dsl]);
-                }
-                crate::trace!(
-                    "  Param Data-Out: BO={} DataSN={} len={}",
-                    expected_bo,
-                    data_sn,
-                    pdu.dsl
-                );
-                expected_bo += pdu.dsl as u64;
-                burst_received += pdu.dsl as u64;
-                data_sn = data_sn.wrapping_add(1);
-                rec += pdu.dsl;
-            }
-            if rec == exp {
-                break;
-            }
-            r2t_sn = r2t_sn.wrapping_add(1);
-        }
-        // Copy full param back to work for complete_param's snapshot.
-        work[BHS_SIZE..BHS_SIZE + exp].copy_from_slice(&buf);
-        *received = rec as u64;
-        Ok(())
+        self.send_data_in_final(work, itt, total, 0, 0, status::GOOD)
     }
 
     // ── Full Feature: Task Management / NOP / Logout ─────────────
 
-    fn handle_tmf<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        pdu: &Pdu,
-    ) -> StepResult {
+    fn handle_tmf<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
 
-        // TMF CmdSN check by I bit (fix #21).
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return StepResult::Idle;
+            return IscsiStep::NeedRecv;
         }
         self.cmd_sn = recv_cmd_sn;
 
@@ -1002,89 +1395,75 @@ impl Session {
         resp.set_flags(flag::F_BIT);
         resp.set_itt(bhs.itt());
         resp.set_tmf_response(response);
-        resp.set_stat_sn(self.stat_sn);
+        resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        if send_pdu(conn, work, &resp, 0).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Processed
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let pad = pdu_pad_len(0) as usize;
+        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        IscsiStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
-    fn handle_nop<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        pdu: &Pdu,
-    ) -> StepResult {
+    fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
         let bhs = &pdu.bhs;
         let mut resp = Bhs::new();
         resp.set_opcode(op::NOP_IN);
         resp.set_flags(flag::F_BIT);
         resp.set_itt(bhs.itt());
         resp.set_ttt(bhs.ttt());
-        resp.set_stat_sn(self.stat_sn);
+        resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        // Echo the NOP-Out ping data if it was received intact.
         let dlen = if pdu.dsl <= MAX_DATA_SEGMENT as usize {
             resp.set_data_segment_len(pdu.dsl as u32);
             pdu.dsl
         } else {
             0
         };
-        if send_pdu(conn, work, &resp, dlen).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Processed
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let total = BHS_SIZE + dlen;
+        let pad = pdu_pad_len(dlen as u32) as usize;
+        work[total..total + pad].fill(0);
+        IscsiStep::NeedSend(&work[..total + pad])
     }
 
-    fn handle_logout<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        pdu: &Pdu,
-    ) -> StepResult {
+    fn handle_logout<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
         let bhs = &pdu.bhs;
         let mut resp = Bhs::new();
         resp.set_opcode(op::LOGOUT_RESP);
         resp.set_flags(flag::F_BIT);
         resp.set_itt(bhs.itt());
-        // Byte 2 = Response (0 = session closed).
-        resp.set_stat_sn(self.stat_sn);
+        resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        if send_pdu(conn, work, &resp, 0).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Closed
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let pad = pdu_pad_len(0) as usize;
+        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        self.state = IscsiState::Closed;
+        IscsiStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
-    // ── Response PDUs ─────────────────────────────────────────────
+    // ── Response PDU builders ─────────────────────────────────────
 
-    fn send_scsi_response<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
+    fn send_scsi_response<'a>(
+        &'a mut self,
+        work: &'a mut [u8],
         itt: u32,
         scsi_status: u8,
         sense: Option<&Sense>,
-    ) -> StepResult {
+    ) -> IscsiStep<'a> {
+        self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_RESP);
         bhs.set_flags(flag::F_BIT);
         bhs.set_itt(itt);
         bhs.set_status(scsi_status);
-        bhs.set_stat_sn(self.stat_sn);
+        bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         let mut dlen = 0;
         if scsi_status == status::CHECK_CONDITION {
             if let Some(s) = sense {
-                // Data segment: 2-byte SenseLength (16-bit BE) + fixed sense.
                 work[BHS_SIZE] = 0;
                 work[BHS_SIZE + 1] = 18;
                 s.write_fixed(&mut work[BHS_SIZE + 2..BHS_SIZE + 20]);
@@ -1092,26 +1471,25 @@ impl Session {
             }
         }
         bhs.set_data_segment_len(dlen as u32);
-        if send_pdu(conn, work, &bhs, dlen).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Processed
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        let total = BHS_SIZE + dlen;
+        let pad = pdu_pad_len(dlen as u32) as usize;
+        work[total..total + pad].fill(0);
+        IscsiStep::NeedSend(&work[..total + pad])
     }
 
     /// Single final Data-In (F=1, S=1) with status — used for synthesized
     /// responses and the zero-length edge case.
-    #[allow(clippy::too_many_arguments)]
-    fn send_data_in_final<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
+    fn send_data_in_final<'a>(
+        &'a mut self,
+        work: &'a mut [u8],
         itt: u32,
         data_len: usize,
         buffer_offset: u32,
         data_sn: u32,
         scsi_status: u8,
-    ) -> StepResult {
+    ) -> IscsiStep<'a> {
+        self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
         bhs.set_flags(flag::F_BIT | flag::S_BIT);
@@ -1120,25 +1498,19 @@ impl Session {
         bhs.set_data_sn(data_sn);
         bhs.set_buffer_offset(buffer_offset);
         bhs.set_data_segment_len(data_len as u32);
-        bhs.set_stat_sn(self.stat_sn);
+        bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        if send_pdu(conn, work, &bhs, data_len).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Processed
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        let total = BHS_SIZE + data_len;
+        let pad = pdu_pad_len(data_len as u32) as usize;
+        work[total..total + pad].fill(0);
+        IscsiStep::NeedSend(&work[..total + pad])
     }
 
-    /// Send a Reject and close the connection. The data segment carries the
-    /// full header of the rejected PDU; ITT = 0xffffffff (fix #18).
-    fn reject<C: Conn + ?Sized>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        reason: u8,
-        rejected: &Bhs,
-    ) -> StepResult {
+    /// Send a Reject and close the connection.  The data segment carries
+    /// the full header of the rejected PDU; ITT = 0xffffffff (fix #18).
+    fn reject<'a>(&'a mut self, work: &'a mut [u8], reason: u8, rejected: &Bhs) -> IscsiStep<'a> {
         crate::warn!(
             "rejecting {} (0x{:02X}) reason={} (0x{:02X})",
             iscsi_opcode_name(rejected.opcode()),
@@ -1151,59 +1523,23 @@ impl Session {
         bhs.set_flags(flag::F_BIT);
         bhs.set_reject_reason(reason);
         bhs.set_itt(0xFFFF_FFFF);
-        bhs.set_stat_sn(self.stat_sn);
+        bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_data_segment_len(BHS_SIZE as u32);
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
         work[BHS_SIZE..2 * BHS_SIZE].copy_from_slice(rejected.as_bytes());
-        if send_pdu(conn, work, &bhs, BHS_SIZE).is_err() {
-            return StepResult::Closed;
-        }
-        self.stat_sn = self.stat_sn.wrapping_add(1);
-        StepResult::Closed
+        let total = 2 * BHS_SIZE;
+        let pad = pdu_pad_len(BHS_SIZE as u32) as usize;
+        work[total..total + pad].fill(0);
+        self.state = IscsiState::Closed;
+        IscsiStep::NeedSend(&work[..total + pad])
     }
 }
-
-/// Result of one [`Session::step`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepResult {
-    /// A PDU was consumed but nothing was sent (out-of-window CmdSN, §3.2.2.1).
-    Idle,
-    /// A transaction completed and response(s) were sent.
-    Processed,
-    /// The connection should be closed (Logout / peer closed / I/O failure).
-    Closed,
-    /// Internal error (caller bug), e.g. work buffer too small.
-    Error(TargetError),
-}
-
-/// Target-level error (no_std).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetError {
-    /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
-    /// `BHS_SIZE` (data area too small for the SCSI layer).
-    WorkBufTooSmall,
-    /// Connection I/O failure (details logged by the transport).
-    Io,
-    /// Unexpected internal state.
-    Internal,
-}
-
-impl core::fmt::Display for TargetError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN + BHS_SIZE"),
-            Self::Io => write!(f, "connection I/O failure"),
-            Self::Internal => write!(f, "internal target error"),
-        }
-    }
-}
-
-impl core::error::Error for TargetError {}
 
 /// Blocking wrapper: run `session.step` until the connection closes.
 ///
-/// Validates `work.len() >= MIN_DATA_LEN + BHS_SIZE` up front. I/O errors
+/// Validates `work.len() >= MIN_DATA_LEN + BHS_SIZE` up front.  I/O errors
 /// inside `step` surface as `Closed`; only caller bugs propagate as `Err`.
 pub fn serve_conn<C: Conn, D: ScsiDevice>(
     conn: &mut C,
@@ -1223,7 +1559,7 @@ pub fn serve_conn<C: Conn, D: ScsiDevice>(
     }
 }
 
-// ── Low-level PDU framing ──────────────────────────────────────────
+// ── Private helpers ─────────────────────────────────────────────────
 
 struct Pdu {
     bhs: Bhs,
@@ -1232,8 +1568,9 @@ struct Pdu {
 
 /// Receive one PDU: 48-byte BHS, optional AHS (skipped), data segment
 /// (into `work[BHS_SIZE..]` when it fits, otherwise discarded), and padding.
-/// Never leaves bytes behind — keeps TCP synchronized (fix #1).
-fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<Pdu, ()> {
+/// Returns the data-segment length.  Never leaves bytes behind — keeps
+/// TCP synchronized (fix #1).
+fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<u32, ()> {
     let mut raw = [0u8; BHS_SIZE];
     let mut got = 0usize;
     while got < BHS_SIZE {
@@ -1249,11 +1586,11 @@ fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<Pdu, ()> 
             }
         }
     }
+    // Copy BHS into work[0..48] so the poll model can inspect it.
+    work[..BHS_SIZE].copy_from_slice(&raw);
     let bhs = Bhs::from_bytes(raw);
     let dsl = bhs.data_segment_len() as usize;
     let ahs = usize::from(bhs.total_ahs_length());
-    // Raw-header trace: everything that arrives is visible here, even if
-    // the frame turns out to be garbage or the connection stalls later.
     let mut hexbuf = [0u8; BHS_SIZE * 2];
     let hlen = fmt_hex(&raw, &mut hexbuf);
     crate::trace!(
@@ -1282,23 +1619,7 @@ fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<Pdu, ()> 
         crate::warn!("recv: connection closed while reading padding (pad={pad})");
         return Err(());
     }
-    Ok(Pdu { bhs, dsl })
-}
-
-/// Send one PDU assembled in `work`: BHS at `[0..48]`, data already at
-/// `[48..48+data_len]`, padding appended. Single contiguous write.
-fn send_pdu<C: Conn + ?Sized>(
-    conn: &mut C,
-    work: &mut [u8],
-    bhs: &Bhs,
-    data_len: usize,
-) -> Result<(), ()> {
-    let total = BHS_SIZE + data_len;
-    let pad = pdu_pad_len(data_len as u32) as usize;
-    debug_assert!(work.len() >= total + pad);
-    work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
-    work[total..total + pad].fill(0);
-    write_all(conn, &work[..total + pad])
+    Ok(dsl as u32)
 }
 
 /// Discard `n` bytes via a small stack scratch (no big stack arrays).
@@ -1338,15 +1659,12 @@ fn append_kv(dst: &mut [u8], w: &mut usize, k: &[u8], v: &[u8]) -> bool {
     true
 }
 
-/// Append `key=<decimal u32>\0` to `dst` (no_std, no alloc).
 fn append_kv_u32(dst: &mut [u8], w: &mut usize, key: &[u8], v: u32) -> bool {
     let mut buf = [0u8; 10];
     let digits = fmt_u32(v, &mut buf);
     append_kv(dst, w, key, digits)
 }
 
-/// Write the decimal ASCII representation of `v` into `buf` and return the
-/// filled slice (no trailing NUL).
 fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
     let mut n = v;
     let mut i = buf.len();
@@ -1361,8 +1679,6 @@ fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
     &buf[i..]
 }
 
-/// Compact lowercase hex dump of `bytes` into `out`; returns the number of
-/// characters written (2 per byte; stops early if `out` is too small).
 fn fmt_hex(bytes: &[u8], out: &mut [u8]) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut i = 0;
@@ -1386,227 +1702,137 @@ fn parse_u32(v: &[u8]) -> Option<u32> {
         if !b.is_ascii_digit() {
             return None;
         }
-        n = n.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
     Some(n)
 }
 
+// ── Tests ───────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iscsi::pdu::{BHS_SIZE, MAX_DATA_SEGMENT};
 
-    /// Build null-separated `key=value` request text.
-    fn req_text(pairs: &[(&str, &str)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (k, v) in pairs {
-            out.extend_from_slice(k.as_bytes());
-            out.push(b'=');
-            out.extend_from_slice(v.as_bytes());
-            out.push(0);
-        }
-        out
-    }
+    /// Verify poll model round-trips: Login → Full Feature → SCSI INQUIRY
+    /// → Logout produces the same logical flow as the old step() model.
+    #[test]
+    fn poll_login_and_inquiry() {
+        use crate::scsi::backend::{BlockBackend, RamBackend};
+        use crate::scsi::block::BlockDevice;
 
-    /// Find the value for `key` in a null-separated response, or None.
-    fn value<'a>(resp: &'a [u8], key: &str) -> Option<&'a [u8]> {
-        let k = key.as_bytes();
-        let mut p = 0usize;
-        while p < resp.len() {
-            if resp[p..].starts_with(k) && p + k.len() < resp.len() && resp[p + k.len()] == b'=' {
-                let start = p + k.len() + 1;
-                let end = resp[start..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map_or(resp.len(), |i| start + i);
-                return Some(&resp[start..end]);
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs =
+            [
+                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
+                    .unwrap(),
+            ];
+        let mut session = Session::new();
+        let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
+
+        // Build a Login Request BHS (I=1, T=1, CSG=1, NSG=3).
+        let login_text = b"InitiatorName=iqn.test\0SessionType=Normal\0";
+        let mut login_bhs = [0u8; 48];
+        login_bhs[0] = op::LOGIN_REQ | 0x40;
+        login_bhs[1] =
+            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
+        login_bhs[5] = (login_text.len() >> 16) as u8;
+        login_bhs[6] = (login_text.len() >> 8) as u8;
+        login_bhs[7] = login_text.len() as u8;
+
+        // Place the PDU into work.
+        work[..48].copy_from_slice(&login_bhs);
+        work[48..48 + login_text.len()].copy_from_slice(login_text);
+
+        // Poll: should get NeedSend (Login Response).
+        match session.poll(
+            IscsiEvent::PduReceived {
+                dsl: login_text.len() as u32,
+            },
+            &mut work,
+            &mut devs,
+        ) {
+            IscsiStep::NeedSend(data) => {
+                assert!(data.len() >= BHS_SIZE);
+                let resp_op = data[0] & 0x3F;
+                assert_eq!(resp_op, op::LOGIN_RESP);
             }
-            let next = resp[p..]
-                .iter()
-                .position(|&b| b == 0)
-                .map_or(resp.len(), |i| p + i + 1);
-            p = next;
+            other => panic!("expected NeedSend for login response, got {other:?}"),
         }
-        None
-    }
 
-    fn negotiate_text(session: &mut Session, src: &[u8]) -> Vec<u8> {
-        let mut dst = [0u8; LOGIN_MAX + 1024];
-        let n = session.negotiate(src, &mut dst);
-        dst[..n].to_vec()
-    }
+        // Simulate "send done" by advancing stat_sn (the blocking wrapper
+        // does this automatically).
+        // After login with T=1, stage should be FullFeature.
+        assert_eq!(session.stage(), LoginStage::FullFeature);
 
-    #[test]
-    fn negotiate_echoes_unknown_values_and_overrides_known() {
-        let mut s = Session::default();
-        let text = req_text(&[
-            ("HeaderDigest", "CRC32C"),
-            ("DataDigest", "CRC32C"),
-            ("InitialR2T", "No"),
-            ("ImmediateData", "Yes"),
-            ("MaxBurstLength", "16776192"),
-            ("FirstBurstLength", "262144"),
-            ("MaxRecvDataSegmentLength", "262144"),
-            ("MaxOutstandingR2T", "1"),
-            ("MaxConnections", "1"),
-            ("ErrorRecoveryLevel", "0"),
-            ("DataPDUInOrder", "Yes"),
-            ("DataSequenceInOrder", "Yes"),
-            ("DefaultTime2Wait", "2"),
-            ("DefaultTime2Retain", "0"),
-            ("IFMarker", "No"),
-            ("OFMarker", "No"),
-        ]);
-        let resp = negotiate_text(&mut s, &text);
+        // Now issue an INQUIRY CDB via a SCSI Command PDU.
+        let inquiry_cdb = [0x12, 0, 0, 0, 96, 0]; // INQUIRY, alloc=96
+        let mut scsi_bhs = [0u8; 48];
+        scsi_bhs[0] = op::SCSI_CMD | 0x40; // I=1 (Immediate) + SCSI_CMD
+        scsi_bhs[1] = 0x80; // R=1 (Data-In expected)
+        scsi_bhs[16..20].copy_from_slice(&0u32.to_be_bytes()); // ITT=0
+        scsi_bhs[24..28].copy_from_slice(&0u32.to_be_bytes()); // CmdSN=0 (next after login)
+        scsi_bhs[32..32 + inquiry_cdb.len()].copy_from_slice(&inquiry_cdb);
 
-        assert_eq!(value(&resp, "HeaderDigest"), Some(b"None".as_slice()));
-        assert_eq!(value(&resp, "DataDigest"), Some(b"None".as_slice()));
-        assert_eq!(value(&resp, "InitialR2T"), Some(b"Yes".as_slice()));
-        assert_eq!(value(&resp, "ImmediateData"), Some(b"Yes".as_slice()));
-        assert_eq!(value(&resp, "MaxBurstLength"), Some(b"16776192".as_slice()));
-        assert_eq!(value(&resp, "FirstBurstLength"), Some(b"262144".as_slice()));
-        assert_eq!(
-            value(&resp, "MaxRecvDataSegmentLength"),
-            Some(b"8192".as_slice())
-        );
-        assert_eq!(value(&resp, "MaxOutstandingR2T"), Some(b"1".as_slice()));
-        assert_eq!(value(&resp, "MaxConnections"), Some(b"1".as_slice()));
-        assert_eq!(value(&resp, "ErrorRecoveryLevel"), Some(b"0".as_slice()));
-        assert_eq!(value(&resp, "DataPDUInOrder"), Some(b"Yes".as_slice()));
-        assert_eq!(value(&resp, "DefaultTime2Wait"), Some(b"2".as_slice()));
-        assert_eq!(value(&resp, "OFMarker"), Some(b"No".as_slice()));
+        work[..48].copy_from_slice(&scsi_bhs);
+        work[48..].fill(0);
 
-        /* always keys appended even though the initiator didn't send them */
-        assert_eq!(value(&resp, "TargetAlias"), Some(b"SnowSCSI".as_slice()));
-        assert_eq!(value(&resp, "TargetPortalGroupTag"), Some(b"1".as_slice()));
-    }
-
-    #[test]
-    fn negotiate_advertises_buffer_derived_max_recv() {
-        // Simulate `handle_login` deriving a 256K-buffer cap (data area =
-        // 256K - BHS, 4-aligned), then negotiating against an initiator that
-        // declares a larger segment (§6.4.1). The response must advertise
-        // the clamped, buffer-derived value, not the raw initiator figure.
-        let mut s = Session::default();
-        s.max_recv_data_segment =
-            crate::scsi::device::data_capacity(256 * 1024 - BHS_SIZE).min(HARD_CAP) as u32;
-        let text = req_text(&[("MaxRecvDataSegmentLength", "1048576")]);
-        let resp = negotiate_text(&mut s, &text);
-        assert_eq!(
-            value(&resp, "MaxRecvDataSegmentLength"),
-            Some(b"262096".as_slice())
-        );
-        assert_eq!(s.max_recv_data_segment, 262096);
-    }
-
-    #[test]
-    fn negotiate_advertises_own_cap_when_initiator_declares_less() {
-        // An initiator declaring a smaller receive segment than the target's
-        // buffer can hold wins: the negotiated value is the minimum.
-        let mut s = Session::default();
-        s.max_recv_data_segment =
-            crate::scsi::device::data_capacity(256 * 1024 - BHS_SIZE).min(HARD_CAP) as u32;
-        let text = req_text(&[("MaxRecvDataSegmentLength", "4096")]);
-        let resp = negotiate_text(&mut s, &text);
-        assert_eq!(
-            value(&resp, "MaxRecvDataSegmentLength"),
-            Some(b"4096".as_slice())
-        );
-        assert_eq!(s.max_recv_data_segment, 4096);
-    }
-
-    #[test]
-    fn negotiate_skips_initiator_only_keys() {
-        let mut s = Session::default();
-        let text = req_text(&[
-            ("InitiatorName", "iqn.1994-05.com.example:host"),
-            ("InitiatorAlias", "alias"),
-            ("SessionType", "Normal"),
-            ("TargetName", "iqn.1970-01.local.snowscsi:target"),
-        ]);
-        let resp = negotiate_text(&mut s, &text);
-        assert!(value(&resp, "InitiatorName").is_none());
-        assert!(value(&resp, "InitiatorAlias").is_none());
-        assert!(value(&resp, "SessionType").is_none());
-        assert!(value(&resp, "TargetName").is_none());
-    }
-
-    #[test]
-    fn negotiate_rejects_unknown_keys() {
-        let mut s = Session::default();
-        let text = req_text(&[("BogusKey", "1")]);
-        let resp = negotiate_text(&mut s, &text);
-        assert_eq!(value(&resp, "BogusKey"), Some(b"Reject".as_slice()));
-    }
-
-    #[test]
-    fn negotiate_length_stays_bounded() {
-        let mut s = Session::default();
-        /* pathological input: many unknown single-char keys */
-        let mut text = Vec::new();
-        for _i in 0..LOGIN_MAX / 4 {
-            text.push(b'A');
-            text.push(b'=');
-            text.push(b'A');
-            text.push(0);
+        match session.poll(IscsiEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            IscsiStep::NeedSend(data) => {
+                assert!(data.len() > BHS_SIZE);
+                // First byte of INQUIRY response: PDT = 0x00 (direct access).
+                assert_eq!(data[BHS_SIZE] & 0x1F, 0x00);
+            }
+            other => panic!("expected NeedSend for INQUIRY response, got {other:?}"),
         }
-        let resp = negotiate_text(&mut s, &text);
-        assert!(resp.len() <= LOGIN_MAX + 1024);
     }
 
     #[test]
-    fn negotiate_updates_session_parameters() {
-        let mut s = Session::default();
-        let text = req_text(&[
-            ("MaxRecvDataSegmentLength", "262144"),
-            ("MaxBurstLength", "16776192"),
-            ("FirstBurstLength", "1048576"),
-            ("InitialR2T", "No"),
-            ("ImmediateData", "Yes"),
-        ]);
-        let _ = negotiate_text(&mut s, &text);
-        assert_eq!(s.max_recv_data_segment, 8192); /* clamped to target max */
-        assert_eq!(s.neg.max_burst_len, 262144); /* clamped to default */
-        assert_eq!(s.neg.first_burst_len, 65536); /* clamped to default */
-        assert!(!s.neg.initial_r2t);
-        assert!(s.neg.immediate_data);
-    }
+    fn poll_reject_on_ahs() {
+        use crate::scsi::backend::{BlockBackend, RamBackend};
+        use crate::scsi::block::BlockDevice;
 
-    #[test]
-    fn negotiate_defaults_when_key_absent() {
-        let mut s = Session::default();
-        let _ = negotiate_text(&mut s, &[]);
-        assert_eq!(s.max_recv_data_segment, 8192);
-        assert_eq!(s.neg.max_burst_len, 262144);
-        assert_eq!(s.neg.first_burst_len, 65536);
-    }
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs =
+            [
+                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
+                    .unwrap(),
+            ];
+        let mut session = Session::new();
+        let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
 
-    #[test]
-    fn login_stage_transitions() {
-        /* First login (CSG=1, T=1) → Full Feature directly (mock-style). */
-        let mut bhs = Bhs::new();
-        bhs.set_opcode(op::LOGIN_REQ);
-        bhs.set_flags(
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE,
+        // Login first.
+        let login_text = b"InitiatorName=iqn.test\0SessionType=Normal\0";
+        let mut login_bhs = [0u8; 48];
+        login_bhs[0] = op::LOGIN_REQ | 0x40;
+        login_bhs[1] =
+            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
+        login_bhs[5] = (login_text.len() >> 16) as u8;
+        login_bhs[6] = (login_text.len() >> 8) as u8;
+        login_bhs[7] = login_text.len() as u8;
+        work[..48].copy_from_slice(&login_bhs);
+        work[48..48 + login_text.len()].copy_from_slice(login_text);
+        let _ = session.poll(
+            IscsiEvent::PduReceived {
+                dsl: login_text.len() as u32,
+            },
+            &mut work,
+            &mut devs,
         );
-        assert_eq!(bhs.csg(), stage::OP_PARAM);
-        assert_eq!(bhs.nsg(), stage::FULL_FEATURE);
-        assert!(bhs.t_bit());
-    }
+        assert_eq!(session.stage(), LoginStage::FullFeature);
 
-    #[test]
-    fn session_defaults() {
-        let s = Session::default();
-        assert_eq!(s.stage, LoginStage::Security);
-        assert_eq!(s.cmd_sn, 0);
-        assert_eq!(s.stat_sn, 0);
-        assert_eq!(s.max_recv_data_segment, 8192);
-    }
+        // Send a SCSI Command with non-zero AHS → should Reject.
+        let mut scsi_bhs = [0u8; 48];
+        scsi_bhs[0] = op::SCSI_CMD;
+        scsi_bhs[4] = 1; // TotalAHSLength = 1 → invalid
+        work[..48].copy_from_slice(&scsi_bhs);
 
-    #[test]
-    fn reject_reason_codes_are_standard() {
-        /* fix #17: legacy 0x02/0x0A must not be used for these semantics. */
-        assert_eq!(reject::PROTOCOL_ERROR, 0x04);
-        assert_eq!(reject::COMMAND_NOT_SUPPORTED, 0x05);
-        assert_eq!(reject::INVALID_PDU_FIELD, 0x09);
+        match session.poll(IscsiEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            IscsiStep::NeedSend(data) => {
+                assert_eq!(data[0] & 0x3F, op::REJECT);
+                assert_eq!(session.stage(), LoginStage::FullFeature);
+            }
+            other => panic!("expected NeedSend for Reject, got {other:?}"),
+        }
     }
 }

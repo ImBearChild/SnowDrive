@@ -14,6 +14,8 @@ use crate::cdrom::common::{
     CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::cdrom::media::CdMedia;
+#[cfg(feature = "udf_void")]
+use crate::cdrom::udfrw::UdfRwMedia;
 use crate::scsi::device::{CommandOutcome, DeviceType};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, cdb_write_args, op, Sense,
@@ -742,7 +744,11 @@ impl<'a> CdromDrive<'a> {
         // otherwise complete. This makes Windows not prompt “needs format” when
         // a valid mkudffs image is already present, and makes post-WRITE
         // verification see a change after the host creates a new filesystem.
-        let has_udf = self.media.as_mut().map(|m| m.has_udf()).unwrap_or(false);
+        let has_udf = match self.media {
+            #[cfg(feature = "udf_void")]
+            Some(CdMedia::UdfRw(ref mut m)) => UdfRwMedia::has_udf(m.backend()),
+            _ => false,
+        };
         let (disc_status, state_of_last_session, erasable) = if self.is_random_writable() {
             if has_udf {
                 (2, 3, true) // complete, erasable — has valid UDF
@@ -1879,6 +1885,80 @@ mod tests {
             cdb_rs[4] = 18;
             let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
             assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        }
+    }
+
+    /// Verify READ DISC INFORMATION (51h) reflects actual UDF state:
+    /// materialized UDF → complete, after FORMAT UNIT → empty, after
+    /// WRITE_10 recreating AVDP → complete again. This is the core
+    /// invariant that makes Windows accept the disc and not report
+    /// "format failed".
+    #[test]
+    fn disc_info_reflects_udf_state_transitions() {
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let img_len = img.len(); // capture before mutable borrow
+
+            fn disc_status(dev: &mut CdromDrive<'_>) -> u8 {
+                let mut w = [0u8; crate::MIN_DATA_LEN];
+                let mut cdb = [0u8; 10];
+                cdb[0] = op::READ_DISC_INFORMATION;
+                cdb[8] = 0xFF;
+                let mut buf = [0u8; 256];
+                let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &mut buf);
+                assert!(n >= 3, "READ DISC INFORMATION returned {n} bytes");
+                // byte 2: erasable(4) | state_of_last_session(3:2) | disc_status(1:0)
+                buf[2] & 0x03
+            }
+
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let media = UdfRwMedia::materialize(
+                BlockBackend::Ram(RamBackend::new(&mut img)),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(CdMedia::UdfRw(media));
+
+            // 1) Materialized UDF → disc_status 2 (complete)
+            assert_eq!(disc_status(&mut dev), 2, "with UDF: complete");
+
+            // 2) FORMAT UNIT clears blocks → disc_status 0 (empty)
+            let mut cdbf = [0u8; 6];
+            cdbf[0] = op::FORMAT_UNIT;
+            cdbf[1] = 0x11;
+            let mut w = work();
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[8] = 0x00;
+            w[10..12].copy_from_slice(&2048u16.to_be_bytes());
+            assert_eq!(
+                dev.do_cmd(&cdbf, &mut w, 12).unwrap(),
+                CommandOutcome::Status
+            );
+            // Consume UA from format
+            let mut cdb_rs = [0u8; 6];
+            cdb_rs[0] = op::REQUEST_SENSE;
+            cdb_rs[4] = 18;
+            let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
+            assert_eq!(disc_status(&mut dev), 0, "after FORMAT UNIT: empty");
+
+            // 3) Write AVDP at LBA 256 directly → disc_status 2 (complete)
+            let avdp = {
+                use crate::udf_void;
+                let mut sector = [0u8; 2048];
+                let layout = udf_void::compute_layout((img_len / 2048) as u32, "TEST").unwrap();
+                udf_void::gen_sector(&layout, udf_void::AVDP_LBA, &mut sector);
+                sector
+            };
+            dev.media
+                .as_mut()
+                .unwrap()
+                .write_data(256 * 2048, &avdp)
+                .unwrap();
+            assert_eq!(disc_status(&mut dev), 2, "after write AVDP: complete");
         }
     }
 }

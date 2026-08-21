@@ -370,16 +370,6 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    /// Whether the medium contains a valid UDF volume (AVDP at sector 256).
-    /// Only relevant for `UdfRw`; other variants always return `false`.
-    pub fn has_udf(&mut self) -> bool {
-        match self {
-            #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => UdfRwMedia::has_udf(m.backend()),
-            _ => false,
-        }
-    }
-
     // ── GESN ──────────────────────────────────────────────
 
     /// Media event status for GET EVENT STATUS NOTIFICATION.

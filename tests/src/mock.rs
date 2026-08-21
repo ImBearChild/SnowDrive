@@ -324,7 +324,6 @@ mod tests {
             session.step(&mut conn, &mut work, &mut devs),
             StepResult::Processed
         );
-
         let mut count = 0;
         let mut expected_bo = 0u32;
         let mut expected_dsn = 0u32;
