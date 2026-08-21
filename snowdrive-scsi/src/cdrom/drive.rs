@@ -16,12 +16,16 @@ use crate::cdrom::common::{
 use crate::cdrom::media::CdMedia;
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
-use crate::scsi::device::{CommandOutcome, DeviceType};
+use crate::scsi::device::{
+    CommandOutcome, DeviceType, PendingXfer, XferDir, XferError, XferOutcome,
+};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, cdb_write_args, op, Sense,
     SenseKey,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDevice, SpcEffect};
+
+const CLEAR_SENSE: Sense = Sense::clear();
 
 // ── CdromDrive ────────────────────────────────────────
 
@@ -30,7 +34,8 @@ use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDe
 /// The drive identity (INQUIRY, caps, drive_id) is constant; the media
 /// slot is mutable.  `SpcDevice` is implemented directly here.
 pub struct CdromDrive<'a> {
-    pub(crate) sense_state: crate::scsi::device::SenseState,
+    pub(crate) sense: Option<Sense>,
+    pub(crate) pending: Option<PendingXfer>,
     pub(crate) prevent_removal: bool,
     /// Device capability model — single source for GET CONFIG features
     /// and MODE SENSE 0x2A page.
@@ -80,7 +85,7 @@ impl<'a> CdromDrive<'a> {
     /// Load media into the drive (sets UNIT ATTENTION).
     pub fn load(&mut self, media: CdMedia<'a>) {
         self.media = Some(media);
-        self.sense_state.set_pending(Sense::new(
+        self.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -96,7 +101,7 @@ impl<'a> CdromDrive<'a> {
     pub fn eject(&mut self) {
         self.media = None;
         self.tray_open = true;
-        self.sense_state.set_pending(Sense::new(
+        self.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -113,15 +118,28 @@ impl<'a> CdromDrive<'a> {
         self.media_requested
     }
 
+    pub fn peek_sense(&self) -> Option<&Sense> {
+        self.sense.as_ref().filter(|s| s.key != SenseKey::None)
+    }
+
+    pub fn take_sense(&mut self) -> Option<Sense> {
+        let s = self.sense.take()?;
+        if s.key == SenseKey::None {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
     // ── Helper ─────────────────────────────────────────────────────
 
     fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
-        self.sense_state.set_current(Sense::new(key, asc, ascq));
+        self.sense = Some(Sense::new(key, asc, ascq));
     }
 
     fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
         self.set_sense(key, asc, 0);
-        CommandOutcome::CheckCondition(*self.sense_state.current())
+        CommandOutcome::CheckCondition
     }
 
     fn not_ready(&mut self) -> CommandOutcome<'static> {
@@ -131,8 +149,8 @@ impl<'a> CdromDrive<'a> {
             asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED
         };
         let s = Sense::new(SenseKey::NotReady, asc::MEDIUM_NOT_PRESENT, ascq);
-        self.sense_state.set_current(s);
-        CommandOutcome::CheckCondition(s)
+        self.sense = Some(s);
+        CommandOutcome::CheckCondition
     }
 
     fn lead_out_lba(&self) -> u32 {
@@ -173,6 +191,128 @@ impl<'a> CdromDrive<'a> {
         [0x00, m as u8, s as u8, f as u8]
     }
 
+    // ── xfer helpers ──────────────────────────────────────────────
+
+    pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
+            }
+        };
+        if dir != XferDir::Out {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
+        }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        let intra = transfer_offset % u64::from(block_size);
+        let actual = current_lba * u64::from(SECTOR_SIZE) + intra;
+        let res = if let Some(ref mut m) = self.media {
+            m.read_data(actual, buf)
+        } else {
+            Err(crate::scsi::backend::BlockStorageError::OutOfBounds)
+        };
+        if let Err(e) = res {
+            match e {
+                crate::scsi::backend::BlockStorageError::OutOfBounds => {
+                    self.set_sense(SenseKey::MediumError, 0x11, 0);
+                }
+                crate::scsi::backend::BlockStorageError::Io(_) => {
+                    self.set_sense(SenseKey::MediumError, 0x11, 0);
+                }
+                _ => {
+                    self.set_sense(SenseKey::MediumError, 0x11, 0);
+                }
+            }
+            return XferOutcome::Error(XferError::Storage(e));
+        }
+        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
+        if let Some(p) = self.pending.as_mut() {
+            p.current_lba = p.current_lba.saturating_add(blocks);
+        }
+        XferOutcome::Ok
+    }
+
+    pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
+            }
+        };
+        if dir != XferDir::In {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
+        }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        if !self.is_random_writable() {
+            self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+            return XferOutcome::Error(XferError::WriteProtected);
+        }
+        let intra = transfer_offset % u64::from(block_size);
+        let actual = current_lba * u64::from(SECTOR_SIZE) + intra;
+        let res = if let Some(ref mut m) = self.media {
+            m.write_data(actual, buf)
+        } else {
+            Err(crate::cdrom::media::MediaError::WriteProtected)
+        };
+        match res {
+            Ok(()) => {
+                let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
+                if let Some(p) = self.pending.as_mut() {
+                    p.current_lba = p.current_lba.saturating_add(blocks);
+                }
+                XferOutcome::Ok
+            }
+            Err(e) => match e {
+                crate::cdrom::media::MediaError::WriteProtected => {
+                    self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+                    XferOutcome::Error(XferError::WriteProtected)
+                }
+                crate::cdrom::media::MediaError::OutOfBounds => {
+                    self.set_sense(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0);
+                    XferOutcome::Error(XferError::Storage(
+                        crate::scsi::backend::BlockStorageError::OutOfBounds,
+                    ))
+                }
+                crate::cdrom::media::MediaError::IllegalField => {
+                    self.set_sense(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+                    XferOutcome::Error(XferError::Storage(
+                        crate::scsi::backend::BlockStorageError::OutOfBounds,
+                    ))
+                }
+                crate::cdrom::media::MediaError::Io => {
+                    self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+                    XferOutcome::Error(XferError::Storage(
+                        crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other),
+                    ))
+                }
+            },
+        }
+    }
+
     // ── Unified command dispatch ───────────────────────
 
     /// Process one SCSI command.  **All** MMC commands are dispatched
@@ -186,53 +326,40 @@ impl<'a> CdromDrive<'a> {
         if data.len() < crate::MIN_DATA_LEN {
             return Err(crate::scsi::device::Error::WorkBufTooSmall);
         }
+        // PendingXfer is per-command: clear at entry.
+        self.pending = None;
 
         // Generic pending sense (UA is just a sense): if a sense is
-        // pending, the next command (except INQUIRY/REPORT LUNS) gets it
-        // as CHECK, and the pending is considered delivered. REQUEST SENSE
-        // itself never consumes it via this path; it will return the stashed
-        // current sense as DataIn.
-        let spc = parse_spc(cdb);
-        if let Some(pending) = self.sense_state.pending {
-            if let Some(cmd) = spc {
-                match cmd {
-                    SpcCommand::Inquiry { .. } | SpcCommand::ReceiveDiagnosticResults { .. } => {
-                        // Bypass: don't report or clear.
-                    }
-                    SpcCommand::RequestSense { .. } => {
-                        // Let the normal REQUEST SENSE path return current.
-                        self.sense_state.current = pending;
-                        self.sense_state.pending = None;
-                    }
-                    _ => {
-                        self.sense_state.pending = None;
-                        self.sense_state.current = pending;
-                        return Ok(CommandOutcome::CheckCondition(pending));
-                    }
-                }
+        // pending, the next command (except INQUIRY/REPORT LUNS/REQUEST SENSE)
+        // gets it as CHECK. REQUEST SENSE itself is allowed to proceed and
+        // will return the sense as DataIn via execute_spc and clear it.
+        if self.peek_sense().is_some() {
+            let spc = parse_spc(cdb);
+            let bypass = if let Some(cmd) = spc {
+                matches!(
+                    cmd,
+                    SpcCommand::Inquiry { .. } | SpcCommand::RequestSense { .. }
+                )
             } else {
-                let op = cdb_opcode(cdb);
-                match op {
-                    Some(o) if o == op::REPORT_LUNS => {}
-                    Some(o) if o == op::REQUEST_SENSE => {
-                        self.sense_state.current = pending;
-                        self.sense_state.pending = None;
-                    }
-                    _ => {
-                        self.sense_state.pending = None;
-                        self.sense_state.current = pending;
-                        return Ok(CommandOutcome::CheckCondition(pending));
-                    }
-                }
+                matches!(
+                    cdb_opcode(cdb),
+                    Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::REQUEST_SENSE)
+                )
+            };
+            if !bypass {
+                return Ok(CommandOutcome::CheckCondition);
             }
         }
+
+        let spc = parse_spc(cdb);
 
         // ── Intercept TUR before execute_spc ──────────
         if let Some(SpcCommand::TestUnitReady) = spc {
             if self.media.is_some() {
-                let outcome = CommandOutcome::Status;
-                self.sense_state.current = Sense::clear();
-                return Ok(outcome);
+                // GOOD; sense already None or will be cleared by not having UA.
+                // Ensure sense is cleared for GOOD? With owning Option, GOOD leaves sense None.
+                // If there was a UA that was bypass? TUR is not bypass, so we wouldn't be here with UA.
+                return Ok(CommandOutcome::Status);
             }
             return Ok(self.not_ready());
         }
@@ -288,13 +415,20 @@ impl<'a> CdromDrive<'a> {
                         else {
                             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
                         };
-                        let received = dsl.min(data.len());
-                        if received as u64 > bytes {
+                        let transfer_len = bytes;
+                        let received = dsl.min(data.len()).min(transfer_len as usize);
+                        if received as u64 > transfer_len {
                             self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
                         } else {
+                            self.pending = Some(PendingXfer {
+                                base_lba: lba,
+                                current_lba: lba,
+                                block_size: SECTOR_SIZE,
+                                dir: XferDir::In,
+                                transfer_len,
+                            });
                             CommandOutcome::DataOut {
-                                transfer_len: bytes,
-                                byte_offset: lba * u64::from(SECTOR_SIZE),
+                                transfer_len,
                                 immediate: &data[..received],
                             }
                         }
@@ -375,7 +509,6 @@ impl<'a> CdromDrive<'a> {
                     } else {
                         CommandOutcome::DataOut {
                             transfer_len: 0,
-                            byte_offset: 0,
                             immediate: &[],
                         }
                     }
@@ -384,7 +517,6 @@ impl<'a> CdromDrive<'a> {
                 // ── SET STREAMING (0xB6) ─────────────────────────
                 op::SET_STREAMING => CommandOutcome::DataOut {
                     transfer_len: 0,
-                    byte_offset: 0,
                     immediate: &[],
                 },
 
@@ -399,7 +531,7 @@ impl<'a> CdromDrive<'a> {
                             if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
                                 match media.format_unit() {
                                     Ok(()) => {
-                                        self.sense_state.set_pending(Sense::new(
+                                        self.sense = Some(Sense::new(
                                             SenseKey::UnitAttention,
                                             asc::MEDIUM_MAY_HAVE_CHANGED,
                                             0,
@@ -426,9 +558,6 @@ impl<'a> CdromDrive<'a> {
             }
         };
 
-        if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
-            self.sense_state.current = Sense::clear();
-        }
         Ok(outcome)
     }
 
@@ -459,7 +588,6 @@ impl<'a> CdromDrive<'a> {
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[..n],
         }
     }
@@ -483,7 +611,7 @@ impl<'a> CdromDrive<'a> {
             };
         }
         // Full parameter already present (iSCSI Immediate or direct test).
-        return self.complete_mode_select(long, alloc, &data[..expected]);
+        self.complete_mode_select(long, alloc, &data[..expected])
     }
 
     fn complete_mode_select(
@@ -541,7 +669,7 @@ impl<'a> CdromDrive<'a> {
                 immediate: &data[..imm],
             };
         }
-        return self.complete_format_unit(cdb, &data[..expected]);
+        self.complete_format_unit(cdb, &data[..expected])
     }
 
     fn complete_format_unit(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome<'static> {
@@ -573,7 +701,7 @@ impl<'a> CdromDrive<'a> {
             return match media.format_unit() {
                 Ok(()) => {
                     // Signal media change so host re-reads DiscInfo/TOC/Capacity.
-                    self.sense_state.set_pending(Sense::new(
+                    self.sense = Some(Sense::new(
                         SenseKey::UnitAttention,
                         asc::MEDIUM_MAY_HAVE_CHANGED,
                         0,
@@ -606,9 +734,16 @@ impl<'a> CdromDrive<'a> {
         else {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
+        let transfer_len = bytes as u64;
+        self.pending = Some(PendingXfer {
+            base_lba: lba,
+            current_lba: lba,
+            block_size: SECTOR_SIZE,
+            dir: XferDir::Out,
+            transfer_len,
+        });
         CommandOutcome::DataIn {
-            transfer_len: bytes as u64,
-            byte_offset: lba * u64::from(SECTOR_SIZE),
+            transfer_len,
             immediate: &[],
         }
     }
@@ -632,7 +767,6 @@ impl<'a> CdromDrive<'a> {
         data[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         CommandOutcome::DataIn {
             transfer_len: 8,
-            byte_offset: 0,
             immediate: &data[0..8],
         }
     }
@@ -657,7 +791,6 @@ impl<'a> CdromDrive<'a> {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -715,7 +848,6 @@ impl<'a> CdromDrive<'a> {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -808,7 +940,6 @@ impl<'a> CdromDrive<'a> {
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[..n],
         }
     }
@@ -839,7 +970,6 @@ impl<'a> CdromDrive<'a> {
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
                             transfer_len: n as u64,
-                            byte_offset: 0,
                             immediate: &data[..n],
                         };
                     }
@@ -857,7 +987,6 @@ impl<'a> CdromDrive<'a> {
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
                             transfer_len: n as u64,
-                            byte_offset: 0,
                             immediate: &data[..n],
                         };
                     }
@@ -876,7 +1005,6 @@ impl<'a> CdromDrive<'a> {
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
                             transfer_len: n as u64,
-                            byte_offset: 0,
                             immediate: &data[..n],
                         };
                     }
@@ -896,7 +1024,6 @@ impl<'a> CdromDrive<'a> {
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
                             transfer_len: n as u64,
-                            byte_offset: 0,
                             immediate: &data[..n],
                         };
                     }
@@ -915,7 +1042,6 @@ impl<'a> CdromDrive<'a> {
                         data[..n].copy_from_slice(&buf[..n]);
                         return CommandOutcome::DataIn {
                             transfer_len: n as u64,
-                            byte_offset: 0,
                             immediate: &data[..n],
                         };
                     }
@@ -931,7 +1057,6 @@ impl<'a> CdromDrive<'a> {
                 data[..n].copy_from_slice(&buf[..n]);
                 CommandOutcome::DataIn {
                     transfer_len: n as u64,
-                    byte_offset: 0,
                     immediate: &data[..n],
                 }
             }
@@ -943,7 +1068,6 @@ impl<'a> CdromDrive<'a> {
                 data[..n].copy_from_slice(&buf[..n]);
                 CommandOutcome::DataIn {
                     transfer_len: n as u64,
-                    byte_offset: 0,
                     immediate: &data[..n],
                 }
             }
@@ -980,7 +1104,6 @@ impl<'a> CdromDrive<'a> {
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[..n],
         }
     }
@@ -1014,7 +1137,6 @@ impl<'a> CdromDrive<'a> {
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -1065,15 +1187,17 @@ impl SpcDevice for CdromDrive<'_> {
     }
 
     fn sense(&self) -> &Sense {
-        self.sense_state.current()
+        self.sense
+            .as_ref()
+            .filter(|s| s.key != SenseKey::None)
+            .unwrap_or(&CLEAR_SENSE)
     }
 
     fn sense_mut(&mut self) -> &mut Sense {
-        // For SpcDevice helpers that need mutable sense, expose current.
-        // This is used by spc.rs for REQUEST SENSE handling.
-        // SAFETY: We return a mutable ref to the current sense inside sense_state.
-        // The caller will overwrite it, which is correct.
-        &mut self.sense_state.current
+        if self.sense.is_none() {
+            self.sense = Some(Sense::clear());
+        }
+        self.sense.as_mut().unwrap()
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
@@ -1113,41 +1237,20 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
         self.do_cmd(cdb, data, dsl)
     }
 
-    fn read_data(
-        &mut self,
-        byte_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        if let Some(ref mut m) = self.media {
-            return m.read_data(byte_offset, buf);
-        }
-        Err(crate::scsi::backend::BlockStorageError::OutOfBounds)
+    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        self.xfer_out(transfer_offset, buf)
     }
 
-    fn write_data(
-        &mut self,
-        byte_offset: u64,
-        buf: &[u8],
-    ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        if let Some(ref mut m) = self.media {
-            return m.write_data(byte_offset, buf).map_err(|e| match e {
-                crate::cdrom::media::MediaError::OutOfBounds => {
-                    crate::scsi::backend::BlockStorageError::OutOfBounds
-                }
-                crate::cdrom::media::MediaError::WriteProtected => {
-                    crate::scsi::backend::BlockStorageError::NotWritable
-                }
-                crate::cdrom::media::MediaError::Io => {
-                    crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other)
-                }
-                _ => crate::scsi::backend::BlockStorageError::NotWritable,
-            });
-        }
-        Err(crate::scsi::backend::BlockStorageError::NotWritable)
+    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        self.xfer_in(transfer_offset, buf)
     }
 
-    fn sense(&self) -> &Sense {
-        self.sense_state.current()
+    fn peek_sense(&self) -> Option<&Sense> {
+        self.peek_sense()
+    }
+
+    fn take_sense(&mut self) -> Option<Sense> {
+        self.take_sense()
     }
 
     fn device_type(&self) -> DeviceType {
@@ -1221,7 +1324,8 @@ impl CdromDriveBuilder {
     /// Build the drive (empty tray).
     pub fn build(self) -> CdromDrive<'static> {
         CdromDrive {
-            sense_state: crate::scsi::device::SenseState::new(),
+            sense: None,
+            pending: None,
             prevent_removal: false,
             caps: self.caps,
             drive_id: self.drive_id,
@@ -1242,6 +1346,7 @@ mod tests {
     use crate::cdrom::common::CurrentProfile;
     use crate::cdrom::media::FlatMedia;
     use crate::scsi::backend::{BlockBackend, RamBackend};
+    use crate::scsi::device::{XferError, XferOutcome};
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
@@ -1262,17 +1367,44 @@ mod tests {
         }
     }
 
-    fn check_condition(outcome: CommandOutcome<'_>) -> (SenseKey, u8) {
+    fn check_condition(outcome: CommandOutcome<'_>, dev: &CdromDrive<'_>) -> (SenseKey, u8) {
         match outcome {
-            CommandOutcome::CheckCondition(s) => (s.key, s.asc),
+            CommandOutcome::CheckCondition => {
+                let s = dev.peek_sense().expect("sense should be set");
+                (s.key, s.asc)
+            }
             _ => panic!("expected CheckCondition"),
+        }
+    }
+
+    fn data_in_xfer(
+        dev: &mut CdromDrive<'_>,
+        outcome: CommandOutcome<'_>,
+        buf: &mut [u8],
+    ) -> usize {
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+            } => {
+                let n = transfer_len as usize;
+                assert!(n <= buf.len());
+                if immediate.is_empty() {
+                    // Backend read via xfer_out
+                    assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
+                } else {
+                    buf[..n].copy_from_slice(&immediate[..n]);
+                }
+                n
+            }
+            _ => panic!("expected DataIn"),
         }
     }
 
     #[test]
     fn drive_new_defaults() {
         let dev = CdromDrive::new();
-        assert_eq!(dev.sense_state.current, Sense::clear());
+        assert!(dev.peek_sense().is_none());
         assert!(!dev.prevent_removal);
         assert!(!dev.tray_open);
         assert!(!dev.media_requested);
@@ -1314,13 +1446,10 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        // Empty tray → 3Ah/01h (tray closed).
-        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(
-            dev.sense_state.current.ascq,
-            asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(s.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED);
     }
 
     #[test]
@@ -1345,8 +1474,8 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_NOT_PRESENT);
     }
 
     #[test]
@@ -1418,21 +1547,17 @@ mod tests {
         w[8] = 0x00; // full format
         w[10..12].copy_from_slice(&2048u16.to_be_bytes());
         let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-        assert!(matches!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense {
-                key: SenseKey::DataProtect,
-                asc: asc::WRITE_PROTECTED,
-                ..
-            })
-        ));
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.key, SenseKey::DataProtect);
+        assert_eq!(s.asc, asc::WRITE_PROTECTED);
     }
 
     #[test]
     fn drive_pending_overrides_tur() {
         let mut dev = CdromDrive::new();
         // Manually inject a pending UA.
-        dev.sense_state.pending = Some(Sense::new(
+        dev.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1441,20 +1566,19 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        match outcome {
-            CommandOutcome::CheckCondition(s) => {
-                assert_eq!(s.key, SenseKey::UnitAttention);
-                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-            }
-            _ => panic!("expected CheckCondition with UA"),
-        }
-        // UA is cleared after being reported (iSCSI delivers sense in the
-        // Response, so the host may never send REQUEST SENSE).
-        assert!(dev.sense_state.pending.is_none());
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.key, SenseKey::UnitAttention);
+        assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+        // UA stays until taken (autosense). Simulate transport taking it.
+        let taken = dev.take_sense().unwrap();
+        assert_eq!(taken.key, SenseKey::UnitAttention);
+        assert!(dev.peek_sense().is_none());
         // Next TUR should not be UA again (may be NOT READY if no media).
         let outcome2 = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         match outcome2 {
-            CommandOutcome::CheckCondition(s) => {
+            CommandOutcome::CheckCondition => {
+                let s = dev.peek_sense().unwrap();
                 assert_ne!(s.key, SenseKey::UnitAttention, "UA should not repeat");
             }
             CommandOutcome::Status => {}
@@ -1465,7 +1589,7 @@ mod tests {
     #[test]
     fn drive_request_sense_clears_pending() {
         let mut dev = CdromDrive::new();
-        dev.sense_state.pending = Some(Sense::new(
+        dev.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1475,14 +1599,14 @@ mod tests {
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
         let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        // UA should now be cleared.
-        assert!(dev.sense_state.pending.is_none());
+        // UA should now be cleared via REQUEST SENSE.
+        assert!(dev.peek_sense().is_none());
     }
 
     #[test]
     fn drive_inquiry_bypasses_ua() {
         let mut dev = CdromDrive::new();
-        dev.sense_state.pending = Some(Sense::new(
+        dev.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1494,7 +1618,7 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::DataIn { .. }));
         // UA is NOT cleared by INQUIRY.
-        assert!(dev.sense_state.pending.is_some());
+        assert!(dev.peek_sense().is_some());
     }
 
     #[test]
@@ -1505,12 +1629,10 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(
-            dev.sense_state.current.ascq,
-            asc::MEDIUM_NOT_PRESENT_TRAY_OPEN
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(s.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
     }
 
     #[test]
@@ -1522,8 +1644,10 @@ mod tests {
         // Initially empty tray → NOT READY.
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_NOT_PRESENT);
+        // Clear NOT READY sense before proceeding (simulate REQUEST SENSE or autosense)
+        dev.take_sense();
 
         // START STOP LoEj=1, Load=1 → load media on empty tray.
         use crate::scsi::spc::SpcDevice;
@@ -1544,21 +1668,19 @@ mod tests {
         // TUR → CC(UA 28h/00h).
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        match outcome {
-            CommandOutcome::CheckCondition(s) => {
-                assert_eq!(s.key, SenseKey::UnitAttention);
-                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-            }
-            _ => panic!("expected CheckCondition with UA"),
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        {
+            let s = dev.peek_sense().unwrap();
+            assert_eq!(s.key, SenseKey::UnitAttention);
+            assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
         }
-        // UA is cleared after being reported (no need to wait for REQUEST SENSE).
-        assert!(dev.sense_state.pending.is_none());
-        // REQUEST SENSE still returns the UA sense (from sense, not pending).
+        // Do not take here — let REQUEST SENSE consume UA.
+        // REQUEST SENSE still returns the UA sense.
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
         let outcome_rs = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome_rs, CommandOutcome::DataIn { .. }));
-        assert!(dev.sense_state.pending.is_none());
+        assert!(dev.peek_sense().is_none());
 
         // TUR → GOOD.
         cdb[0] = op::TEST_UNIT_READY;
@@ -1574,12 +1696,11 @@ mod tests {
         // TUR → CC(UA 28h/00h) then → NOT READY 3Ah/02h.
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        match outcome {
-            CommandOutcome::CheckCondition(s) => {
-                assert_eq!(s.key, SenseKey::UnitAttention);
-                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-            }
-            _ => panic!("expected CheckCondition with UA"),
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        {
+            let s = dev.peek_sense().unwrap();
+            assert_eq!(s.key, SenseKey::UnitAttention);
+            assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
         }
         // REQUEST SENSE → clears UA.
         cdb[0] = op::REQUEST_SENSE;
@@ -1588,18 +1709,16 @@ mod tests {
         // TUR → NOT READY 3Ah/02h (tray open).
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(
-            dev.sense_state.current.ascq,
-            asc::MEDIUM_NOT_PRESENT_TRAY_OPEN
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(s.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
     }
 
     #[test]
     fn drive_ua_overrides_read_capacity() {
         let mut dev = CdromDrive::new();
-        dev.sense_state.pending = Some(Sense::new(
+        dev.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1608,13 +1727,10 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        match outcome {
-            CommandOutcome::CheckCondition(s) => {
-                assert_eq!(s.key, SenseKey::UnitAttention);
-                assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-            }
-            _ => panic!("expected CheckCondition with UA"),
-        }
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let s = dev.peek_sense().unwrap();
+        assert_eq!(s.key, SenseKey::UnitAttention);
+        assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
     }
 
     #[test]
@@ -1652,14 +1768,9 @@ mod tests {
             w[8] = 0x01; // Spare Area Expansion — must be rejected
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-            assert!(matches!(
-                outcome,
-                CommandOutcome::CheckCondition(Sense {
-                    key: SenseKey::IllegalRequest,
-                    asc: asc::INVALID_FIELD,
-                    ..
-                })
-            ));
+            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+            assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
         }
         #[cfg(not(feature = "udf_void"))]
         {
@@ -1693,14 +1804,9 @@ mod tests {
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-            assert!(matches!(
-                outcome,
-                CommandOutcome::CheckCondition(Sense {
-                    key: SenseKey::IllegalRequest,
-                    asc: asc::INVALID_FIELD,
-                    ..
-                })
-            ));
+            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+            assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
         }
         #[cfg(not(feature = "udf_void"))]
         {
@@ -1724,12 +1830,28 @@ mod tests {
             )
             .unwrap();
             dev.load_quiet(CdMedia::UdfRw(media));
-            // Write pattern
-            dev.media
-                .as_mut()
-                .unwrap()
-                .write_data(0, &[0xA5; 2048])
-                .unwrap();
+            // Write pattern via xfer_in path
+            let mut w = work();
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::WRITE_10;
+            cdb[5] = 0;
+            cdb[8] = 1;
+            let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+            match outcome {
+                CommandOutcome::DataOut {
+                    transfer_len,
+                    immediate,
+                } => {
+                    let mut pat = [0xA5u8; 2048];
+                    // immediate is borrowed from work; copy pattern into work prefix for xfer
+                    // For this test we directly use media write via xfer_in
+                    let _ = (transfer_len, immediate);
+                    // Use xfer_in directly with pattern
+                    // Need to have pending set; we have it from WRITE_10
+                    assert_eq!(dev.xfer_in(0, &pat), XferOutcome::Ok);
+                }
+                _ => panic!("expected DataOut"),
+            }
             // Try-out format (byte1 bit1 = 0x02) should validate and return GOOD without clearing
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -1741,9 +1863,15 @@ mod tests {
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
             assert_eq!(outcome, CommandOutcome::Status);
-            // Verify data still present (not cleared)
+            // Verify data still present (not cleared) via READ + xfer_out
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::READ_10;
+            cdb[5] = 0;
+            cdb[8] = 1;
+            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
             let mut out = [0u8; 2048];
-            dev.media.as_mut().unwrap().read_data(0, &mut out).unwrap();
+            let n = data_in_xfer(&mut dev, outcome, &mut out);
+            assert_eq!(n, 2048);
             assert_eq!(out, [0xA5; 2048]);
         }
     }
@@ -1764,13 +1892,22 @@ mod tests {
             )
             .unwrap();
             dev.load_quiet(CdMedia::UdfRw(media));
-            // Write some data
-            let mut pattern = [0x5A; 2048];
-            dev.media
-                .as_mut()
-                .unwrap()
-                .write_data(2048, &pattern)
-                .unwrap();
+            // Write some data via xfer_in
+            {
+                let mut w = work();
+                let mut cdb = [0u8; 10];
+                cdb[0] = op::WRITE_10;
+                cdb[5] = 1; // lba 1
+                cdb[8] = 1;
+                let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+                match outcome {
+                    CommandOutcome::DataOut { .. } => {
+                        let pat = [0x5A; 2048];
+                        assert_eq!(dev.xfer_in(0, &pat), XferOutcome::Ok);
+                    }
+                    _ => panic!("expected DataOut"),
+                }
+            }
             // Normal format (not try-out) should clear
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -1782,20 +1919,28 @@ mod tests {
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
             assert_eq!(outcome, CommandOutcome::Status);
+            // Consume UA from format (autosense)
+            let _ = dev.take_sense();
+            // Verify cleared via READ + xfer_out
+            let mut w = work();
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::READ_10;
+            cdb[5] = 1;
+            cdb[8] = 1;
+            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
             let mut out = [0u8; 2048];
-            dev.media
-                .as_mut()
-                .unwrap()
-                .read_data(2048, &mut out)
-                .unwrap();
+            let n = data_in_xfer(&mut dev, outcome, &mut out);
+            assert_eq!(n, 2048);
             assert_eq!(out, [0u8; 2048]);
-            // UDF structures should be zeroed — check BEA sector
+            // UDF structures should be zeroed — check BEA sector via READ
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::READ_10;
+            cdb[5] = 16;
+            cdb[8] = 1;
+            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
             let mut sec = [0u8; 2048];
-            dev.media
-                .as_mut()
-                .unwrap()
-                .read_data(16 * 2048, &mut sec)
-                .unwrap();
+            let n = data_in_xfer(&mut dev, outcome, &mut sec);
+            assert_eq!(n, 2048);
             assert_eq!(sec, [0u8; 2048]);
         }
     }
@@ -1849,13 +1994,8 @@ mod tests {
                 cdb[7] = fmt;
                 cdb[8] = 0x08;
                 let outcome = dev2.do_cmd(&cdb, &mut w, 0).unwrap();
-                assert!(matches!(
-                    outcome,
-                    CommandOutcome::CheckCondition(Sense {
-                        key: SenseKey::IllegalRequest,
-                        ..
-                    })
-                ));
+                assert_eq!(outcome, CommandOutcome::CheckCondition);
+                assert_eq!(dev2.peek_sense().unwrap().key, SenseKey::IllegalRequest);
             }
         }
     }
@@ -1888,9 +2028,19 @@ mod tests {
             cdb10[8] = 0x01;
             let out = dev.do_cmd(&cdb10, &mut w, 0).unwrap();
             assert!(matches!(out, CommandOutcome::DataIn { .. }));
+            // consume READ via xfer to clear pending for next WRITE
+            if let CommandOutcome::DataIn { transfer_len, .. } = out {
+                let mut dummy = vec![0u8; transfer_len as usize];
+                let _ = dev.xfer_out(0, &mut dummy);
+            }
             cdb10[0] = op::WRITE_10;
-            let out2 = dev.do_cmd(&cdb10, &mut w, 0).unwrap();
+            let out2 = dev.do_cmd(&cdb10, &mut w, 2048).unwrap();
             assert!(matches!(out2, CommandOutcome::DataOut { .. }));
+            // Clear pending for next test by doing xfer_in with dummy
+            if let CommandOutcome::DataOut { transfer_len, .. } = out2 {
+                let dummy = vec![0u8; transfer_len as usize];
+                let _ = dev.xfer_in(0, &dummy);
+            }
             // Format then TUR should be UA 28h (media changed), then GOOD after REQUEST SENSE
             let mut cdbf = [0u8; 6];
             cdbf[0] = op::FORMAT_UNIT;
@@ -1903,14 +2053,11 @@ mod tests {
                 dev.do_cmd(&cdbf, &mut w2, 12).unwrap(),
                 CommandOutcome::Status
             );
-            assert!(matches!(
-                dev.do_cmd(&cdb, &mut w, 0).unwrap(),
-                CommandOutcome::CheckCondition(Sense {
-                    key: SenseKey::UnitAttention,
-                    asc: 0x28,
-                    ..
-                })
-            ));
+            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            let s = dev.peek_sense().unwrap();
+            assert_eq!(s.key, SenseKey::UnitAttention);
+            assert_eq!(s.asc, 0x28);
             let mut cdb_rs = [0u8; 6];
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;
@@ -1977,7 +2124,7 @@ mod tests {
             let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
             assert_eq!(disc_status(&mut dev), 0, "after FORMAT UNIT: empty");
 
-            // 3) Write AVDP at LBA 256 directly → disc_status 2 (complete)
+            // 3) Write AVDP at LBA 256 directly via xfer_in
             let avdp = {
                 use crate::udf_void;
                 let mut sector = [0u8; 2048];
@@ -1985,11 +2132,29 @@ mod tests {
                 udf_void::gen_sector(&layout, udf_void::AVDP_LBA, &mut sector);
                 sector
             };
-            dev.media
-                .as_mut()
-                .unwrap()
-                .write_data(256 * 2048, &avdp)
-                .unwrap();
+            // Use WRITE_10 to write AVDP
+            let mut w = work();
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::WRITE_10;
+            cdb[2] = 0;
+            cdb[3] = 0;
+            cdb[4] = 1;
+            cdb[5] = 0; // LBA 256 = 0x00000100
+            cdb[3] = 1; // actually 256 = 0x00000100 => bytes: cdb[2]=0, cdb[3]=0, cdb[4]=1, cdb[5]=0
+            cdb[8] = 1;
+            // Correct LBA encoding: cdb[2..6] = 0x00000100
+            cdb[2] = 0;
+            cdb[3] = 0;
+            cdb[4] = 1;
+            cdb[5] = 0;
+            w[..2048].copy_from_slice(&avdp);
+            let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+            match outcome {
+                CommandOutcome::DataOut { .. } => {
+                    assert_eq!(dev.xfer_in(0, &avdp), XferOutcome::Ok);
+                }
+                _ => panic!("expected DataOut"),
+            }
             assert_eq!(disc_status(&mut dev), 2, "after write AVDP: complete");
         }
     }

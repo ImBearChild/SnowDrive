@@ -22,6 +22,19 @@ fn block_device(ram: &mut [u8]) -> Device<'_> {
     Device::Block(BlockDevice::new(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap())
 }
 
+fn device_read(dev: &mut Device<'_>, offset: u64, buf: &mut [u8]) {
+    match dev {
+        Device::Block(b) => {
+            use embedded_io::{Read, Seek};
+            b.backend()
+                .seek(embedded_io::SeekFrom::Start(offset))
+                .unwrap();
+            b.backend().read_exact(buf).unwrap();
+        }
+        _ => panic!("device_read on non-block device"),
+    }
+}
+
 /// Build a raw 31-byte CBW from its logical fields (little endian).
 fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
     let mut raw = [0u8; CBW_LEN];
@@ -266,7 +279,7 @@ fn command_sequence_read_and_write_verify_backend() {
     let sent = io.take_sent();
     assert_eq!(sent.len(), 4096 + CSW_LEN);
     let mut check = [0u8; 4096];
-    devs[0].read_data(0, &mut check).unwrap();
+    device_read(&mut devs[0], 0, &mut check);
     assert_eq!(&sent[..4096], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 
@@ -289,7 +302,7 @@ fn command_sequence_read_and_write_verify_backend() {
     assert_eq!(sent.len(), CSW_LEN);
     assert_eq!(csw_fields(&sent), (5, 0, 0x00));
     let mut check = [0u8; 512];
-    devs[0].read_data(512, &mut check).unwrap();
+    device_read(&mut devs[0], 512, &mut check);
     assert_eq!(&check[..], payload.as_slice());
 
     // READ(10) back LBA 1 → the written payload.
@@ -661,7 +674,7 @@ fn host_probe_script_drives_serve_bot() {
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
     let mut check = [0u8; 512];
-    devs[0].read_data(5 * 512, &mut check).unwrap();
+    device_read(&mut devs[0], 5 * 512, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 }
@@ -974,7 +987,7 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
     let sent = io.take_sent();
     assert_eq!(sent.len(), 512 + CSW_LEN);
     let mut check = [0u8; 512];
-    devs[0].read_data(0, &mut check).unwrap();
+    device_read(&mut devs[0], 0, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));
     // Back in Command, ready for the next CBW.
@@ -1014,10 +1027,10 @@ fn data_out_host_overrun_is_drained() {
 
     // Only the declared 512 bytes were written; the excess was discarded.
     let mut check = [0u8; 512];
-    devs[0].read_data(0, &mut check).unwrap();
+    device_read(&mut devs[0], 0, &mut check);
     assert!(check.iter().all(|&b| b == 0x5A));
     let mut tail = [0u8; 128];
-    devs[0].read_data(512, &mut tail).unwrap();
+    device_read(&mut devs[0], 512, &mut tail);
     assert!(tail.iter().all(|&b| b == 0));
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));

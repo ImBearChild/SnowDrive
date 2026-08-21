@@ -196,13 +196,14 @@ pub fn execute_spc<'a, D: SpcDevice>(
         SpcCommand::TestUnitReady => CommandOutcome::Status,
 
         SpcCommand::RequestSense { alloc } => {
+            let s = *dev.sense();
             let mut buf = [0u8; SENSE_LEN];
-            let n = dev.sense().write_fixed(&mut buf);
+            let n = s.write_fixed(&mut buf);
             let n = n.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
+            *dev.sense_mut() = Sense::clear();
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
-                byte_offset: 0,
                 immediate: &data[0..n],
             }
         }
@@ -235,7 +236,6 @@ pub fn execute_spc<'a, D: SpcDevice>(
             data[0..n].copy_from_slice(&buf[..n]);
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
-                byte_offset: 0,
                 immediate: &data[0..n],
             }
         }
@@ -291,7 +291,6 @@ pub fn execute_spc<'a, D: SpcDevice>(
             data[0..n].fill(0);
             CommandOutcome::DataIn {
                 transfer_len: n as u64,
-                byte_offset: 0,
                 immediate: &data[0..n],
             }
         }
@@ -345,7 +344,6 @@ fn inquiry<'a, D: SpcDevice>(
         let n = data_out.len().min(alloc as usize);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     } else {
@@ -374,7 +372,6 @@ fn inquiry<'a, D: SpcDevice>(
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -389,7 +386,7 @@ fn cc<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8) -> CommandOutcome<'
 fn cc_q<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8, ascq: u8) -> CommandOutcome<'a> {
     let s = Sense::new(key, asc, ascq);
     *dev.sense_mut() = s;
-    CommandOutcome::CheckCondition(s)
+    CommandOutcome::CheckCondition
 }
 
 /// Format a u64 as 16 uppercase hex digits (VPD 0x80 serial).
@@ -487,7 +484,7 @@ mod tests {
         let mut w = work();
         match run(dev, cdb, &mut w) {
             CommandOutcome::Status => CommandOutcome::Status,
-            CommandOutcome::CheckCondition(s) => CommandOutcome::CheckCondition(s),
+            CommandOutcome::CheckCondition => CommandOutcome::CheckCondition,
             other => panic!("expected Status or CheckCondition, got {other:?}"),
         }
     }
@@ -652,14 +649,9 @@ mod tests {
         cdb[2] = 0x01;
         cdb[4] = 96;
         let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
     }
 
     #[test]
@@ -709,14 +701,9 @@ mod tests {
         cdb[2] = 0xFF;
         cdb[4] = 96;
         let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
     }
 
     #[test]
@@ -772,14 +759,9 @@ mod tests {
         cdb[2] = 0x01;
         cdb[4] = 32;
         let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
     }
 
     #[test]
@@ -811,15 +793,9 @@ mod tests {
 
         dev.start_stop_effect = SpcEffect::RemovalPrevented;
         let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::MEDIUM_REMOVAL_PREVENTED,
-                asc::MEDIUM_REMOVAL_PREVENTED_ASCQ
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::MEDIUM_REMOVAL_PREVENTED);
         assert_eq!(dev.sense.ascq, asc::MEDIUM_REMOVAL_PREVENTED_ASCQ);
     }
 
@@ -839,14 +815,9 @@ mod tests {
         cdb[0] = op::SEND_DIAGNOSTIC;
         cdb[1] = 0x0A; /* PF=1, SELFTEST=1 */
         let outcome = run_static(&mut dev, &cdb);
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
     }
 
     #[test]

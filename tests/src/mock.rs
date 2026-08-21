@@ -315,7 +315,12 @@ mod tests {
 
         // Pre-fill the device with a known pattern (LBA 0..18).
         let pattern: Vec<u8> = (0..9216u32).map(|i| (i & 0xFF) as u8).collect();
-        devs[0].write_data(0, &pattern).unwrap();
+        {
+            use embedded_io::{Seek, Write};
+            let b = devs[0].backend();
+            b.seek(embedded_io::SeekFrom::Start(0)).unwrap();
+            b.write_all(&pattern).unwrap();
+        }
 
         // READ 18 blocks (9216 bytes) — crosses 2+ Data-In PDUs.
         let cmd = read10_bhs(0, 18, 0x12345678, 0);
@@ -396,7 +401,12 @@ mod tests {
 
         // Verify backend content.
         let mut buf = [0u8; 1536];
-        devs[0].read_data(10 * 512, &mut buf).unwrap();
+        {
+            use embedded_io::{Read, Seek};
+            let b = devs[0].backend();
+            b.seek(embedded_io::SeekFrom::Start(10 * 512)).unwrap();
+            b.read_exact(&mut buf).unwrap();
+        }
         let mut expect = imm.clone();
         expect.extend_from_slice(&out);
         assert_eq!(&buf, expect.as_slice());

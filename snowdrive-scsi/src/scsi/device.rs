@@ -7,7 +7,7 @@ use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
-use crate::scsi::scsi::{asc, op, Sense, SenseKey};
+use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,30 +30,31 @@ impl DeviceType {
 ///
 /// Borrowed, zero-alloc: the device never holds a cross-command buffer.
 /// For `DataIn` / `DataOut`, `transfer_len` is the whole-transfer byte
-/// count and `byte_offset` is the backing-store byte offset
-/// (= LBA × sector_size).
+/// count. Sense is not carried in the outcome; it is held by the device
+/// and retrieved via `peek_sense` / `take_sense` (Status / REQUEST SENSE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome<'a> {
     /// No data phase, command succeeded (GOOD).
     Status,
+    /// GOOD with pending sense (deferred/recovered, to be fetched via
+    /// REQUEST SENSE). Transport leaves sense in device.
+    StatusWithSense,
     /// Device → host. `immediate` is empty for backend reads (READ*):
-    /// the target reads `transfer_len` bytes from the backend at
-    /// `byte_offset`. Non-empty `immediate` (INQUIRY, MODE SENSE, ...)
-    /// is a synthesized response already placed at `data[0..len]`.
+    /// the target fetches `transfer_len` bytes via `xfer_out`.
+    /// Non-empty `immediate` (INQUIRY, MODE SENSE, ...) is a synthesized
+    /// response already placed at `data[0..len]`.
     DataIn {
         transfer_len: u64,
-        byte_offset: u64,
         immediate: &'a [u8],
     },
-    /// Host → device: write `transfer_len` bytes starting at `byte_offset`.
-    /// `immediate` borrows the caller's data buffer (already-received data).
+    /// Host → device: write `transfer_len` bytes. `immediate` borrows the
+    /// caller's data buffer (already-received data).
     DataOut {
         transfer_len: u64,
-        byte_offset: u64,
         immediate: &'a [u8],
     },
-    /// Command failed, sense data in `Sense`.
-    CheckCondition(Sense),
+    /// Command failed, sense is held in the device (peek/take).
+    CheckCondition,
     /// Host → device: parameter list (MODE SELECT, FORMAT UNIT, …).
     /// `expected_len` is the total parameter length the device expects
     /// (from the CDB's allocation field); `immediate` is the already
@@ -84,70 +85,52 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// Generic pending-sense state for any SCSI device.
-///
-/// A sense (including a UA `06/28`) is “pending” until the next command
-/// that is not `INQUIRY`/`REPORT LUNS`. The first such command gets
-/// `CHECK` with that sense and the pending is considered delivered
-/// (whether the transport piggy-backed it in the Response or the host
-/// will fetch it with a subsequent `REQUEST SENSE`). The sense is kept
-/// as `current` so that an immediate `REQUEST SENSE` still returns it.
-#[derive(Debug, Clone, Copy)]
-pub struct SenseState {
-    pub(crate) pending: Option<Sense>,
-    pub(crate) current: Sense,
+/// Direction of a data transfer from the device's perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferDir {
+    /// Data enters the device (WRITE / host → device, `xfer_in`).
+    In,
+    /// Data leaves the device (READ / device → host, `xfer_out`).
+    Out,
 }
 
-impl Default for SenseState {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Pending data transfer context (per-device, per-command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingXfer {
+    /// Starting LBA of the transfer.
+    pub base_lba: u64,
+    /// LBA of the next block to transfer.
+    pub current_lba: u64,
+    /// Block size in bytes (from track/sector_size).
+    pub block_size: u32,
+    /// Transfer direction.
+    pub dir: XferDir,
+    /// Total transfer length in bytes.
+    pub transfer_len: u64,
 }
 
-impl SenseState {
-    pub fn new() -> Self {
-        Self {
-            pending: None,
-            current: Sense::clear(),
-        }
-    }
+/// Data-phase error (does not carry sense; sense is held in the device).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferError {
+    /// Backend storage failure.
+    Storage(BlockStorageError),
+    /// No prior `do_cmd` (target misuse).
+    NoCommand,
+    /// Direction mismatch (READ called xfer_in, etc.).
+    Direction,
+    /// `transfer_offset + buf.len() > transfer_len`.
+    Overrun,
+    /// Write to read-only medium.
+    WriteProtected,
+}
 
-    /// Queue a sense to be reported on the next non-bypass command.
-    pub fn set_pending(&mut self, s: Sense) {
-        self.pending = Some(s);
-        self.current = s;
-    }
-
-    /// If a pending sense exists and `cdb` is not a bypass command
-    /// (`INQUIRY`/`REPORT LUNS`), consume it and return it as `CHECK`.
-    /// `REQUEST SENSE` itself never consumes the pending via this path;
-    /// it is handled separately to return `current` as `DataIn`.
-    pub fn take_pending(&mut self, cdb: &[u8]) -> Option<Sense> {
-        let pending = self.pending?;
-        let op = cdb.first().copied().unwrap_or(0);
-        match op {
-            op::INQUIRY | op::REPORT_LUNS => return None,
-            op::REQUEST_SENSE => return None, // let the device return current as DataIn
-            _ => {}
-        }
-        // Also bypass via SPC parse for INQUIRY variants (e.g. EVPD)
-        // to stay compatible with the old CdromDrive gate.
-        // For now, the opcode check above is sufficient for the generic case.
-        self.pending = None;
-        Some(pending)
-    }
-
-    pub fn current(&self) -> &Sense {
-        &self.current
-    }
-
-    pub fn set_current(&mut self, s: Sense) {
-        self.current = s;
-    }
-
-    pub fn clear_current(&mut self) {
-        self.current = Sense::clear();
-    }
+/// Outcome of one `xfer_out` / `xfer_in` chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferOutcome {
+    /// Chunk transferred.
+    Ok,
+    /// Transfer failed; sense has been set in the device.
+    Error(XferError),
 }
 
 /// Data-area capacity of a transport scratch buffer, rounded down to a
@@ -178,16 +161,18 @@ pub trait ScsiDevice {
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error>;
 
-    /// Read `buf.len()` bytes from the backing store at `byte_offset`
-    /// (the READ data path — `CommandOutcome::DataIn` with empty
-    /// `immediate`).
-    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError>;
+    /// Read `buf.len()` bytes for the current READ transfer (device → host).
+    /// `transfer_offset` is the byte offset within the transfer (0 ≤ off < transfer_len).
+    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome;
 
-    /// Write `buf` to the backing store at `byte_offset`
-    /// (the WRITE data path — `CommandOutcome::DataOut`).
-    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError>;
+    /// Write `buf` for the current WRITE transfer (host → device).
+    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome;
 
-    fn sense(&self) -> &Sense;
+    /// Borrow the pending sense without consuming it (Status phase peek).
+    fn peek_sense(&self) -> Option<&Sense>;
+
+    /// Take the pending sense, clearing the device (Status autosense or REQUEST SENSE).
+    fn take_sense(&mut self) -> Option<Sense>;
 
     fn device_type(&self) -> DeviceType;
 
@@ -198,7 +183,7 @@ pub trait ScsiDevice {
     /// work buffer. Returns `Status` on success or `CheckCondition`.
     fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome<'static> {
         let _ = (cdb, data);
-        CommandOutcome::CheckCondition(Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0))
+        CommandOutcome::CheckCondition
     }
 }
 
@@ -239,33 +224,43 @@ impl ScsiDevice for Device<'_> {
         }
     }
 
-    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
         match self {
-            Self::Block(dev) => dev.read_data(byte_offset, buf),
+            Self::Block(dev) => dev.xfer_out(transfer_offset, buf),
             #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.read_data(byte_offset, buf),
+            Self::CdBlock(dev) => dev.xfer_out(transfer_offset, buf),
             #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.read_data(byte_offset, buf),
+            Self::Cdrom(dev) => dev.xfer_out(transfer_offset, buf),
         }
     }
 
-    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
         match self {
-            Self::Block(dev) => dev.write_data(byte_offset, buf),
+            Self::Block(dev) => dev.xfer_in(transfer_offset, buf),
             #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.write_data(byte_offset, buf),
+            Self::CdBlock(dev) => dev.xfer_in(transfer_offset, buf),
             #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.write_data(byte_offset, buf),
+            Self::Cdrom(dev) => dev.xfer_in(transfer_offset, buf),
         }
     }
 
-    fn sense(&self) -> &Sense {
+    fn peek_sense(&self) -> Option<&Sense> {
         match self {
-            Self::Block(dev) => dev.sense(),
+            Self::Block(dev) => dev.peek_sense(),
             #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.sense(),
+            Self::CdBlock(dev) => dev.peek_sense(),
             #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.sense(),
+            Self::Cdrom(dev) => dev.peek_sense(),
+        }
+    }
+
+    fn take_sense(&mut self) -> Option<Sense> {
+        match self {
+            Self::Block(dev) => dev.take_sense(),
+            #[cfg(feature = "std")]
+            Self::CdBlock(dev) => dev.take_sense(),
+            #[cfg(feature = "cdrom")]
+            Self::Cdrom(dev) => dev.take_sense(),
         }
     }
 
@@ -327,7 +322,25 @@ mod tests {
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x00);
         assert_eq!(dev.device_type(), DeviceType::Block);
-        assert!(dev.write_data(0, &[0u8; 4]).is_ok());
+        // xfer path: do_cmd WRITE then xfer_in
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::WRITE_10;
+        cdb[5] = 0;
+        cdb[7] = 0;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        match outcome {
+            CommandOutcome::DataOut {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 512);
+                assert_eq!(immediate.len(), 512);
+                let r = dev.xfer_in(0, immediate);
+                assert_eq!(r, XferOutcome::Ok);
+            }
+            _ => panic!("expected DataOut"),
+        }
     }
 
     #[cfg(feature = "std")]
@@ -344,10 +357,27 @@ mod tests {
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
         assert_eq!(dev.device_type(), DeviceType::Cdrom);
-        assert_eq!(
-            dev.write_data(0, &[0u8; 4]),
-            Err(BlockStorageError::NotWritable)
-        );
+        // write must fail (CheckCondition immediate for read-only)
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::WRITE_10;
+        cdb[5] = 0;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        match outcome {
+            CommandOutcome::DataOut {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 512);
+                let r = dev.xfer_in(0, immediate);
+                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
+            }
+            CommandOutcome::CheckCondition => {
+                // also acceptable: immediate DataProtect
+                assert!(dev.peek_sense().is_some());
+            }
+            _ => panic!("expected DataOut or CheckCondition"),
+        }
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -361,19 +391,50 @@ mod tests {
         let backend = BlockBackend::Ram(RamBackend::new(&mut img));
         let flat = FlatMedia::new(backend, crate::cdrom::common::CurrentProfile::CdRom);
         let mut drive = CdromDrive::new();
-        drive.load(CdMedia::Flat(flat));
+        drive.load_quiet(CdMedia::Flat(flat));
         let mut dev = Device::Cdrom(drive);
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
         assert_eq!(dev.device_type(), DeviceType::Cdrom);
-        // Data path reads through the backend.
-        let mut buf = [0u8; 4];
-        dev.read_data(0, &mut buf).unwrap();
-        assert_eq!(buf, [0xAA; 4]);
-        assert_eq!(
-            dev.write_data(0, &[0u8; 4]),
-            Err(BlockStorageError::NotWritable)
-        );
+        // Data path via xfer_out: first do_cmd READ then xfer_out
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[5] = 0;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 2048);
+                assert!(immediate.is_empty());
+                let mut buf = [0u8; 4];
+                let r = dev.xfer_out(0, &mut buf);
+                assert_eq!(r, XferOutcome::Ok);
+                assert_eq!(buf, [0xAA; 4]);
+            }
+            _ => panic!("expected DataIn"),
+        }
+        // write must fail
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::WRITE_10;
+        cdb[5] = 0;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        match outcome {
+            CommandOutcome::DataOut {
+                transfer_len: _,
+                immediate,
+            } => {
+                let r = dev.xfer_in(0, immediate);
+                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
+            }
+            CommandOutcome::CheckCondition => {
+                // also acceptable for CD-ROM non-writable
+            }
+            _ => panic!("unexpected outcome"),
+        }
     }
 
     #[cfg(all(feature = "livefs", feature = "std"))]
@@ -391,7 +452,7 @@ mod tests {
         let live = LiveData::new(fs, "TEST").unwrap();
         let flat = FlatMedia::new(live, crate::cdrom::common::CurrentProfile::CdRom);
         let mut drive = CdromDrive::new();
-        drive.load(CdMedia::Live(Box::new(flat)));
+        drive.load_quiet(CdMedia::Live(Box::new(flat)));
         let mut dev = Device::Cdrom(drive);
         let mut w = work();
         assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
@@ -412,13 +473,42 @@ mod tests {
             }
             _ => unreachable!("Cdrom variant"),
         };
-        let mut buf = [0u8; 2048];
-        dev.read_data(u64::from(first) * 2048, &mut buf).unwrap();
-        assert_eq!(&buf[..4], &[0x42; 4]);
-        assert_eq!(
-            dev.write_data(0, &[0u8; 4]),
-            Err(BlockStorageError::NotWritable)
-        );
+        // Do READ for that LBA then xfer_out
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[2] = (first >> 24) as u8;
+        cdb[3] = (first >> 16) as u8;
+        cdb[4] = (first >> 8) as u8;
+        cdb[5] = first as u8;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 2048);
+                assert!(immediate.is_empty());
+                let mut buf = [0u8; 2048];
+                let r = dev.xfer_out(0, &mut buf);
+                assert_eq!(r, XferOutcome::Ok);
+                assert_eq!(&buf[..4], &[0x42; 4]);
+            }
+            _ => panic!("expected DataIn"),
+        }
+        // write must fail
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::WRITE_10;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        match outcome {
+            CommandOutcome::DataOut { immediate, .. } => {
+                let r = dev.xfer_in(0, immediate);
+                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
+            }
+            CommandOutcome::CheckCondition => {}
+            _ => panic!("unexpected"),
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -407,50 +407,32 @@ pub const fn build_capabilities_page(caps: &CdromCapabilities, descs: &[(u16, u1
     p[0] = 0x2A;
     p[1] = (30 + 4 * n) as u8; // page length (total - 2)
                                // Byte 2: read caps (LTOH low-bit order as cdrkit/wodim expects)
-    p[2] = (bit(caps.read_cdr) << 0)
+    p[2] = bit(caps.read_cdr)
         | (bit(caps.read_cdrw) << 1)
-        | (0 << 2) // Method2 — not modelled
         | (bit(caps.read_dvd_rom) << 3)
         | (bit(caps.read_dvd_r) << 4)
         | (bit(caps.read_dvd_ram) << 5);
     // Byte 3: write caps
-    p[3] = (bit(caps.write_cdr) << 0)
+    p[3] = bit(caps.write_cdr)
         | (bit(caps.write_cdrw) << 1)
         | (bit(caps.test_write) << 2)
-        | (0 << 3)
         | (bit(caps.write_dvd_r) << 4)
         | (bit(caps.write_dvd_ram) << 5);
     // Byte 4: audio/composite/mode2/multi/BUF
-    p[4] = (0 << 0) // audio_play — not modelled
-        | (0 << 1) // composite
-        | (0 << 2) // digital_port_2
-        | (0 << 3) // digital_port_1
-        | (bit(caps.mode2_form1) << 4)
+    p[4] = (bit(caps.mode2_form1) << 4)
         | (bit(caps.mode2_form2) << 5)
         | (bit(caps.multi_session) << 6)
         | (bit(caps.burn_proof) << 7);
     // Byte 5: CD-DA / subchannel
-    p[5] = (bit(caps.cd_da) << 0)
-        | (bit(caps.cd_da) << 1) // cd_da_accurate follows cd_da
-        | (0 << 2)
-        | (0 << 3)
-        | (0 << 4)
-        | (0 << 5)
-        | (0 << 6)
-        | (0 << 7);
-    // Byte 6: lock / eject / loading
-    p[6] = (bit(caps.lock) << 0)
-        | (0 << 1) // lock_state
-        | (0 << 2) // prevent_jumper
-        | (bit(caps.eject) << 3)
-        | (0 << 4)
-        | (loading_type_bits(caps.tray) << 5);
+    p[5] = bit(caps.cd_da) | (bit(caps.cd_da) << 1); // cd_da_accurate follows cd_da
+                                                     // Byte 6: lock / eject / loading
+    p[6] = bit(caps.lock) | (bit(caps.eject) << 3) | (loading_type_bits(caps.tray) << 5);
     // Byte 7: sep / changer
     p[7] = 0;
     p[8] = (caps.max_read_speed >> 8) as u8;
     p[9] = caps.max_read_speed as u8;
     p[10] = ((caps.num_volume_levels as u16) >> 8) as u8;
-    p[11] = caps.num_volume_levels as u8;
+    p[11] = caps.num_volume_levels;
     p[12] = (caps.buffer_size >> 8) as u8;
     p[13] = caps.buffer_size as u8;
     p[14] = (caps.max_read_speed >> 8) as u8;
@@ -979,7 +961,6 @@ pub fn build_get_config_response<'a>(
     data[0..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
-        byte_offset: 0,
         immediate: &data[0..n],
     }
 }
@@ -1013,7 +994,6 @@ pub fn build_get_config_response_for_media<'a>(
     data[0..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
-        byte_offset: 0,
         immediate: &data[0..n],
     }
 }
@@ -1034,7 +1014,6 @@ pub fn build_read_buffer_capacity<'a>(
     data[..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
-        byte_offset: 0,
         immediate: &data[0..n],
     }
 }
@@ -1098,7 +1077,6 @@ pub fn build_read_disc_info<'a>(
     data[..n].copy_from_slice(&buf[..n]);
     CommandOutcome::DataIn {
         transfer_len: n as u64,
-        byte_offset: 0,
         immediate: &data[0..n],
     }
 }

@@ -21,7 +21,9 @@
 //! Linux `sr`/generic-cdrom driver needs it to mount `/dev/srX`.
 
 use crate::scsi::backend::{BlockStorage, BlockStorageError, FileBackend};
-use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
+use crate::scsi::device::{
+    CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
+};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, op, Sense, SenseKey,
 };
@@ -41,11 +43,14 @@ pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
 };
 
+const CLEAR_SENSE: Sense = Sense::clear();
+
 /// The CDBlock device: a read-only CD-ROM emulated over a flat file.
 pub struct CDBlockDevice {
     backend: FileBackend,
     sector_size: u32,
-    sense: Sense,
+    sense: Option<Sense>,
+    pending: Option<PendingXfer>,
     prevent_removal: bool,
 }
 
@@ -57,7 +62,8 @@ impl CDBlockDevice {
         Ok(Self {
             backend: FileBackend::open(path, false)?,
             sector_size: SECTOR_SIZE,
-            sense: Sense::clear(),
+            sense: None,
+            pending: None,
             prevent_removal: false,
         })
     }
@@ -66,8 +72,17 @@ impl CDBlockDevice {
         self.sector_size
     }
 
-    pub fn sense(&self) -> &Sense {
-        &self.sense
+    pub fn peek_sense(&self) -> Option<&Sense> {
+        self.sense.as_ref().filter(|s| s.key != SenseKey::None)
+    }
+
+    pub fn take_sense(&mut self) -> Option<Sense> {
+        let s = self.sense.take()?;
+        if s.key == SenseKey::None {
+            None
+        } else {
+            Some(s)
+        }
     }
 
     /// Raw backend access (target data path reads chunks via
@@ -90,37 +105,103 @@ impl CDBlockDevice {
     }
 
     pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
-        self.sense = Sense::new(key, asc, ascq);
+        self.sense = Some(Sense::new(key, asc, ascq));
     }
 
     /// CHECK CONDITION helper for non-SPC commands (SBC/MMC dispatch).
     pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
         self.set_sense(key, asc, 0);
-        CommandOutcome::CheckCondition(self.sense)
+        CommandOutcome::CheckCondition
     }
 
-    /// Read data from the backend (target data path), setting MEDIUM ERROR
-    /// sense on failure.
-    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        use embedded_io::Read;
-        use embedded_io::Seek;
+    fn check_bounds(&self, offset: u64, len: usize) -> Result<(), BlockStorageError> {
         let end = offset
-            .checked_add(buf.len() as u64)
+            .checked_add(len as u64)
             .ok_or(BlockStorageError::OutOfBounds)?;
         if end > BlockStorage::capacity(&self.backend) {
-            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
             return Err(BlockStorageError::OutOfBounds);
         }
-        if self
-            .backend
-            .seek(embedded_io::SeekFrom::Start(offset))
-            .is_err()
-            || self.backend.read_exact(buf).is_err()
+        Ok(())
+    }
+
+    /// Read `buf.len()` bytes for the current READ transfer (device → host).
+    /// `transfer_offset` is the byte offset within the transfer.
+    pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
+            }
+        };
+        if dir != XferDir::Out {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
+        }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        let intra = transfer_offset % u64::from(block_size);
+        let actual = current_lba * u64::from(block_size) + intra;
+        if self.check_bounds(actual, buf.len()).is_err() {
+            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
+        }
+        if embedded_io::Seek::seek(&mut self.backend, embedded_io::SeekFrom::Start(actual)).is_err()
         {
             self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
-            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
         }
-        Ok(())
+        if embedded_io::Read::read_exact(&mut self.backend, buf).is_err() {
+            self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
+        }
+        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
+        if let Some(p) = self.pending.as_mut() {
+            p.current_lba = p.current_lba.saturating_add(blocks);
+        }
+        XferOutcome::Ok
+    }
+
+    /// Write `buf` for the current WRITE transfer (host → device).
+    /// This device is read-only; any write is rejected with DATA PROTECT.
+    pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        let (dir, transfer_len, _block_size, _current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
+            }
+        };
+        if dir != XferDir::In {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
+        }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+        XferOutcome::Error(XferError::WriteProtected)
     }
 
     /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `data`
@@ -138,6 +219,7 @@ impl CDBlockDevice {
         data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
+        self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
@@ -186,9 +268,6 @@ impl CDBlockDevice {
                 _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND),
             }
         };
-        if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
-            self.sense = Sense::clear();
-        }
         Ok(outcome)
     }
 
@@ -211,9 +290,16 @@ impl CDBlockDevice {
         else {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
+        let transfer_len = u64::from(bytes);
+        self.pending = Some(PendingXfer {
+            base_lba: lba,
+            current_lba: lba,
+            block_size: SECTOR_SIZE,
+            dir: XferDir::Out,
+            transfer_len,
+        });
         CommandOutcome::DataIn {
-            transfer_len: bytes as u64,
-            byte_offset: lba * u64::from(SECTOR_SIZE),
+            transfer_len,
             immediate: &data[0..0],
         }
     }
@@ -242,7 +328,6 @@ impl CDBlockDevice {
         data[0..8].copy_from_slice(&buf);
         CommandOutcome::DataIn {
             transfer_len: 8,
-            byte_offset: 0,
             immediate: &data[0..8],
         }
     }
@@ -264,7 +349,6 @@ impl CDBlockDevice {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -337,7 +421,6 @@ impl CDBlockDevice {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -438,7 +521,6 @@ impl CDBlockDevice {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -474,11 +556,17 @@ impl SpcDevice for CDBlockDevice {
     }
 
     fn sense(&self) -> &Sense {
-        &self.sense
+        self.sense
+            .as_ref()
+            .filter(|s| s.key != SenseKey::None)
+            .unwrap_or(&CLEAR_SENSE)
     }
 
     fn sense_mut(&mut self) -> &mut Sense {
-        &mut self.sense
+        if self.sense.is_none() {
+            self.sense = Some(Sense::clear());
+        }
+        self.sense.as_mut().unwrap()
     }
 
     fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
@@ -501,18 +589,20 @@ impl ScsiDevice for CDBlockDevice {
         self.do_cmd(cdb, data, dsl)
     }
 
-    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        self.read_data(byte_offset, buf)
+    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        self.xfer_out(transfer_offset, buf)
     }
 
-    fn write_data(&mut self, _byte_offset: u64, _buf: &[u8]) -> Result<(), BlockStorageError> {
-        // do_cmd never yields DataOut for this read-only device (every write
-        // command returns DATA PROTECT); a direct write is still refused.
-        Err(BlockStorageError::NotWritable)
+    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        self.xfer_in(transfer_offset, buf)
     }
 
-    fn sense(&self) -> &Sense {
-        self.sense()
+    fn peek_sense(&self) -> Option<&Sense> {
+        self.peek_sense()
+    }
+
+    fn take_sense(&mut self) -> Option<Sense> {
+        self.take_sense()
     }
 
     fn device_type(&self) -> DeviceType {
@@ -528,7 +618,7 @@ impl ScsiDevice for CDBlockDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scsi::device::CommandOutcome;
+    use crate::scsi::device::{CommandOutcome, XferError, XferOutcome};
 
     /// Create a temp file of `len` bytes, returning the cleaned-up path
     /// string on drop. Each file gets a unique name (parallel tests).
@@ -628,20 +718,18 @@ mod tests {
     }
 
     /// Run one full SCSI command via `do_cmd` and fetch the payload, reading
-    /// backend-resident DataIn through `dev.read_data` when `immediate` is
-    /// empty.
+    /// backend-resident DataIn through `xfer_out` when `immediate` is empty.
     fn do_data_in(dev: &mut CDBlockDevice, cdb: &[u8], work: &mut [u8], buf: &mut [u8]) -> usize {
         let outcome = dev.do_cmd(cdb, work, 0).unwrap();
         match outcome {
             CommandOutcome::DataIn {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert!(transfer_len as usize <= buf.len());
                 let n = transfer_len as usize;
                 if immediate.is_empty() {
-                    dev.read_data(byte_offset, &mut buf[..n]).unwrap();
+                    assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
                 } else {
                     buf[..n].copy_from_slice(&immediate[..n]);
                 }
@@ -652,9 +740,12 @@ mod tests {
     }
 
     /// Check condition sense from a do_cmd dispatch.
-    fn check_condition(outcome: CommandOutcome<'_>) -> (SenseKey, u8) {
+    fn check_condition(dev: &CDBlockDevice, outcome: CommandOutcome<'_>) -> (SenseKey, u8) {
         match outcome {
-            CommandOutcome::CheckCondition(s) => (s.key, s.asc),
+            CommandOutcome::CheckCondition => {
+                let s = dev.peek_sense().expect("sense should be set");
+                (s.key, s.asc)
+            }
             _ => panic!("expected CheckCondition"),
         }
     }
@@ -668,31 +759,48 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = 0xFF;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            check_condition(&dev, outcome),
             (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
         );
         // READ DISC INFORMATION (0x51) is an MMC command this minimal
         // device does not implement → INVALID COMMAND (plan §8.1b).
         let mut cdb = [0u8; 10];
         cdb[0] = 0x51;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert_eq!(
-            check_condition(dev.do_cmd(&cdb, &mut w, 0).unwrap()),
+            check_condition(&dev, outcome),
             (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
         );
     }
 
     #[test]
     fn cdblock_read_failure_sets_medium_error() {
-        use crate::scsi::scsi::asc;
-
         let f = TempFile::new(2048 * 4);
         let mut dev = CDBlockDevice::new(f.path_str()).unwrap();
+        // xfer_out without prior do_cmd -> NoCommand -> IllegalRequest 0x24
         let mut buf = [0u8; 2048];
-        let r = dev.read_data(2048 * 5, &mut buf);
-        assert_eq!(r, Err(BlockStorageError::OutOfBounds));
-        assert_eq!(dev.sense().key, SenseKey::MediumError);
-        assert_eq!(dev.sense().asc, asc::UNRECOVERED_READ_ERROR);
+        let r = dev.xfer_out(0, &mut buf);
+        assert_eq!(r, XferOutcome::Error(XferError::NoCommand));
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, 0x24);
+        // Valid read then overrun
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[5] = 0;
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn { transfer_len, .. } => assert_eq!(transfer_len, 2048),
+            _ => panic!("expected DataIn"),
+        }
+        let mut big = [0u8; 4096];
+        let r = dev.xfer_out(0, &mut big);
+        assert_eq!(r, XferOutcome::Error(XferError::Overrun));
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, 0x21);
     }
 
     fn make_cdb_read_toc(msf: bool, format: u8, track: u8, alloc: u16) -> [u8; 10] {

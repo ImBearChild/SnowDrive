@@ -3,21 +3,26 @@
 //! Implements the direct-access block device commands (SPC-4 / SBC-3).
 //! SPC commands (INQUIRY, MODE SENSE, ...) are delegated to
 //! [`crate::scsi::spc`]; READ commands return an empty `immediate` and
-//! the target reads the backend at `byte_offset`.
+//! the target fetches the data via `xfer_out`.
 
 use crate::scsi::backend::{BlockStorage, BlockStorageError};
-use crate::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice};
+use crate::scsi::device::{
+    CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
+};
 use crate::scsi::sbc::{execute_sbc, parse_sbc, SbcCommand};
 use crate::scsi::scsi::{asc, Sense, SenseKey};
 use crate::scsi::spc::{
     block_mode_page, execute_spc, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY,
 };
 
+const CLEAR_SENSE: Sense = Sense::clear();
+
 /// Direct-access block device (device_internal.h `snowscsi_device`).
 pub struct BlockDevice<B: BlockStorage> {
     backend: B,
     sector_size: u32,
-    sense: Sense,
+    sense: Option<Sense>,
+    pending: Option<PendingXfer>,
     prevent_removal: bool,
 }
 
@@ -31,7 +36,8 @@ impl<B: BlockStorage> BlockDevice<B> {
         Some(Self {
             backend,
             sector_size,
-            sense: Sense::clear(),
+            sense: None,
+            pending: None,
             prevent_removal: false,
         })
     }
@@ -46,12 +52,21 @@ impl<B: BlockStorage> BlockDevice<B> {
         self.sector_size
     }
 
-    pub fn sense(&self) -> &Sense {
-        &self.sense
-    }
-
     pub fn device_type(&self) -> DeviceType {
         DeviceType::Block
+    }
+
+    pub fn peek_sense(&self) -> Option<&Sense> {
+        self.sense.as_ref().filter(|s| s.key != SenseKey::None)
+    }
+
+    pub fn take_sense(&mut self) -> Option<Sense> {
+        let s = self.sense.take()?;
+        if s.key == SenseKey::None {
+            None
+        } else {
+            Some(s)
+        }
     }
 
     pub(crate) fn max_lba(&self) -> u64 {
@@ -60,12 +75,12 @@ impl<B: BlockStorage> BlockDevice<B> {
     }
 
     pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
-        self.sense = Sense::new(key, asc, ascq);
+        self.sense = Some(Sense::new(key, asc, ascq));
     }
 
     pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
         self.set_sense(key, asc, 0);
-        CommandOutcome::CheckCondition(self.sense)
+        CommandOutcome::CheckCondition
     }
 
     fn check_bounds(&self, offset: u64, len: usize) -> Result<(), BlockStorageError> {
@@ -78,59 +93,105 @@ impl<B: BlockStorage> BlockDevice<B> {
         Ok(())
     }
 
-    /// Write received data to the backend, setting sense on failure
-    /// (C `snowscsi_write_data` backend flush semantics).
-    pub fn write_data(
-        &mut self,
-        offset: u64,
-        buf: &[u8],
-    ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        if let Err(e) = self.check_bounds(offset, buf.len()) {
-            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return Err(e);
-        }
-        if self
-            .backend
-            .seek(embedded_io::SeekFrom::Start(offset))
-            .is_err()
-        {
-            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
-        }
-        match self.backend.write_all(buf) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-                Err(BlockStorageError::Io(embedded_io::ErrorKind::Other))
+    /// Read `buf.len()` bytes for the current READ transfer (device → host).
+    /// `transfer_offset` is the byte offset within the transfer.
+    pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
             }
+        };
+        if dir != XferDir::Out {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
         }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        let intra = transfer_offset % u64::from(block_size);
+        let actual = current_lba * u64::from(block_size) + intra;
+        if self.check_bounds(actual, buf.len()).is_err() {
+            self.set_sense(SenseKey::MediumError, 0x11, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
+        }
+        if embedded_io::Seek::seek(&mut self.backend, embedded_io::SeekFrom::Start(actual)).is_err()
+        {
+            self.set_sense(SenseKey::MediumError, 0x11, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
+        }
+        if embedded_io::Read::read_exact(&mut self.backend, buf).is_err() {
+            self.set_sense(SenseKey::MediumError, 0x11, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
+        }
+        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
+        if let Some(p) = self.pending.as_mut() {
+            p.current_lba = p.current_lba.saturating_add(blocks);
+        }
+        XferOutcome::Ok
     }
 
-    /// Read data from the backend, setting sense on failure.
-    pub fn read_data(
-        &mut self,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        if let Err(e) = self.check_bounds(offset, buf.len()) {
-            self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return Err(e);
-        }
-        if self
-            .backend
-            .seek(embedded_io::SeekFrom::Start(offset))
-            .is_err()
-        {
-            self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return Err(BlockStorageError::Io(embedded_io::ErrorKind::Other));
-        }
-        match self.backend.read_exact(buf) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.set_sense(SenseKey::MediumError, 0x11, 0);
-                Err(BlockStorageError::Io(embedded_io::ErrorKind::Other))
+    /// Write `buf` for the current WRITE transfer (host → device).
+    pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+                return XferOutcome::Error(XferError::NoCommand);
             }
+        };
+        if dir != XferDir::In {
+            self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
+            return XferOutcome::Error(XferError::Direction);
         }
+        let end = match transfer_offset.checked_add(buf.len() as u64) {
+            Some(e) => e,
+            None => {
+                self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+                return XferOutcome::Error(XferError::Overrun);
+            }
+        };
+        if end > transfer_len {
+            self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
+            return XferOutcome::Error(XferError::Overrun);
+        }
+        let intra = transfer_offset % u64::from(block_size);
+        let actual = current_lba * u64::from(block_size) + intra;
+        if self.check_bounds(actual, buf.len()).is_err() {
+            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
+        }
+        if embedded_io::Seek::seek(&mut self.backend, embedded_io::SeekFrom::Start(actual)).is_err()
+        {
+            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
+        }
+        if embedded_io::Write::write_all(&mut self.backend, buf).is_err() {
+            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
+            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
+                embedded_io::ErrorKind::Other,
+            )));
+        }
+        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
+        if let Some(p) = self.pending.as_mut() {
+            p.current_lba = p.current_lba.saturating_add(blocks);
+        }
+        XferOutcome::Ok
     }
 
     /// Process one SCSI command (`snowscsi_do_cmd`). `data` must be at
@@ -146,6 +207,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         data: &'a mut [u8],
         dsl: usize,
     ) -> Result<CommandOutcome<'a>, Error> {
+        self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
@@ -156,9 +218,6 @@ impl<B: BlockStorage> BlockDevice<B> {
             SbcCommand::Spc(cmd) => execute_spc(self, cmd, data, dsl),
             cmd => execute_sbc(self, cmd, data, dsl),
         };
-        if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
-            self.sense = Sense::clear();
-        }
         Ok(outcome)
     }
 
@@ -180,9 +239,16 @@ impl<B: BlockStorage> BlockDevice<B> {
         let Some(bytes) = bytes else {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
+        let transfer_len = u64::from(bytes);
+        self.pending = Some(PendingXfer {
+            base_lba: lba,
+            current_lba: lba,
+            block_size: self.sector_size,
+            dir: XferDir::Out,
+            transfer_len,
+        });
         CommandOutcome::DataIn {
-            transfer_len: bytes as u64,
-            byte_offset: lba * u64::from(self.sector_size),
+            transfer_len,
             immediate: &data[0..0],
         }
     }
@@ -205,11 +271,18 @@ impl<B: BlockStorage> BlockDevice<B> {
         let Some(bytes) = self.count_to_bytes(count) else {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
-        let bytes = bytes as usize;
-        let imm = dsl.min(bytes).min(data.len());
+        let bytes_usize = bytes as usize;
+        let transfer_len = u64::from(bytes);
+        let imm = dsl.min(bytes_usize).min(data.len());
+        self.pending = Some(PendingXfer {
+            base_lba: lba,
+            current_lba: lba,
+            block_size: self.sector_size,
+            dir: XferDir::In,
+            transfer_len,
+        });
         CommandOutcome::DataOut {
-            transfer_len: bytes as u64,
-            byte_offset: lba * u64::from(self.sector_size),
+            transfer_len,
             immediate: &data[0..imm],
         }
     }
@@ -244,7 +317,6 @@ impl<B: BlockStorage> BlockDevice<B> {
         data[0..8].copy_from_slice(&buf);
         CommandOutcome::DataIn {
             transfer_len: 8,
-            byte_offset: 0,
             immediate: &data[0..8],
         }
     }
@@ -266,7 +338,6 @@ impl<B: BlockStorage> BlockDevice<B> {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::DataIn {
             transfer_len: n as u64,
-            byte_offset: 0,
             immediate: &data[0..n],
         }
     }
@@ -290,11 +361,17 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
     }
 
     fn sense(&self) -> &Sense {
-        &self.sense
+        self.sense
+            .as_ref()
+            .filter(|s| s.key != SenseKey::None)
+            .unwrap_or(&CLEAR_SENSE)
     }
 
     fn sense_mut(&mut self) -> &mut Sense {
-        &mut self.sense
+        if self.sense.is_none() {
+            self.sense = Some(Sense::clear());
+        }
+        self.sense.as_mut().unwrap()
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
@@ -320,20 +397,24 @@ impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
         self.do_cmd(cdb, data, dsl)
     }
 
-    fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        self.read_data(byte_offset, buf)
+    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+        self.xfer_out(transfer_offset, buf)
     }
 
-    fn write_data(&mut self, byte_offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
-        self.write_data(byte_offset, buf)
+    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+        self.xfer_in(transfer_offset, buf)
     }
 
-    fn sense(&self) -> &Sense {
-        self.sense()
+    fn peek_sense(&self) -> Option<&Sense> {
+        self.peek_sense()
+    }
+
+    fn take_sense(&mut self) -> Option<Sense> {
+        self.take_sense()
     }
 
     fn device_type(&self) -> DeviceType {
-        self.device_type()
+        DeviceType::Block
     }
 
     fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome<'static> {
@@ -414,7 +495,7 @@ mod tests {
         BlockDevice::new(RamBackend::new(ram), 512).unwrap()
     }
 
-    /// Extract the DataIn payload (backend read or work-resident).
+    /// Extract the DataIn payload (backend read via xfer_out or work-resident).
     /// Returns the number of bytes transferred.
     fn data_in<B: BlockStorage>(
         dev: &mut BlockDevice<B>,
@@ -424,13 +505,12 @@ mod tests {
         match outcome {
             CommandOutcome::DataIn {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert!(transfer_len as usize <= buf.len());
                 let n = transfer_len as usize;
                 if immediate.is_empty() {
-                    dev.read_data(byte_offset, &mut buf[..n]).unwrap();
+                    assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
                 } else {
                     buf[..n].copy_from_slice(&immediate[..n]);
                 }
@@ -479,13 +559,11 @@ mod tests {
         match outcome {
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert_eq!(transfer_len, 512);
-                assert_eq!(byte_offset, 10 * 512);
                 assert_eq!(immediate, pattern.as_slice());
-                dev.write_data(byte_offset, immediate).unwrap();
+                assert_eq!(dev.xfer_in(0, immediate), XferOutcome::Ok);
             }
             _ => panic!("expected DataOut"),
         }
@@ -504,16 +582,9 @@ mod tests {
         let mut w = work();
         let cdb = make_cdb10(op::READ_10, 2048, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::LBA_OUT_OF_RANGE,
-                0
-            ))
-        );
-        assert_eq!(dev.sense().key, SenseKey::IllegalRequest);
-        assert_eq!(dev.sense().asc, asc::LBA_OUT_OF_RANGE);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
     }
 
     #[test]
@@ -524,16 +595,9 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = 0xFF;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_COMMAND,
-                0
-            ))
-        );
-        assert_eq!(dev.sense().key, SenseKey::IllegalRequest);
-        assert_eq!(dev.sense().asc, asc::INVALID_COMMAND);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_COMMAND);
     }
 
     #[test]
@@ -578,14 +642,9 @@ mod tests {
         cdb[0] = op::SERVICE_ACTION_IN;
         cdb[1] = 0xFF;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
     }
 
     #[test]
@@ -613,12 +672,10 @@ mod tests {
         match outcome {
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert_eq!(transfer_len, 512);
-                assert_eq!(byte_offset, 5 * 512);
-                dev.write_data(byte_offset, immediate).unwrap();
+                assert_eq!(dev.xfer_in(0, immediate), XferOutcome::Ok);
             }
             _ => panic!("expected DataOut"),
         }
@@ -643,12 +700,10 @@ mod tests {
         match outcome {
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert_eq!(transfer_len, 1024);
-                assert_eq!(byte_offset, 20 * 512);
-                dev.write_data(byte_offset, immediate).unwrap();
+                assert_eq!(dev.xfer_in(0, immediate), XferOutcome::Ok);
             }
             _ => panic!("expected DataOut"),
         }
@@ -673,12 +728,10 @@ mod tests {
         match outcome {
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert_eq!(transfer_len, 1024);
-                assert_eq!(byte_offset, 30 * 512);
-                dev.write_data(byte_offset, immediate).unwrap();
+                assert_eq!(dev.xfer_in(0, immediate), XferOutcome::Ok);
             }
             _ => panic!("expected DataOut"),
         }
@@ -697,14 +750,9 @@ mod tests {
         let mut w = work();
         let cdb = make_cdb6(op::READ_6, 2048, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::LBA_OUT_OF_RANGE,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
     }
 
     #[test]
@@ -714,14 +762,9 @@ mod tests {
         let mut w = work();
         let cdb = make_cdb12(op::READ_12, 2048, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::LBA_OUT_OF_RANGE,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
     }
 
     #[test]
@@ -731,14 +774,9 @@ mod tests {
         let mut w = work();
         let cdb = make_cdb16(op::READ_16, 2048, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::LBA_OUT_OF_RANGE,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
     }
 
     #[test]
@@ -766,13 +804,12 @@ mod tests {
         cdb[0] = op::START_STOP_UNIT;
         cdb[4] = 0x02; /* LoEj=1, Load=0 (eject) */
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_REMOVAL_PREVENTED);
         assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::MEDIUM_REMOVAL_PREVENTED,
-                asc::MEDIUM_REMOVAL_PREVENTED_ASCQ
-            ))
+            dev.peek_sense().unwrap().ascq,
+            asc::MEDIUM_REMOVAL_PREVENTED_ASCQ
         );
 
         let mut cdb = [0u8; 6];
@@ -790,14 +827,9 @@ mod tests {
         cdb[0] = op::READ_CAPACITY_10;
         cdb[5] = 0x01; /* PMI=0, LBA=1 */
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
-        assert_eq!(
-            outcome,
-            CommandOutcome::CheckCondition(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::INVALID_FIELD,
-                0
-            ))
-        );
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
     }
 
     #[test]
@@ -832,11 +864,10 @@ mod tests {
         match outcome {
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 assert_eq!(transfer_len, 512);
-                dev.write_data(byte_offset, immediate).unwrap();
+                assert_eq!(dev.xfer_in(0, immediate), XferOutcome::Ok);
             }
             _ => panic!("expected DataOut"),
         }
@@ -866,15 +897,11 @@ mod tests {
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
         let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
         match outcome {
-            CommandOutcome::DataOut {
-                byte_offset,
-                immediate,
-                ..
-            } => {
-                let r = dev.write_data(byte_offset, immediate);
-                assert!(r.is_err(), "write to read-only backend must fail");
-                assert_eq!(dev.sense().key, SenseKey::MediumError);
-                assert_eq!(dev.sense().asc, asc::WRITE_FAULT);
+            CommandOutcome::DataOut { immediate, .. } => {
+                let r = dev.xfer_in(0, immediate);
+                assert!(matches!(r, XferOutcome::Error(_)));
+                assert_eq!(dev.peek_sense().unwrap().key, SenseKey::MediumError);
+                assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_FAULT);
             }
             _ => panic!("expected DataOut"),
         }

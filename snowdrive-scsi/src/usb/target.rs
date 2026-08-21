@@ -24,7 +24,7 @@
 
 use core::time::Duration;
 
-use crate::scsi::device::{CommandOutcome, ScsiDevice};
+use crate::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
 use crate::scsi::scsi::{asc, op as scsi_op, Sense, SenseKey};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
 use crate::usb::io::BotIo;
@@ -126,7 +126,6 @@ enum BotState {
     DataIn {
         expected: u64,
         transfer_len: u64,
-        byte_offset: u64,
         sent: u64,
         tag: u32,
         lun: usize,
@@ -136,7 +135,6 @@ enum BotState {
     DataOut {
         declared: u64,
         to_write: u64,
-        byte_offset: u64,
         received: u64,
         written: u64,
         tag: u32,
@@ -440,12 +438,14 @@ impl BotSession {
         };
         match outcome {
             CommandOutcome::Status => self.finish_cmd(cbw, 0, CswStatus::Passed, data.len()),
-            CommandOutcome::CheckCondition(_) => {
+            CommandOutcome::StatusWithSense => {
+                self.finish_cmd(cbw, 0, CswStatus::Passed, data.len())
+            }
+            CommandOutcome::CheckCondition => {
                 self.finish_cmd(cbw, 0, CswStatus::Failed, data.len())
             }
             CommandOutcome::DataIn {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 if declared == 0 {
@@ -470,17 +470,17 @@ impl BotSession {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 let chunk = (actual as usize).min(data.len());
-                if immediate_len == 0
-                    && devs[lun]
-                        .read_data(byte_offset, &mut data[..chunk])
-                        .is_err()
-                {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                if immediate_len == 0 {
+                    match devs[lun].xfer_out(0, &mut data[..chunk]) {
+                        XferOutcome::Ok => {}
+                        XferOutcome::Error(_) => {
+                            return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                        }
+                    }
                 }
                 self.state = BotState::DataIn {
                     expected: declared,
                     transfer_len: actual,
-                    byte_offset,
                     sent: chunk as u64,
                     tag: cbw.tag,
                     lun,
@@ -490,7 +490,6 @@ impl BotSession {
             }
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 if declared == 0 {
@@ -509,17 +508,17 @@ impl BotSession {
                 let mut status = CswStatus::Passed;
                 if !immediate.is_empty() {
                     let w = (immediate.len() as u64).min(to_write) as usize;
-                    if devs[lun].write_data(byte_offset, &immediate[..w]).is_err() {
-                        status = CswStatus::Failed;
-                    } else {
-                        written = w as u64;
+                    if w > 0 {
+                        match devs[lun].xfer_in(0, &immediate[..w]) {
+                            XferOutcome::Ok => written = w as u64,
+                            XferOutcome::Error(_) => status = CswStatus::Failed,
+                        }
                     }
                 }
                 let chunk = (declared as usize).min(data.len());
                 self.state = BotState::DataOut {
                     declared,
                     to_write,
-                    byte_offset,
                     received: written,
                     written,
                     tag: cbw.tag,
@@ -565,7 +564,8 @@ impl BotSession {
                         devs[lun].complete_param(&cdb_buf[..cdb_len], &data[..expected as usize]);
                     let status = match outcome2 {
                         CommandOutcome::Status => CswStatus::Passed,
-                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        CommandOutcome::StatusWithSense => CswStatus::Passed,
+                        CommandOutcome::CheckCondition => CswStatus::Failed,
                         _ => CswStatus::Failed,
                     };
                     return self.finish_cmd(cbw, 0, status, data.len());
@@ -618,7 +618,6 @@ impl BotSession {
         self.state = BotState::DataIn {
             expected: declared,
             transfer_len: actual,
-            byte_offset: 0,
             sent: chunk as u64,
             tag: cbw.tag,
             lun: usize::from(cbw.lun),
@@ -701,7 +700,6 @@ impl BotSession {
         self.state = BotState::DataOut {
             declared,
             to_write: 0,
-            byte_offset: 0,
             received: 0,
             written: 0,
             tag: cbw.tag,
@@ -727,7 +725,6 @@ impl BotSession {
         let BotState::DataIn {
             expected,
             transfer_len,
-            byte_offset,
             sent,
             tag,
             lun,
@@ -743,16 +740,12 @@ impl BotSession {
                     return self.finish_data_in(tag, expected, transfer_len, CswStatus::Passed);
                 }
                 let next = ((transfer_len - sent) as usize).min(data.len());
-                if devs[lun]
-                    .read_data(byte_offset + sent, &mut data[..next])
-                    .is_err()
-                {
+                if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
                     return self.finish_data_in(tag, expected, sent, CswStatus::Failed);
                 }
                 self.state = BotState::DataIn {
                     expected,
                     transfer_len,
-                    byte_offset,
                     sent: sent + next as u64,
                     tag,
                     lun,
@@ -779,7 +772,6 @@ impl BotSession {
         let BotState::DataOut {
             declared,
             to_write,
-            byte_offset,
             received,
             written,
             tag,
@@ -797,13 +789,9 @@ impl BotSession {
                 if status == CswStatus::Passed && written < to_write {
                     let w = (recv.len() as u64).min(to_write - written) as usize;
                     if w > 0 {
-                        if devs[lun]
-                            .write_data(byte_offset + written, &recv[..w])
-                            .is_ok()
-                        {
-                            written += w as u64;
-                        } else {
-                            status = CswStatus::Failed;
+                        match devs[lun].xfer_in(written, &recv[..w]) {
+                            XferOutcome::Ok => written += w as u64,
+                            XferOutcome::Error(_) => status = CswStatus::Failed,
                         }
                     }
                 }
@@ -831,7 +819,6 @@ impl BotSession {
                 self.state = BotState::DataOut {
                     declared,
                     to_write,
-                    byte_offset,
                     received,
                     written,
                     tag,
@@ -890,7 +877,8 @@ impl BotSession {
                         .complete_param(&cdb[..cdb_len], &data[..expected as usize])
                     {
                         CommandOutcome::Status => CswStatus::Passed,
-                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        CommandOutcome::StatusWithSense => CswStatus::Passed,
+                        CommandOutcome::CheckCondition => CswStatus::Failed,
                         _ => CswStatus::Failed,
                     };
                     // Extra bytes beyond declared are already in recv[fit..]; treat as overrun.
@@ -916,7 +904,8 @@ impl BotSession {
                     let outcome = devs[lun].complete_param(cdb_slice, &data[..expected as usize]);
                     let status = match outcome {
                         CommandOutcome::Status => CswStatus::Passed,
-                        CommandOutcome::CheckCondition(_) => CswStatus::Failed,
+                        CommandOutcome::StatusWithSense => CswStatus::Passed,
+                        CommandOutcome::CheckCondition => CswStatus::Failed,
                         _ => CswStatus::Failed,
                     };
                     if received > expected {
@@ -1091,6 +1080,32 @@ mod tests {
         cdb[0] = scsi_op::INQUIRY;
         cdb[4] = alloc;
         cdb
+    }
+
+    fn read_via_xfer(dev: &mut BlockDevice<BlockBackend<'_>>, lba: u64, buf: &mut [u8]) {
+        let mut work = [0u8; crate::MIN_DATA_LEN];
+        let blocks = ((buf.len() as u64 + 511) / 512) as u32;
+        let nblocks = blocks.max(1) as u16; // at least 1 for small reads like 64B tail
+        let mut cdb = [0u8; 10];
+        cdb[0] = scsi_op::READ_10;
+        cdb[2] = ((lba >> 24) & 0xFF) as u8;
+        cdb[3] = ((lba >> 16) & 0xFF) as u8;
+        cdb[4] = ((lba >> 8) & 0xFF) as u8;
+        cdb[5] = (lba & 0xFF) as u8;
+        cdb[7] = ((nblocks >> 8) & 0xFF) as u8;
+        cdb[8] = (nblocks & 0xFF) as u8;
+        let outcome = dev.do_cmd(&cdb, &mut work, 0).expect("READ setup");
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+            } => {
+                assert!(immediate.is_empty());
+                assert!(transfer_len >= buf.len() as u64);
+                assert_eq!(dev.xfer_out(0, buf), XferOutcome::Ok);
+            }
+            _ => panic!("expected DataIn"),
+        }
     }
 
     #[test]
@@ -1270,7 +1285,7 @@ mod tests {
             }
         );
         let mut check = [0u8; 512];
-        devs[0].read_data(0, &mut check).unwrap();
+        read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
 
         // No more data → OutIdle ends the drain → CSW.
@@ -1327,10 +1342,10 @@ mod tests {
         }
         // The excess was discarded, not written to the backend.
         let mut check = [0u8; 512];
-        devs[0].read_data(0, &mut check).unwrap();
+        read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
         let mut tail = [0u8; 64];
-        devs[0].read_data(512, &mut tail).unwrap();
+        read_via_xfer(&mut devs[0], 1, &mut tail);
         assert!(tail.iter().all(|&b| b == 0));
 
         let (_, residue, status) = read_csw(&mut s, &mut data);
@@ -1488,7 +1503,7 @@ mod tests {
         assert_eq!(status, 0x01); // Failed
                                   // The backend was not written.
         let mut check = [0u8; 512];
-        devs[0].read_data(0, &mut check).unwrap();
+        read_via_xfer(&mut devs[0], 0, &mut check);
         assert!(check.iter().all(|&b| b == 0));
     }
 
@@ -1832,7 +1847,7 @@ mod tests {
         let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
         assert_eq!(r, BotStepResult::Processed);
         let mut check = [0u8; 512];
-        devs[0].read_data(0, &mut check).unwrap();
+        read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
     }
 }

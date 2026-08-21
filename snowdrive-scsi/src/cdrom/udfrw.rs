@@ -232,6 +232,7 @@ fn write_sector<B: BlockStorage>(
         .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))
 }
 
+#[allow(dead_code)]
 fn write_at<B: BlockStorage>(
     backend: &mut B,
     lba: u32,
@@ -246,6 +247,7 @@ fn write_at<B: BlockStorage>(
         .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
 }
 
+#[allow(dead_code)]
 fn write_sector_io<B: BlockStorage>(
     backend: &mut B,
     layout: &Layout,

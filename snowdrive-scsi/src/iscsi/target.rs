@@ -20,7 +20,7 @@ use crate::iscsi::pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
     BHS_SIZE, MAX_DATA_SEGMENT,
 };
-use crate::scsi::device::{CommandOutcome, ScsiDevice};
+use crate::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
 use crate::scsi::scsi::op as scsi_op;
 use crate::scsi::scsi::{asc, opcode_from_cdb, opcode_name, Sense, SenseKey};
 
@@ -279,7 +279,6 @@ enum IscsiState {
     /// Data-In phase: sending data to the initiator.
     DataIn {
         transfer_len: u64,
-        byte_offset: u64,
         sent: u64,
         itt: u32,
         chunk: usize,
@@ -289,7 +288,6 @@ enum IscsiState {
     R2tSend {
         itt: u32,
         transfer_len: u64,
-        byte_offset: u64,
         received: u64,
         r2t_sn: u32,
         data_sn: u32,
@@ -298,7 +296,6 @@ enum IscsiState {
     R2tCollect {
         itt: u32,
         transfer_len: u64,
-        byte_offset: u64,
         received: u64,
         r2t_sn: u32,
         data_sn: u32,
@@ -427,7 +424,6 @@ impl Session {
                     let st = self.state;
                     let IscsiState::DataIn {
                         transfer_len,
-                        byte_offset,
                         sent,
                         itt,
                         chunk,
@@ -443,26 +439,23 @@ impl Session {
                         let len = (remaining as usize).min(chunk);
                         if lun < devs.len() {
                             let dev = &mut devs[lun];
-                            if dev
-                                .read_data(
-                                    byte_offset + offset,
-                                    &mut work[BHS_SIZE..BHS_SIZE + len],
-                                )
-                                .is_err()
-                            {
-                                let sense = *dev.sense();
-                                let r = self.send_scsi_response(
-                                    work,
-                                    itt,
-                                    status::CHECK_CONDITION,
-                                    Some(&sense),
-                                );
-                                if let IscsiStep::NeedSend(data) = r {
-                                    let l = data.len();
-                                    let _ = r;
-                                    let _ = write_all(conn, &work[..l]);
+                            match dev.xfer_out(offset, &mut work[BHS_SIZE..BHS_SIZE + len]) {
+                                XferOutcome::Ok => {}
+                                XferOutcome::Error(_) => {
+                                    let sense = dev.take_sense();
+                                    let r = self.send_scsi_response(
+                                        work,
+                                        itt,
+                                        status::CHECK_CONDITION,
+                                        sense.as_ref(),
+                                    );
+                                    if let IscsiStep::NeedSend(data) = r {
+                                        let l = data.len();
+                                        let _ = r;
+                                        let _ = write_all(conn, &work[..l]);
+                                    }
+                                    return StepResult::Closed;
                                 }
-                                return StepResult::Closed;
                             }
                         }
                         let is_last = offset + len as u64 == transfer_len;
@@ -600,7 +593,6 @@ impl Session {
         let st = self.state;
         let IscsiState::DataIn {
             transfer_len,
-            byte_offset,
             sent,
             itt,
             chunk,
@@ -619,17 +611,21 @@ impl Session {
         let next = ((transfer_len - sent) as usize).min(chunk);
         if lun < devs.len() {
             let dev = &mut devs[lun];
-            if dev
-                .read_data(byte_offset + sent, &mut work[BHS_SIZE..BHS_SIZE + next])
-                .is_err()
-            {
-                let sense = *dev.sense();
-                return self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense));
+            match dev.xfer_out(sent, &mut work[BHS_SIZE..BHS_SIZE + next]) {
+                XferOutcome::Ok => {}
+                XferOutcome::Error(_) => {
+                    let sense = dev.take_sense();
+                    return self.send_scsi_response(
+                        work,
+                        itt,
+                        status::CHECK_CONDITION,
+                        sense.as_ref(),
+                    );
+                }
             }
         }
         self.state = IscsiState::DataIn {
             transfer_len,
-            byte_offset,
             sent: sent + next as u64,
             itt,
             chunk: next,
@@ -643,7 +639,6 @@ impl Session {
         let IscsiState::R2tSend {
             itt,
             transfer_len,
-            byte_offset,
             received,
             r2t_sn,
             data_sn,
@@ -672,7 +667,6 @@ impl Session {
         self.state = IscsiState::R2tCollect {
             itt,
             transfer_len,
-            byte_offset,
             received,
             r2t_sn,
             data_sn,
@@ -692,7 +686,6 @@ impl Session {
         let IscsiState::R2tCollect {
             itt,
             transfer_len,
-            byte_offset,
             mut received,
             r2t_sn,
             mut data_sn,
@@ -728,20 +721,17 @@ impl Session {
 
         if pdu_dsl > 0 {
             if let Some(dev) = devs.first_mut() {
-                if dev
-                    .write_data(
-                        byte_offset + expected_bo as u64,
-                        &work[BHS_SIZE..BHS_SIZE + pdu_dsl],
-                    )
-                    .is_err()
-                {
-                    let sense = *dev.sense();
-                    return self.send_scsi_response(
-                        work,
-                        itt,
-                        status::CHECK_CONDITION,
-                        Some(&sense),
-                    );
+                match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
+                    XferOutcome::Ok => {}
+                    XferOutcome::Error(_) => {
+                        let sense = dev.take_sense();
+                        return self.send_scsi_response(
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            sense.as_ref(),
+                        );
+                    }
                 }
             }
         }
@@ -767,7 +757,6 @@ impl Session {
             self.state = IscsiState::R2tSend {
                 itt,
                 transfer_len,
-                byte_offset,
                 received,
                 r2t_sn: r2t_sn + 1,
                 data_sn: 0,
@@ -779,7 +768,6 @@ impl Session {
         self.state = IscsiState::R2tCollect {
             itt,
             transfer_len,
-            byte_offset,
             received,
             r2t_sn,
             data_sn,
@@ -854,8 +842,12 @@ impl Session {
             let outcome = devs[0].complete_param(cdb_slice, param_data);
             return match outcome {
                 CommandOutcome::Status => self.send_scsi_response(work, itt, status::GOOD, None),
-                CommandOutcome::CheckCondition(sense) => {
-                    self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense))
+                CommandOutcome::StatusWithSense => {
+                    self.send_scsi_response(work, itt, status::GOOD, None)
+                }
+                CommandOutcome::CheckCondition => {
+                    let sense = devs[0].take_sense();
+                    self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref())
                 }
                 _ => {
                     let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
@@ -1160,18 +1152,26 @@ impl Session {
                 crate::debug!("  -> Status (GOOD)");
                 self.send_scsi_response(work, itt, status::GOOD, None)
             }
-            CommandOutcome::CheckCondition(sense) => {
-                crate::debug!(
-                    "  -> CheckCondition key={:?} asc=0x{:02X} ascq=0x{:02X}",
-                    sense.key,
-                    sense.asc,
-                    sense.ascq
-                );
-                self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense))
+            CommandOutcome::StatusWithSense => {
+                crate::debug!("  -> StatusWithSense (GOOD, sense pending)");
+                self.send_scsi_response(work, itt, status::GOOD, None)
+            }
+            CommandOutcome::CheckCondition => {
+                let sense = devs[lun].take_sense();
+                if let Some(ref s) = sense {
+                    crate::debug!(
+                        "  -> CheckCondition key={:?} asc=0x{:02X} ascq=0x{:02X}",
+                        s.key,
+                        s.asc,
+                        s.ascq
+                    );
+                } else {
+                    crate::debug!("  -> CheckCondition (no sense)");
+                }
+                self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref())
             }
             CommandOutcome::DataIn {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 if !immediate.is_empty() {
@@ -1179,25 +1179,21 @@ impl Session {
                     crate::debug!("  -> DataIn (synthesized, {} bytes)", n);
                     self.send_data_in_final(work, itt, n, 0, 0, status::GOOD)
                 } else {
-                    crate::debug!(
-                        "  -> DataIn (backend, transfer_len={} @ offset={})",
-                        transfer_len,
-                        byte_offset
-                    );
+                    crate::debug!("  -> DataIn (backend, transfer_len={})", transfer_len);
                     let chunk = (transfer_len as usize).min(work.len() - BHS_SIZE);
                     if lun < devs.len() {
                         let dev = &mut devs[lun];
-                        if dev
-                            .read_data(byte_offset, &mut work[BHS_SIZE..BHS_SIZE + chunk])
-                            .is_err()
-                        {
-                            let sense = *dev.sense();
-                            return self.send_scsi_response(
-                                work,
-                                itt,
-                                status::CHECK_CONDITION,
-                                Some(&sense),
-                            );
+                        match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
+                            XferOutcome::Ok => {}
+                            XferOutcome::Error(_) => {
+                                let sense = dev.take_sense();
+                                return self.send_scsi_response(
+                                    work,
+                                    itt,
+                                    status::CHECK_CONDITION,
+                                    sense.as_ref(),
+                                );
+                            }
                         }
                     }
                     if chunk as u64 == transfer_len {
@@ -1222,7 +1218,6 @@ impl Session {
                         work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
                         self.state = IscsiState::DataIn {
                             transfer_len,
-                            byte_offset,
                             sent: chunk as u64,
                             itt,
                             chunk,
@@ -1234,28 +1229,29 @@ impl Session {
             }
             CommandOutcome::DataOut {
                 transfer_len,
-                byte_offset,
                 immediate,
             } => {
                 // Consume the immediate data first (write to backend), then
                 // drive R2T/Data-Out.
                 let received = immediate.len() as u64;
                 crate::debug!(
-                    "  -> DataOut transfer_len={} immediate={} @ offset={}",
+                    "  -> DataOut transfer_len={} immediate={}",
                     transfer_len,
-                    received,
-                    byte_offset
+                    received
                 );
                 if received > 0 && lun < devs.len() {
                     let dev = &mut devs[lun];
-                    if dev.write_data(byte_offset, immediate).is_err() {
-                        let sense = *dev.sense();
-                        return self.send_scsi_response(
-                            work,
-                            itt,
-                            status::CHECK_CONDITION,
-                            Some(&sense),
-                        );
+                    match dev.xfer_in(0, immediate) {
+                        XferOutcome::Ok => {}
+                        XferOutcome::Error(_) => {
+                            let sense = dev.take_sense();
+                            return self.send_scsi_response(
+                                work,
+                                itt,
+                                status::CHECK_CONDITION,
+                                sense.as_ref(),
+                            );
+                        }
                     }
                 }
                 if received == transfer_len {
@@ -1266,7 +1262,6 @@ impl Session {
                 self.state = IscsiState::R2tSend {
                     itt,
                     transfer_len,
-                    byte_offset,
                     received,
                     r2t_sn: 0,
                     data_sn: 0,
@@ -1304,12 +1299,18 @@ impl Session {
                         CommandOutcome::Status => {
                             self.send_scsi_response(work, itt, status::GOOD, None)
                         }
-                        CommandOutcome::CheckCondition(sense) => self.send_scsi_response(
-                            work,
-                            itt,
-                            status::CHECK_CONDITION,
-                            Some(&sense),
-                        ),
+                        CommandOutcome::StatusWithSense => {
+                            self.send_scsi_response(work, itt, status::GOOD, None)
+                        }
+                        CommandOutcome::CheckCondition => {
+                            let sense = devs[0].take_sense();
+                            self.send_scsi_response(
+                                work,
+                                itt,
+                                status::CHECK_CONDITION,
+                                sense.as_ref(),
+                            )
+                        }
                         _ => {
                             let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
                             self.send_scsi_response(
