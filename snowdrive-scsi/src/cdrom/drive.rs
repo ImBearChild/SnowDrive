@@ -32,8 +32,12 @@ use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDe
 pub struct CdromDrive<'a> {
     pub(crate) sense: Sense,
     pub(crate) prevent_removal: bool,
-    /// UNIT ATTENTION pending: independent of `sense`.
-    pub(crate) pending_ua: Option<Sense>,
+    /// Pending sense to be reported on the next command (except INQUIRY).
+    /// This subsumes the old `pending`: a UA is just a sense with
+    /// `06/28` that is pending until the next CHECK. After it is reported
+    /// (whether via a CHECK's Response or via a subsequent REQUEST SENSE),
+    /// it is considered delivered and cleared.
+    pub(crate) pending: Option<Sense>,
     /// Device capability model — single source for GET CONFIG features
     /// and MODE SENSE 0x2A page.
     pub(crate) caps: CdromCapabilities,
@@ -82,7 +86,7 @@ impl<'a> CdromDrive<'a> {
     /// Load media into the drive (sets UNIT ATTENTION).
     pub fn load(&mut self, media: CdMedia<'a>) {
         self.media = Some(media);
-        self.pending_ua = Some(Sense::new(
+        self.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -98,7 +102,7 @@ impl<'a> CdromDrive<'a> {
     pub fn eject(&mut self) {
         self.media = None;
         self.tray_open = true;
-        self.pending_ua = Some(Sense::new(
+        self.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -194,7 +198,7 @@ impl<'a> CdromDrive<'a> {
         // Plan : UNIT ATTENTION takes priority over everything
         // except INQUIRY / REQUEST SENSE / REPORT LUNS.
         let spc = parse_spc(cdb);
-        if let Some(ua) = self.pending_ua {
+        if let Some(ua) = self.pending {
             if let Some(cmd) = spc {
                 match cmd {
                     SpcCommand::Inquiry { .. } | SpcCommand::ReceiveDiagnosticResults { .. } => {
@@ -203,14 +207,14 @@ impl<'a> CdromDrive<'a> {
                     SpcCommand::RequestSense { .. } => {
                         // Merge UA into sense; execute_spc will read & clear it.
                         self.sense = ua;
-                        self.pending_ua = None;
+                        self.pending = None;
                     }
                     _ => {
                         // iSCSI delivers sense in the Response PDU, so the
                         // host may never send REQUEST SENSE; clear UA after
                         // the first CHECK so the next command (e.g. TEST_UNIT_READY
                         // retried by udev) sees GOOD.
-                        self.pending_ua = None;
+                        self.pending = None;
                         self.sense = ua;
                         return Ok(CommandOutcome::CheckCondition(ua));
                     }
@@ -222,10 +226,10 @@ impl<'a> CdromDrive<'a> {
                     Some(o) if o == op::REPORT_LUNS => {}
                     Some(o) if o == op::REQUEST_SENSE => {
                         self.sense = ua;
-                        self.pending_ua = None;
+                        self.pending = None;
                     }
                     _ => {
-                        self.pending_ua = None;
+                        self.pending = None;
                         self.sense = ua;
                         return Ok(CommandOutcome::CheckCondition(ua));
                     }
@@ -405,7 +409,7 @@ impl<'a> CdromDrive<'a> {
                             if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
                                 match media.format_unit() {
                                     Ok(()) => {
-                                        self.pending_ua = Some(Sense::new(
+                                        self.pending = Some(Sense::new(
                                             SenseKey::UnitAttention,
                                             asc::MEDIUM_MAY_HAVE_CHANGED,
                                             0,
@@ -579,7 +583,7 @@ impl<'a> CdromDrive<'a> {
             return match media.format_unit() {
                 Ok(()) => {
                     // Signal media change so host re-reads DiscInfo/TOC/Capacity.
-                    self.pending_ua = Some(Sense::new(
+                    self.pending = Some(Sense::new(
                         SenseKey::UnitAttention,
                         asc::MEDIUM_MAY_HAVE_CHANGED,
                         0,
@@ -1225,7 +1229,7 @@ impl CdromDriveBuilder {
         CdromDrive {
             sense: Sense::clear(),
             prevent_removal: false,
-            pending_ua: None,
+            pending: None,
             caps: self.caps,
             drive_id: self.drive_id,
             identity: self.identity,
@@ -1428,10 +1432,10 @@ mod tests {
     }
 
     #[test]
-    fn drive_pending_ua_overrides_tur() {
+    fn drive_pending_overrides_tur() {
         let mut dev = CdromDrive::new();
         // Manually inject a pending UA.
-        dev.pending_ua = Some(Sense::new(
+        dev.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1449,7 +1453,7 @@ mod tests {
         }
         // UA is cleared after being reported (iSCSI delivers sense in the
         // Response, so the host may never send REQUEST SENSE).
-        assert!(dev.pending_ua.is_none());
+        assert!(dev.pending.is_none());
         // Next TUR should not be UA again (may be NOT READY if no media).
         let outcome2 = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         match outcome2 {
@@ -1462,9 +1466,9 @@ mod tests {
     }
 
     #[test]
-    fn drive_request_sense_clears_pending_ua() {
+    fn drive_request_sense_clears_pending() {
         let mut dev = CdromDrive::new();
-        dev.pending_ua = Some(Sense::new(
+        dev.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1475,13 +1479,13 @@ mod tests {
         cdb[4] = 18;
         let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         // UA should now be cleared.
-        assert!(dev.pending_ua.is_none());
+        assert!(dev.pending.is_none());
     }
 
     #[test]
     fn drive_inquiry_bypasses_ua() {
         let mut dev = CdromDrive::new();
-        dev.pending_ua = Some(Sense::new(
+        dev.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1493,7 +1497,7 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::DataIn { .. }));
         // UA is NOT cleared by INQUIRY.
-        assert!(dev.pending_ua.is_some());
+        assert!(dev.pending.is_some());
     }
 
     #[test]
@@ -1548,13 +1552,13 @@ mod tests {
             _ => panic!("expected CheckCondition with UA"),
         }
         // UA is cleared after being reported (no need to wait for REQUEST SENSE).
-        assert!(dev.pending_ua.is_none());
+        assert!(dev.pending.is_none());
         // REQUEST SENSE still returns the UA sense (from sense, not pending).
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
         let outcome_rs = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome_rs, CommandOutcome::DataIn { .. }));
-        assert!(dev.pending_ua.is_none());
+        assert!(dev.pending.is_none());
 
         // TUR → GOOD.
         cdb[0] = op::TEST_UNIT_READY;
@@ -1592,7 +1596,7 @@ mod tests {
     #[test]
     fn drive_ua_overrides_read_capacity() {
         let mut dev = CdromDrive::new();
-        dev.pending_ua = Some(Sense::new(
+        dev.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
