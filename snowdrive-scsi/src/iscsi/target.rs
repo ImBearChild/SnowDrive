@@ -333,6 +333,7 @@ impl Default for Session {
 impl Session {
     /// Create a session in the default (pre-login) state.
     pub fn new() -> Self {
+        crate::info!("new iSCSI session");
         Self {
             cmd_sn: 0,
             stat_sn: Cell::new(0),

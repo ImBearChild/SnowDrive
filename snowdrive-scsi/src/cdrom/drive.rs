@@ -206,6 +206,12 @@ impl<'a> CdromDrive<'a> {
                         self.pending_ua = None;
                     }
                     _ => {
+                        // iSCSI delivers sense in the Response PDU, so the
+                        // host may never send REQUEST SENSE; clear UA after
+                        // the first CHECK so the next command (e.g. TEST_UNIT_READY
+                        // retried by udev) sees GOOD.
+                        self.pending_ua = None;
+                        self.sense = ua;
                         return Ok(CommandOutcome::CheckCondition(ua));
                     }
                 }
@@ -219,6 +225,8 @@ impl<'a> CdromDrive<'a> {
                         self.pending_ua = None;
                     }
                     _ => {
+                        self.pending_ua = None;
+                        self.sense = ua;
                         return Ok(CommandOutcome::CheckCondition(ua));
                     }
                 }
@@ -1439,8 +1447,18 @@ mod tests {
             }
             _ => panic!("expected CheckCondition with UA"),
         }
-        // UA is NOT cleared by delivery — only by REQUEST SENSE.
-        assert!(dev.pending_ua.is_some());
+        // UA is cleared after being reported (iSCSI delivers sense in the
+        // Response, so the host may never send REQUEST SENSE).
+        assert!(dev.pending_ua.is_none());
+        // Next TUR should not be UA again (may be NOT READY if no media).
+        let outcome2 = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome2 {
+            CommandOutcome::CheckCondition(s) => {
+                assert_ne!(s.key, SenseKey::UnitAttention, "UA should not repeat");
+            }
+            CommandOutcome::Status => {}
+            _ => panic!("unexpected outcome"),
+        }
     }
 
     #[test]
@@ -1529,13 +1547,13 @@ mod tests {
             }
             _ => panic!("expected CheckCondition with UA"),
         }
-        // UA is NOT cleared by delivery.
-        assert!(dev.pending_ua.is_some());
-
-        // REQUEST SENSE → clears UA.
+        // UA is cleared after being reported (no need to wait for REQUEST SENSE).
+        assert!(dev.pending_ua.is_none());
+        // REQUEST SENSE still returns the UA sense (from sense, not pending).
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
-        let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome_rs = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        assert!(matches!(outcome_rs, CommandOutcome::DataIn { .. }));
         assert!(dev.pending_ua.is_none());
 
         // TUR → GOOD.
