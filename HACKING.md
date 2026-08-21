@@ -2,58 +2,92 @@
 
 ## Project Structure
 
-SCSI device emulation toolkit — unified Rust lib crate + one binary.
+SCSI device emulation toolkit — a **multi-crate cargo workspace** (resolver = "2").
+The old unified `snowdrive` lib+bin crate has been split into focused crates;
+the `snowdrive` binary lives in `snowdrive-cli`.
 
-| Component | Location | Description |
-|-----------|----------|-------------|
-| **snowdrive** | `snowdrive/` | Unified lib crate + CLI (`no_std` + `std` feature) |
-| — `common` | `snowdrive/src/common/` | Zero-alloc storage seams (`BlockStorage` / `FsStorage`) + unified logging macros |
-| — `scsi` | `snowdrive/src/scsi/` | SCSI core, block/CDBlock devices (SBC/SPC), file/fs backends |
-| — `cdrom` | `snowdrive/src/cdrom/` | CD-ROM device emulation — flat (`CdromDevice`) / live (`CdLiveFsDevice`), full MMC |
-| — `iscsi` | `snowdrive/src/iscsi/` | iSCSI PDU codec, connection, target state machine, TCP transport |
-| — `iso9660` | `snowdrive/src/iso9660/` | ISO9660 + Joliet live-generation algorithms |
-| — `usb` | `snowdrive/src/usb/` | USB Mass Storage Bulk-Only Transport core — CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
-| **snowdrive bin** | `snowdrive/src/main.rs` | Binary — `snowdrive serve` starts the iSCSI target or the USB MSC (BOT) gadget; `snowdrive mkisofs` generates an ISO image from a directory |
-| **snowdrive smoke** | `snowdrive/tests/smoke.rs` | Process-level CLI smoke tests (`CARGO_BIN_EXE_snowdrive`) |
-| **snowdrive-tests** | `tests/` | Integration tests crate (MockConn folded in + libiscsi whitebox) |
+| Component | Crate | Description |
+|-----------|-------|-------------|
+| **Common** | `snowdrive-common` | Zero-alloc `BlockStorage` / `FsStorage` seams + unified logging macros (always available, no feature gate) |
+| **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
+| **SCSI core** | `snowdrive-scsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, UDF volume skeleton |
+| — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `BlockStorage`/`FsStorage` + logging macros |
+| — SCSI | `snowdrive-scsi::scsi` | Block/CD-Block devices, SPC/SBC command layers, file/fs backends, `Device` enum |
+| — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `UdfRwMedia`), full MMC |
+| — iSCSI | `snowdrive-scsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
+| — USB MSC | `snowdrive-scsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
+| — UDF | `snowdrive-scsi::udf_void` (feature `udf_void`) | Pure UDF 2.01 volume skeleton backing `cdrom::udfrw` |
+| **CLI** | `snowdrive-cli` (`src/main.rs`) | `snowdrive serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowdrive mkisofs` generates an ISO image from a directory |
+| **Tests** | `snowdrive-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
+| **Tools** | `tools/` (not a workspace member) | External Python black-box tests (`ext-test/`) + USB passthrough helper |
 
 ```
-snowdrive/
-├── Cargo.toml            # workspace: lib + bin + tests
-├── Cargo.lock
-├── snowdrive/            # unified lib crate + CLI (feature-gated modules)
-│   ├── src/
-│   │   ├── lib.rs        # common, scsi, cdrom, iscsi, iso9660, usb (feature-gated)
-│   │   ├── main.rs       # CLI: serve (iSCSI target / USB gadget) + mkisofs (ISO generator)
-│   │   ├── common/       # BlockStorage / FsStorage seams + logging macros
-│   │   ├── scsi/         # SCSI core, block/cdblock devices, spc/sbc, backends
-│   │   ├── cdrom/        # CD-ROM device emulation (flat / live, full MMC)
-│   │   ├── iscsi/        # PDU codec, Conn, target, transport
-│   │   ├── iso9660/      # ISO9660/Joliet live-generation algorithms
-│   │   └── usb/          # USB MSC Bulk-Only Transport core (CBW/CSW, BotSession)
-│   ├── tests/smoke.rs    # process-level CLI smoke tests
-├── tests/                # integration tests crate (mock + libiscsi whitebox)
-└── HACKING.md
+SnowDrive/                          # cargo workspace (resolver = "2")
+├── Cargo.toml                      # workspace: members listed below
+├── snowdrive-common/               # crate: storage seams + logging macros
+│   ├── Cargo.toml
+│   └── src/{lib.rs, block_storage.rs, fs_storage.rs, logging.rs}
+├── snowdrive-disc/                 # crate: ISO9660/Joliet live-generation algorithms
+│   ├── Cargo.toml
+│   └── src/{lib.rs, mod.rs, live.rs}
+├── snowdrive-scsi/                 # crate: SCSI core + iSCSI + USB MSC + CD-ROM
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs                 # #![deny(unsafe_code)]; re-exports common + logging macros
+│       ├── scsi/                  # feature "scsi": backend, block, cdblock, device,
+│       │                         #            fs_backend, sbc, spc, scsi
+│       ├── cdrom/                 # feature "cdrom": common, drive, media,
+│       │                         #            udfrw (gated by "udf_void")
+│       ├── iscsi/                 # feature "iscsi": conn, pdu, target, transport
+│       ├── usb/                   # feature "usb": bot, gadget, io, target
+│       └── udf_void.rs            # feature "udf_void": UDF 2.01 volume skeleton
+├── snowdrive-cli/                 # crate: `snowdrive` binary (src/main.rs)
+│   ├── Cargo.toml                # features: full/std/scsi/iso9660/udf_void/iscsi/cdrom/livefs/usb/log/defmt
+│   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
+├── tests/                         # crate: snowdrive-tests (integration tests)
+│   ├── Cargo.toml
+│   ├── build.rs                  # probes libiscsi (cfg has_libiscsi), compiles c/iscsi_access.c
+│   ├── c/iscsi_access.c
+│   └── src/{lib.rs, mock.rs, mock_conn.rs, mock_bot.rs, usb_bot.rs, whitebox.rs, iso_cross.rs}
+└── tools/                         # NOT a cargo member: external black-box tests + helpers
+    ├── ext-test/*.py             # iso / iscsi-loopback / usb-loopback black-box tests (Python)
+    └── libvirt-usb-helper        # USB passthrough helper
 ```
 
 Dependency chain:
 
 ```
-snowdrive/src/main.rs ──┬── snowdrive (lib)
-snowdrive-tests         ┘
+snowdrive-cli (bin) ──▶ snowdrive-scsi (lib) ◀──┐
+                          ▲                      │
+snowdrive-tests ──────────┘                      │
+                          │                      │
+snowdrive-scsi ──▶ snowdrive-common              │
+               └─▶ snowdrive-disc ──▶ snowdrive-common
 ```
 
-Feature map (`snowdrive/Cargo.toml`): `std`, `scsi`, `iscsi` (→ `scsi`),
-`iso9660`, `cdrom` (→ `scsi`), `livefs` (→ `cdrom`+`iso9660`), `usb`
-(→ `scsi`), `cli` (→ `std`+all core features+std-only deps), `capi`,
-`log` / `defmt`. The lib's default is `["std", "scsi", "iscsi",
-"iso9660", "cdrom", "livefs", "cli"]`; the `snowdrive` bin
-(`src/main.rs`) builds only with `required-features = ["cli"]`, so
-`--no-default-features` skips the CLI entirely and the lib stays
-`no_std`-clean. The `serve --usb` FunctionFS bridge pulls in the
-Linux-only `usb-gadget` (`>= 1.1`) and `bytes` crates via
-`[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on
-other targets.
+Feature maps:
+
+- **`snowdrive-common`** — `std` (default), `log`, `defmt`. No feature gate on
+  the crate itself; the seams are always compiled.
+- **`snowdrive-disc`** — `std` (default), `iso9660` (declared, currently empty).
+- **`snowdrive-scsi`** — `std` (default), `scsi`, `iso9660`, `udf_void`,
+  `iscsi` (→`scsi`), `cdrom` (→`scsi`),
+  `livefs` (→`cdrom`+`iso9660`+`snowdrive-disc/iso9660`), `usb` (→`scsi`),
+  `log`, `defmt`. Linux-only `usb-gadget`/`bytes` deps under
+  `[target.'cfg(target_os = "linux")'.dependencies]`.
+- **`snowdrive-cli`** — `full` (default) pulls `std` +
+  `scsi`/`iso9660`/`udf_void`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
+  std-only deps (clap/ctrlc/env_logger). Builds against `snowdrive-scsi` with
+  `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
+  Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
+  `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
+  targets.
+- **`tests`** (`snowdrive-tests`) — depends on `snowdrive-scsi` with
+  `std, scsi, iscsi, iso9660, cdrom, livefs, usb`; enables `has_libiscsi`
+  only when the `libiscsi` system library is present (probed in `build.rs`).
+
+`snowdrive-scsi`'s `no_std` surface is feature-gated; without `std` it stays
+`no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
 
 ## Commit Messages
 
@@ -80,13 +114,17 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 | `test` | Adding or correcting tests |
 | `chore` | Other changes that don't modify src or test files |
 
+Scopes should name the crate and/or module, e.g. `scsi`, `cdrom`, `iscsi`,
+`usb`, `disc`, `common`, `cli`, `tests`.
+
 ### Examples
 
 ```
-feat(block): add WRITE(10) command support
+feat(scsi): add WRITE(10) command support
 fix(iscsi): correct StatSN sequence numbering
 docs: update API usage examples
 test(cdrom): add READ TOC format 0 tests
+refactor(scsi): introduce generic SenseState for pending sense
 ```
 
 ### Breaking Changes
@@ -127,7 +165,7 @@ standard-library Python (no pytest dependency):
   fsck-checks it. Skipped unless root and the module/daemon are available.
 - `tools/ext-test/test_usb_loopback.py` — a real kernel `usb-storage`
   initiator attaches to `snowdrive serve --usb` through a `dummy_hcd`
-  UDC (FunctionFS gadget) and exercises the same §8.3 checklist
+  UDC (FunctionFS gadget) and exercises the same checklist
   (capacity, `dd`/`badblocks` roundtrip, ext4 format/mount/write/fsck,
   read-only backend write protection) via `/dev/sdX`. Skipped unless root,
   a `dummy_udc.0` UDC and writable configfs are present; auto-loads
@@ -160,7 +198,8 @@ Design notes:
   not that our layout is byte-identical to `mkisofs`.
 - The PVD-tree assertions (`isoinfo -l`) are the regression net for the
   dual-tree (PVD 8.3 + Joliet UCS-2) layout — the Rust cross-reader
-  prefers the Joliet SVD, so only external tools exercise the PVD tree.
+  (`iso9660-no-std`) prefers the Joliet SVD, so only external tools exercise
+  the PVD tree.
 
 ## Code Coverage
 
@@ -176,7 +215,7 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov --workspace
 
 # Lib-only coverage (exclude the thin bin shell)
-cargo llvm-cov --workspace --ignore-filename-regex 'snowdrive/src/main.rs'
+cargo llvm-cov --workspace --ignore-filename-regex 'snowdrive-cli/src/main.rs'
 
 # HTML report (writes target/llvm-cov-html/)
 cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html
@@ -185,15 +224,16 @@ cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html
 cargo llvm-cov --workspace --lcov --output-path target/coverage.lcov
 ```
 
-Baseline (Aug 2026, `cargo llvm-cov --workspace`): **TOTAL ~90% lines**,
-with `iso9660/live.rs` (99%), `spc.rs` (99%), `pdu.rs` (97%) the strongest
-modules.
+Baseline (Aug 2026, `cargo llvm-cov --workspace`): **TOTAL ~90% lines**, with
+`snowdrive-disc/src/live.rs` (99%), `snowdrive-scsi/src/scsi/spc.rs` (99%),
+`snowdrive-scsi/src/iscsi/pdu.rs` (97%) the strongest modules.
 
 Notes:
 
-- `--no-default-features` builds only the always-on `common` module (~3%);
-  meaningful feature-matrix runs must enable `--features scsi` etc.
-- **Pre-existing gap**: `cargo test -p snowdrive --no-default-features
+- `--no-default-features` builds only the always-on `snowdrive-common` module
+  (~3%); meaningful feature-matrix runs must enable `--features scsi` etc. on
+  `snowdrive-scsi`.
+- **Pre-existing gap**: `cargo test -p snowdrive-scsi --no-default-features
   --features scsi` does not compile (unit tests use `Vec`/`String` without
   pulling in `std`). This predates coverage tooling and is a separate bug.
 - Coverage artifacts land under `target/` (already gitignored).
@@ -204,7 +244,7 @@ Notes:
 2. `cargo test --workspace`
 3. `cargo fmt --check`
 4. `cargo clippy --workspace -- -D warnings`
-5. `cargo build -p snowdrive --no-default-features` — the lib must stay
+5. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
    `no_std`-clean (feature-gated std surface only)
 
 ## Code Formatting
