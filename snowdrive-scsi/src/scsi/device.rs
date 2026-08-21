@@ -7,7 +7,7 @@ use crate::scsi::backend::{BlockBackend, BlockStorageError};
 use crate::scsi::block::BlockDevice;
 #[cfg(feature = "std")]
 use crate::scsi::cdblock::CDBlockDevice;
-use crate::scsi::scsi::{asc, Sense, SenseKey};
+use crate::scsi::scsi::{asc, op, Sense, SenseKey};
 
 /// Device type reported via INQUIRY (device.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,72 @@ impl core::fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
+
+/// Generic pending-sense state for any SCSI device.
+///
+/// A sense (including a UA `06/28`) is “pending” until the next command
+/// that is not `INQUIRY`/`REPORT LUNS`. The first such command gets
+/// `CHECK` with that sense and the pending is considered delivered
+/// (whether the transport piggy-backed it in the Response or the host
+/// will fetch it with a subsequent `REQUEST SENSE`). The sense is kept
+/// as `current` so that an immediate `REQUEST SENSE` still returns it.
+#[derive(Debug, Clone, Copy)]
+pub struct SenseState {
+    pub(crate) pending: Option<Sense>,
+    pub(crate) current: Sense,
+}
+
+impl Default for SenseState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SenseState {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            current: Sense::clear(),
+        }
+    }
+
+    /// Queue a sense to be reported on the next non-bypass command.
+    pub fn set_pending(&mut self, s: Sense) {
+        self.pending = Some(s);
+        self.current = s;
+    }
+
+    /// If a pending sense exists and `cdb` is not a bypass command
+    /// (`INQUIRY`/`REPORT LUNS`), consume it and return it as `CHECK`.
+    /// `REQUEST SENSE` itself never consumes the pending via this path;
+    /// it is handled separately to return `current` as `DataIn`.
+    pub fn take_pending(&mut self, cdb: &[u8]) -> Option<Sense> {
+        let pending = self.pending?;
+        let op = cdb.first().copied().unwrap_or(0);
+        match op {
+            op::INQUIRY | op::REPORT_LUNS => return None,
+            op::REQUEST_SENSE => return None, // let the device return current as DataIn
+            _ => {}
+        }
+        // Also bypass via SPC parse for INQUIRY variants (e.g. EVPD)
+        // to stay compatible with the old CdromDrive gate.
+        // For now, the opcode check above is sufficient for the generic case.
+        self.pending = None;
+        Some(pending)
+    }
+
+    pub fn current(&self) -> &Sense {
+        &self.current
+    }
+
+    pub fn set_current(&mut self, s: Sense) {
+        self.current = s;
+    }
+
+    pub fn clear_current(&mut self) {
+        self.current = Sense::clear();
+    }
+}
 
 /// Data-area capacity of a transport scratch buffer, rounded down to a
 /// 4-byte multiple.

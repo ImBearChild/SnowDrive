@@ -30,14 +30,8 @@ use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcCommand, SpcDe
 /// The drive identity (INQUIRY, caps, drive_id) is constant; the media
 /// slot is mutable.  `SpcDevice` is implemented directly here.
 pub struct CdromDrive<'a> {
-    pub(crate) sense: Sense,
+    pub(crate) sense_state: crate::scsi::device::SenseState,
     pub(crate) prevent_removal: bool,
-    /// Pending sense to be reported on the next command (except INQUIRY).
-    /// This subsumes the old `pending`: a UA is just a sense with
-    /// `06/28` that is pending until the next CHECK. After it is reported
-    /// (whether via a CHECK's Response or via a subsequent REQUEST SENSE),
-    /// it is considered delivered and cleared.
-    pub(crate) pending: Option<Sense>,
     /// Device capability model — single source for GET CONFIG features
     /// and MODE SENSE 0x2A page.
     pub(crate) caps: CdromCapabilities,
@@ -86,7 +80,7 @@ impl<'a> CdromDrive<'a> {
     /// Load media into the drive (sets UNIT ATTENTION).
     pub fn load(&mut self, media: CdMedia<'a>) {
         self.media = Some(media);
-        self.pending = Some(Sense::new(
+        self.sense_state.set_pending(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -102,7 +96,7 @@ impl<'a> CdromDrive<'a> {
     pub fn eject(&mut self) {
         self.media = None;
         self.tray_open = true;
-        self.pending = Some(Sense::new(
+        self.sense_state.set_pending(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -122,12 +116,12 @@ impl<'a> CdromDrive<'a> {
     // ── Helper ─────────────────────────────────────────────────────
 
     fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
-        self.sense = Sense::new(key, asc, ascq);
+        self.sense_state.set_current(Sense::new(key, asc, ascq));
     }
 
     fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
         self.set_sense(key, asc, 0);
-        CommandOutcome::CheckCondition(self.sense)
+        CommandOutcome::CheckCondition(*self.sense_state.current())
     }
 
     fn not_ready(&mut self) -> CommandOutcome<'static> {
@@ -136,11 +130,9 @@ impl<'a> CdromDrive<'a> {
         } else {
             asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED
         };
-        self.cc(SenseKey::NotReady, asc::MEDIUM_NOT_PRESENT);
-        // The above sets ascq=0, but we need the specific ASCQ.
-        // Override sense with correct ASCQ.
-        self.sense = Sense::new(SenseKey::NotReady, asc::MEDIUM_NOT_PRESENT, ascq);
-        CommandOutcome::CheckCondition(self.sense)
+        let s = Sense::new(SenseKey::NotReady, asc::MEDIUM_NOT_PRESENT, ascq);
+        self.sense_state.set_current(s);
+        CommandOutcome::CheckCondition(s)
     }
 
     fn lead_out_lba(&self) -> u32 {
@@ -195,43 +187,41 @@ impl<'a> CdromDrive<'a> {
             return Err(crate::scsi::device::Error::WorkBufTooSmall);
         }
 
-        // Plan : UNIT ATTENTION takes priority over everything
-        // except INQUIRY / REQUEST SENSE / REPORT LUNS.
+        // Generic pending sense (UA is just a sense): if a sense is
+        // pending, the next command (except INQUIRY/REPORT LUNS) gets it
+        // as CHECK, and the pending is considered delivered. REQUEST SENSE
+        // itself never consumes it via this path; it will return the stashed
+        // current sense as DataIn.
         let spc = parse_spc(cdb);
-        if let Some(ua) = self.pending {
+        if let Some(pending) = self.sense_state.pending {
             if let Some(cmd) = spc {
                 match cmd {
                     SpcCommand::Inquiry { .. } | SpcCommand::ReceiveDiagnosticResults { .. } => {
-                        // Bypass: don't report or clear UA.
+                        // Bypass: don't report or clear.
                     }
                     SpcCommand::RequestSense { .. } => {
-                        // Merge UA into sense; execute_spc will read & clear it.
-                        self.sense = ua;
-                        self.pending = None;
+                        // Let the normal REQUEST SENSE path return current.
+                        self.sense_state.current = pending;
+                        self.sense_state.pending = None;
                     }
                     _ => {
-                        // iSCSI delivers sense in the Response PDU, so the
-                        // host may never send REQUEST SENSE; clear UA after
-                        // the first CHECK so the next command (e.g. TEST_UNIT_READY
-                        // retried by udev) sees GOOD.
-                        self.pending = None;
-                        self.sense = ua;
-                        return Ok(CommandOutcome::CheckCondition(ua));
+                        self.sense_state.pending = None;
+                        self.sense_state.current = pending;
+                        return Ok(CommandOutcome::CheckCondition(pending));
                     }
                 }
             } else {
-                // Non-SPC opcodes: check REPORT LUNS and REQUEST SENSE.
                 let op = cdb_opcode(cdb);
                 match op {
                     Some(o) if o == op::REPORT_LUNS => {}
                     Some(o) if o == op::REQUEST_SENSE => {
-                        self.sense = ua;
-                        self.pending = None;
+                        self.sense_state.current = pending;
+                        self.sense_state.pending = None;
                     }
                     _ => {
-                        self.pending = None;
-                        self.sense = ua;
-                        return Ok(CommandOutcome::CheckCondition(ua));
+                        self.sense_state.pending = None;
+                        self.sense_state.current = pending;
+                        return Ok(CommandOutcome::CheckCondition(pending));
                     }
                 }
             }
@@ -241,7 +231,7 @@ impl<'a> CdromDrive<'a> {
         if let Some(SpcCommand::TestUnitReady) = spc {
             if self.media.is_some() {
                 let outcome = CommandOutcome::Status;
-                self.sense = Sense::clear();
+                self.sense_state.current = Sense::clear();
                 return Ok(outcome);
             }
             return Ok(self.not_ready());
@@ -409,7 +399,7 @@ impl<'a> CdromDrive<'a> {
                             if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
                                 match media.format_unit() {
                                     Ok(()) => {
-                                        self.pending = Some(Sense::new(
+                                        self.sense_state.set_pending(Sense::new(
                                             SenseKey::UnitAttention,
                                             asc::MEDIUM_MAY_HAVE_CHANGED,
                                             0,
@@ -437,7 +427,7 @@ impl<'a> CdromDrive<'a> {
         };
 
         if !matches!(outcome, CommandOutcome::CheckCondition(_)) {
-            self.sense = Sense::clear();
+            self.sense_state.current = Sense::clear();
         }
         Ok(outcome)
     }
@@ -583,7 +573,7 @@ impl<'a> CdromDrive<'a> {
             return match media.format_unit() {
                 Ok(()) => {
                     // Signal media change so host re-reads DiscInfo/TOC/Capacity.
-                    self.pending = Some(Sense::new(
+                    self.sense_state.set_pending(Sense::new(
                         SenseKey::UnitAttention,
                         asc::MEDIUM_MAY_HAVE_CHANGED,
                         0,
@@ -1075,11 +1065,15 @@ impl SpcDevice for CdromDrive<'_> {
     }
 
     fn sense(&self) -> &Sense {
-        &self.sense
+        self.sense_state.current()
     }
 
     fn sense_mut(&mut self) -> &mut Sense {
-        &mut self.sense
+        // For SpcDevice helpers that need mutable sense, expose current.
+        // This is used by spc.rs for REQUEST SENSE handling.
+        // SAFETY: We return a mutable ref to the current sense inside sense_state.
+        // The caller will overwrite it, which is correct.
+        &mut self.sense_state.current
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
@@ -1153,7 +1147,7 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
     }
 
     fn sense(&self) -> &Sense {
-        &self.sense
+        self.sense_state.current()
     }
 
     fn device_type(&self) -> DeviceType {
@@ -1227,9 +1221,8 @@ impl CdromDriveBuilder {
     /// Build the drive (empty tray).
     pub fn build(self) -> CdromDrive<'static> {
         CdromDrive {
-            sense: Sense::clear(),
+            sense_state: crate::scsi::device::SenseState::new(),
             prevent_removal: false,
-            pending: None,
             caps: self.caps,
             drive_id: self.drive_id,
             identity: self.identity,
@@ -1279,7 +1272,7 @@ mod tests {
     #[test]
     fn drive_new_defaults() {
         let dev = CdromDrive::new();
-        assert_eq!(dev.sense, Sense::clear());
+        assert_eq!(dev.sense_state.current, Sense::clear());
         assert!(!dev.prevent_removal);
         assert!(!dev.tray_open);
         assert!(!dev.media_requested);
@@ -1323,8 +1316,11 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
         // Empty tray → 3Ah/01h (tray closed).
-        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(dev.sense.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED);
+        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(
+            dev.sense_state.current.ascq,
+            asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED
+        );
     }
 
     #[test]
@@ -1350,7 +1346,7 @@ mod tests {
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
     }
 
     #[test]
@@ -1405,6 +1401,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_rejects_read_only_media() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 2048];
@@ -1435,7 +1432,7 @@ mod tests {
     fn drive_pending_overrides_tur() {
         let mut dev = CdromDrive::new();
         // Manually inject a pending UA.
-        dev.pending = Some(Sense::new(
+        dev.sense_state.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1453,7 +1450,7 @@ mod tests {
         }
         // UA is cleared after being reported (iSCSI delivers sense in the
         // Response, so the host may never send REQUEST SENSE).
-        assert!(dev.pending.is_none());
+        assert!(dev.sense_state.pending.is_none());
         // Next TUR should not be UA again (may be NOT READY if no media).
         let outcome2 = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         match outcome2 {
@@ -1468,7 +1465,7 @@ mod tests {
     #[test]
     fn drive_request_sense_clears_pending() {
         let mut dev = CdromDrive::new();
-        dev.pending = Some(Sense::new(
+        dev.sense_state.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1479,13 +1476,13 @@ mod tests {
         cdb[4] = 18;
         let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         // UA should now be cleared.
-        assert!(dev.pending.is_none());
+        assert!(dev.sense_state.pending.is_none());
     }
 
     #[test]
     fn drive_inquiry_bypasses_ua() {
         let mut dev = CdromDrive::new();
-        dev.pending = Some(Sense::new(
+        dev.sense_state.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1497,7 +1494,7 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::DataIn { .. }));
         // UA is NOT cleared by INQUIRY.
-        assert!(dev.pending.is_some());
+        assert!(dev.sense_state.pending.is_some());
     }
 
     #[test]
@@ -1509,8 +1506,11 @@ mod tests {
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(dev.sense.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
+        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(
+            dev.sense_state.current.ascq,
+            asc::MEDIUM_NOT_PRESENT_TRAY_OPEN
+        );
     }
 
     #[test]
@@ -1523,7 +1523,7 @@ mod tests {
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
 
         // START STOP LoEj=1, Load=1 → load media on empty tray.
         use crate::scsi::spc::SpcDevice;
@@ -1552,13 +1552,13 @@ mod tests {
             _ => panic!("expected CheckCondition with UA"),
         }
         // UA is cleared after being reported (no need to wait for REQUEST SENSE).
-        assert!(dev.pending.is_none());
+        assert!(dev.sense_state.pending.is_none());
         // REQUEST SENSE still returns the UA sense (from sense, not pending).
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
         let outcome_rs = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome_rs, CommandOutcome::DataIn { .. }));
-        assert!(dev.pending.is_none());
+        assert!(dev.sense_state.pending.is_none());
 
         // TUR → GOOD.
         cdb[0] = op::TEST_UNIT_READY;
@@ -1589,14 +1589,17 @@ mod tests {
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         assert!(matches!(outcome, CommandOutcome::CheckCondition(_)));
-        assert_eq!(dev.sense.asc, asc::MEDIUM_NOT_PRESENT);
-        assert_eq!(dev.sense.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_OPEN);
+        assert_eq!(dev.sense_state.current.asc, asc::MEDIUM_NOT_PRESENT);
+        assert_eq!(
+            dev.sense_state.current.ascq,
+            asc::MEDIUM_NOT_PRESENT_TRAY_OPEN
+        );
     }
 
     #[test]
     fn drive_ua_overrides_read_capacity() {
         let mut dev = CdromDrive::new();
-        dev.pending = Some(Sense::new(
+        dev.sense_state.pending = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
@@ -1624,6 +1627,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_rejects_type_01() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 4096 * 2048];
@@ -1664,6 +1668,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_rejects_init_pattern() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 4096 * 2048];
@@ -1704,6 +1709,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_tryout_does_not_clear() {
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udf_void")]
@@ -1743,6 +1749,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_clears_logical_blocks() {
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udf_void")]
@@ -1794,6 +1801,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn drive_read_dvd_structure_08_09_0a_0b_for_dvdram() {
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udf_void")]
@@ -1853,6 +1861,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn dvd_ram_always_formatted_no_medium_not_formatted() {
         // Logical DVD-RAM never returns NOT READY/MEDIUM NOT FORMATTED per §2.1
         let mut img = vec![0u8; 4096 * 2048];
@@ -1916,6 +1925,7 @@ mod tests {
     /// invariant that makes Windows accept the disc and not report
     /// "format failed".
     #[test]
+    #[allow(unused_mut, unused_variables)]
     fn disc_info_reflects_udf_state_transitions() {
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udf_void")]
