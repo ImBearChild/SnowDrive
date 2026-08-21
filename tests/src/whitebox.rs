@@ -427,6 +427,36 @@ fn write_out_of_range_sense() {
     teardown(&iscsi, server);
 }
 
+/// CHECK CONDITION sense is owned and consumed exactly once (autosense):
+/// after an out-of-range WRITE the next TUR must be GOOD, not a repeated
+/// CHECK (verifies `take_sense()` clears the device).
+#[test]
+fn out_of_range_sense_is_consumed() {
+    let (port, server) = start_target();
+    let iscsi = connect(port);
+
+    let buf = vec![0x5Au8; 512];
+    let t = iscsi.write10(0, LAST_LBA + 1, &buf, BLOCK_SIZE as c_int);
+    assert_eq!(
+        t.status(),
+        SCSI_STATUS_CHECK_CONDITION,
+        "out-of-range write must be CHECK CONDITION: {}",
+        iscsi.error()
+    );
+    assert_eq!(t.sense_key(), SENSE_KEY_ILLEGAL_REQUEST);
+
+    // Next command must be GOOD - sense must have been consumed by autosense.
+    let t2 = iscsi.test_unit_ready(0);
+    assert_eq!(
+        t2.status(),
+        SCSI_STATUS_GOOD,
+        "sense must be consumed after autosense, TUR should be GOOD: {}",
+        iscsi.error()
+    );
+
+    teardown(&iscsi, server);
+}
+
 /// Multi-LUN: the target is configured with three independent LUNs.
 /// libiscsi's `iscsi_full_connect_sync` issues a TEST UNIT READY at LUN 0
 /// (and implicitly relies on REPORT LUNS to populate its internal map). The
