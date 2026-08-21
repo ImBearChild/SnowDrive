@@ -35,11 +35,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-#[cfg(target_os = "linux")]
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::{Args, Parser};
@@ -119,9 +118,11 @@ struct ServeArgs {
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
-    /// iSCSI listen address (ADDR:PORT). Mutually exclusive with `--usb`;
-    /// exactly one transport is required.
-    #[arg(long = "iscsi", value_name = "ADDR:PORT", group = "transport")]
+    /// iSCSI listen address (ADDR:PORT) or `auto` for loopback auto-config
+    /// (127.0.0.1:3260, fallback to ephemeral, plus open-iscsi login to
+    /// expose a block device). Mutually exclusive with `--usb`; exactly one
+    /// transport is required.
+    #[arg(long = "iscsi", value_name = "ADDR:PORT|auto", group = "transport")]
     iscsi: Option<String>,
 
     /// Serve the devices over USB Mass Storage (Bulk-Only Transport) by
@@ -216,26 +217,38 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     // iSCSI transport: the ArgGroup guarantees --iscsi when --usb is absent.
-    let addr = match args.iscsi.as_deref() {
-        None => {
-            eprintln!("snowdrive: --iscsi is required");
-            return ExitCode::FAILURE;
-        }
-        Some(s) => match s.parse::<SocketAddr>() {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("snowdrive: invalid --iscsi address: {s}");
+    let is_auto = args.iscsi.as_deref() == Some("auto");
+    let (listener, bound) = if is_auto {
+        match bind_iscsi_auto() {
+            Ok(v) => v,
+            Err(msg) => {
+                eprintln!("snowdrive: {msg}");
                 return ExitCode::FAILURE;
             }
-        },
-    };
-
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("snowdrive: failed to bind {addr}: {e}");
-            return ExitCode::FAILURE;
         }
+    } else {
+        let addr = match args.iscsi.as_deref() {
+            None => {
+                eprintln!("snowdrive: --iscsi is required");
+                return ExitCode::FAILURE;
+            }
+            Some(s) => match s.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => {
+                    eprintln!("snowdrive: invalid --iscsi address: {s}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        let listener = match TcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("snowdrive: failed to bind {addr}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = listener.local_addr().unwrap_or(addr);
+        (listener, bound)
     };
 
     // Graceful shutdown: SIGINT/SIGTERM set `stop`;
@@ -259,16 +272,34 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let mut work = vec![0u8; work_size];
     // Report the actual bound address: `--iscsi 127.0.0.1:0` picks an
     // ephemeral port, so callers (tests) must learn it from this line.
-    let bound = listener.local_addr().unwrap_or(addr);
     log::info!("listening on {bound} with {} LUN(s)", devices.len());
 
-    if let Err(e) = serve(
+    // Auto-config: use open-iscsi to log in and expose a block device.
+    // Runs in a helper thread so the blocking `serve` loop can start
+    // accepting immediately.
+    let auto_handle = if is_auto {
+        spawn_iscsi_auto_helper(bound, Arc::clone(&stop))
+    } else {
+        None
+    };
+
+    let serve_res = serve(
         listener,
         &stop,
         &mut work,
         &mut devices,
         Some(DEFAULT_READ_TIMEOUT),
-    ) {
+    );
+
+    // Tear down the auto-config session (logout, delete node, SELinux).
+    if let Some(handle) = auto_handle {
+        // Wake the helper if it is still waiting for the device.
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        teardown_iscsi_auto(bound);
+    }
+
+    if let Err(e) = serve_res {
         eprintln!("snowdrive: server error: {e}");
         return ExitCode::FAILURE;
     }
@@ -290,6 +321,346 @@ fn sync_devices(devices: &mut [Device<'_>]) {
         if failed {
             eprintln!("snowdrive: sync failed for LUN {i}");
         }
+    }
+}
+
+// ── iSCSI auto-config (open-iscsi) ─────────────────────────────────────
+
+const ISCSI_TARGET_NAME: &str = "iqn.1970-01.local.snowscsi:target";
+const ISCSI_STANDARD_PORT: u16 = 3260;
+
+/// Bind for `--iscsi auto`: try the standard loopback portal
+/// `127.0.0.1:3260` (avoids Fedora SELinux `iscsi_port_t` labeling), fall
+/// back to an ephemeral `127.0.0.1:0` if it is in use.
+fn bind_iscsi_auto() -> Result<(TcpListener, SocketAddr), String> {
+    let std_addr: SocketAddr = format!("127.0.0.1:{ISCSI_STANDARD_PORT}").parse().unwrap();
+    match TcpListener::bind(std_addr) {
+        Ok(l) => {
+            let bound = l
+                .local_addr()
+                .map_err(|e| format!("getsockname failed: {e}"))?;
+            log::info!("auto: bound standard portal {bound}");
+            Ok((l, bound))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            log::warn!("auto: {std_addr} in use ({e}), falling back to ephemeral");
+            let fb: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let l = TcpListener::bind(fb).map_err(|e| format!("failed to bind {fb}: {e}"))?;
+            let bound = l
+                .local_addr()
+                .map_err(|e| format!("getsockname failed: {e}"))?;
+            log::info!("auto: bound ephemeral portal {bound}");
+            Ok((l, bound))
+        }
+        Err(e) => Err(format!("failed to bind {std_addr}: {e}")),
+    }
+}
+
+fn have_tool(name: &str) -> bool {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let cand = Path::new(dir).join(name);
+            if cand.is_file() {
+                // Check executable bit via metadata permissions (best-effort).
+                if let Ok(md) = std::fs::metadata(&cand) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if md.permissions().mode() & 0o111 != 0 {
+                            return true;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_root() -> bool {
+    // Cheap check via `id -u` to avoid a libc dependency.
+    if let Ok(o) = Command::new("id").arg("-u").output() {
+        if o.status.success() {
+            return String::from_utf8_lossy(&o.stdout).trim() == "0";
+        }
+    }
+    false
+}
+
+fn selinux_enforcing() -> bool {
+    if !have_tool("getenforce") {
+        return false;
+    }
+    match Command::new("getenforce").output() {
+        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "Enforcing",
+        Err(_) => false,
+    }
+}
+
+fn selinux_allow_port(port: u16) -> bool {
+    if !selinux_enforcing() || !have_tool("semanage") {
+        return false;
+    }
+    let s = Command::new("timeout")
+        .args([
+            "30",
+            "semanage",
+            "port",
+            "-a",
+            "-t",
+            "iscsi_port_t",
+            "-p",
+            "tcp",
+            &port.to_string(),
+        ])
+        .status();
+    match s {
+        Ok(st) if st.success() => {
+            log::info!("auto: labeled {port}/tcp as iscsi_port_t");
+            true
+        }
+        _ => {
+            log::warn!("auto: semanage port -a failed for {port} (ignored)");
+            false
+        }
+    }
+}
+
+fn selinux_deny_port(port: u16) {
+    if !selinux_enforcing() || !have_tool("semanage") {
+        return;
+    }
+    let _ = Command::new("timeout")
+        .args([
+            "30",
+            "semanage",
+            "port",
+            "-d",
+            "-p",
+            "tcp",
+            &port.to_string(),
+        ])
+        .status();
+}
+
+fn iscsid_running() -> bool {
+    if have_tool("systemctl") {
+        if let Ok(o) = Command::new("systemctl")
+            .args(["is-active", "iscsid"])
+            .output()
+        {
+            if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "active" {
+                return true;
+            }
+        }
+    }
+    // Fallback: pgrep
+    if have_tool("pgrep") {
+        if let Ok(st) = Command::new("pgrep").args(["-x", "iscsid"]).status() {
+            return st.success();
+        }
+    }
+    false
+}
+
+fn ensure_iscsid() {
+    if iscsid_running() {
+        return;
+    }
+    log::info!("auto: iscsid not running, starting");
+    if have_tool("systemctl") {
+        let _ = Command::new("systemctl").args(["start", "iscsid"]).status();
+        if iscsid_running() {
+            return;
+        }
+    }
+    if have_tool("iscsid") {
+        let _ = Command::new("iscsid").status();
+    }
+}
+
+fn iscsi_portal(bound: SocketAddr) -> String {
+    // iscsiadm expects "IP:PORT" (no brackets for IPv4 loopback).
+    // For IPv6 loopback, bracket the IP.
+    match bound {
+        SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+fn find_iscsi_device(portal: &str) -> Option<String> {
+    // /dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-*
+    // portal contains ':', so escape for glob via directory read.
+    let dir = Path::new("/dev/disk/by-path");
+    let entries = std::fs::read_dir(dir).ok()?;
+    let prefix = format!("ip-{portal}-iscsi-{ISCSI_TARGET_NAME}-lun-");
+    for ent in entries.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) {
+            if let Ok(real) = std::fs::read_link(ent.path()) {
+                let abs = if real.is_absolute() {
+                    real
+                } else {
+                    dir.join(real)
+                };
+                // Resolve .. components and return /dev/sdX
+                if let Ok(canon) = abs.canonicalize() {
+                    return Some(canon.to_string_lossy().to_string());
+                }
+                return Some(abs.to_string_lossy().to_string());
+            }
+            // Fallback: resolve via realpath of the symlink's target
+            if let Ok(canon) = ent.path().canonicalize() {
+                return Some(canon.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_iscsi_auto_helper(_bound: SocketAddr, _stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    log::warn!("auto: open-iscsi auto-login is only supported on Linux");
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_iscsi_auto_helper(bound: SocketAddr, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    let portal = iscsi_portal(bound);
+    let port = bound.port();
+    let needs_semanage = port != ISCSI_STANDARD_PORT;
+    // Spawn a helper thread so `serve` can start accepting immediately.
+    Some(std::thread::spawn(move || {
+        if !have_tool("iscsiadm") {
+            log::warn!("auto: iscsiadm not found; target listening on {portal} — manual login required: iscsiadm -m node -o new -T {ISCSI_TARGET_NAME} -p {portal} && iscsiadm -m node -T {ISCSI_TARGET_NAME} -p {portal} --login");
+            return;
+        }
+        if !is_root() {
+            log::warn!("auto: not running as root; skipping iscsiadm auto-login (target listening on {portal})");
+            log::info!("auto: manual login: iscsiadm -m node -o new -T {ISCSI_TARGET_NAME} -p {portal} && iscsiadm -m node -T {ISCSI_TARGET_NAME} -p {portal} --login");
+            return;
+        }
+        ensure_iscsid();
+        // Give `serve` a moment to enter its accept loop.
+        std::thread::sleep(Duration::from_millis(200));
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut selinux_added = false;
+        if needs_semanage {
+            selinux_added = selinux_allow_port(port);
+        }
+        let _ = selinux_added; // recorded for teardown via port check
+                               // Register the node explicitly (no SendTargets discovery).
+        let new_st = Command::new("iscsiadm")
+            .args([
+                "-m",
+                "node",
+                "-o",
+                "new",
+                "-T",
+                ISCSI_TARGET_NAME,
+                "-p",
+                &portal,
+            ])
+            .status();
+        match new_st {
+            Ok(st) if st.success() => {
+                log::info!("auto: iscsiadm new node {ISCSI_TARGET_NAME}@{portal}")
+            }
+            Ok(st) => log::warn!("auto: iscsiadm new failed ({st}); trying login anyway"),
+            Err(e) => log::warn!("auto: iscsiadm new exec failed: {e}"),
+        }
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let login_st = Command::new("iscsiadm")
+            .args([
+                "-m",
+                "node",
+                "-T",
+                ISCSI_TARGET_NAME,
+                "-p",
+                &portal,
+                "--login",
+            ])
+            .status();
+        match login_st {
+            Ok(st) if st.success() => log::info!("auto: iscsiadm login {portal}"),
+            Ok(st) => {
+                log::warn!(
+                    "auto: iscsiadm login failed ({st}); target still listening on {portal}"
+                );
+                log::info!("auto: manual retry: iscsiadm -m node -T {ISCSI_TARGET_NAME} -p {portal} --login");
+                return;
+            }
+            Err(e) => {
+                log::warn!("auto: iscsiadm login exec failed: {e}");
+                return;
+            }
+        }
+        // Wait for udev to create the block device (no mount).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(dev) = find_iscsi_device(&portal) {
+                log::info!("auto: iSCSI block ready: {dev} (portal {portal})");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        log::warn!("auto: iSCSI device did not appear under /dev/disk/by-path for {portal} (login succeeded, udev pending)");
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn teardown_iscsi_auto(_bound: SocketAddr) {}
+
+#[cfg(target_os = "linux")]
+fn teardown_iscsi_auto(bound: SocketAddr) {
+    if !have_tool("iscsiadm") || !is_root() {
+        return;
+    }
+    let portal = iscsi_portal(bound);
+    let port = bound.port();
+    log::info!("auto: logging out {ISCSI_TARGET_NAME}@{portal}");
+    let _ = Command::new("iscsiadm")
+        .args([
+            "-m",
+            "node",
+            "-T",
+            ISCSI_TARGET_NAME,
+            "-p",
+            &portal,
+            "--logout",
+        ])
+        .status();
+    let _ = Command::new("iscsiadm")
+        .args([
+            "-m",
+            "node",
+            "-o",
+            "delete",
+            "-T",
+            ISCSI_TARGET_NAME,
+            "-p",
+            &portal,
+        ])
+        .status();
+    if port != ISCSI_STANDARD_PORT {
+        selinux_deny_port(port);
     }
 }
 
@@ -1976,6 +2347,16 @@ mod tests {
             Cli::try_parse_from(["snowdrive", "serve", "--usb", "--iscsi", "127.0.0.1:3260"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cli_iscsi_auto_parses() {
+        match Cli::try_parse_from(["snowdrive", "serve", "--iscsi", "auto", "--disk", "ram=1M"])
+            .unwrap()
+        {
+            Cli::Serve(a) => assert_eq!(a.iscsi.as_deref(), Some("auto")),
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]
