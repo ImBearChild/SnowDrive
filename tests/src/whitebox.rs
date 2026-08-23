@@ -20,7 +20,7 @@ use std::thread;
 
 use snowdrive_scsi::common::block_storage::RamBackend;
 use snowdrive_scsi::iscsi::pdu::BHS_SIZE;
-use snowdrive_scsi::iscsi::target::{serve_conn, Session, TargetError};
+use snowdrive_scsi::iscsi::target::{serve_conn, IscsiSession, TargetError};
 use snowdrive_scsi::iscsi::transport::TcpConn;
 use snowdrive_scsi::iscsi::transport::DEFAULT_READ_TIMEOUT;
 use snowdrive_scsi::scsi::block::BlockDevice;
@@ -281,7 +281,7 @@ fn start_target_n_luns(
         let (stream, _peer) = listener.accept().expect("target accept");
         let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
         let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
-        let mut session = Session::new();
+        let mut session = IscsiSession::new();
         // Hold RAM guards in a Vec to extend their lifetime across `serve_conn`.
         let mut guards: Vec<std::sync::MutexGuard<'_, Vec<u8>>> = Vec::with_capacity(n);
         for r in &rams_for_thread {

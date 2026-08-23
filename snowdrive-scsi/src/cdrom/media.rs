@@ -187,6 +187,19 @@ pub enum MediaError {
     Io,
 }
 
+impl core::fmt::Display for MediaError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IllegalField => write!(f, "invalid field"),
+            Self::WriteProtected => write!(f, "write protected"),
+            Self::OutOfBounds => write!(f, "out of bounds"),
+            Self::Io => write!(f, "I/O error"),
+        }
+    }
+}
+
+impl core::error::Error for MediaError {}
+
 // ── GESN media event status (plan MC-6 ) ─────────────
 
 /// Media event status for GET EVENT STATUS NOTIFICATION (MMC-6 Table 265).
@@ -220,6 +233,7 @@ pub enum CdMedia<'a> {
     Live(Box<FlatMedia<LiveData<crate::scsi::fs_backend::StdFsBackend>>>),
 
     /// Bundle: multi-track, multi-session disc package (plan ).
+    #[doc(hidden)]
     Bundle(/* BundleMedia<FsBackend> */),
 
     /// UDF random-writable DVD-RAM.
@@ -227,6 +241,7 @@ pub enum CdMedia<'a> {
     UdfRw(UdfRwMedia<BlockBackend<'a>>),
 
     /// Marker for lifetime usage when all other variants are `cfg`-gated.
+    #[doc(hidden)]
     _Phantom(core::marker::PhantomData<&'a ()>),
 }
 

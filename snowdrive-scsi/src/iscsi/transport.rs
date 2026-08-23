@@ -9,7 +9,7 @@
 //!
 //! [`serve`] is the convenience entry: a serial accept
 //! loop (MaxConnections = 1) that serves one connection at a time with a
-//! fresh [`Session`], retrying accept failures with a backoff instead of C's
+//! fresh [`IscsiSession`], retrying accept failures with a backoff instead of C's
 //! infinite busy retry.
 
 use std::io;
@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::iscsi::target::{serve_conn, Session, TargetError};
+use crate::iscsi::target::{serve_conn, IscsiSession, TargetError};
 use crate::scsi::device::ScsiDevice;
 
 /// Default read timeout guarding login / command loop / Data-Out.
@@ -73,7 +73,7 @@ impl embedded_io::Write for TcpConn {
 /// Serial accept loop: serve one connection at a time,
 /// with accept-failure backoff retry.
 ///
-/// Each accepted connection gets a fresh [`Session`] (login restarts the
+/// Each accepted connection gets a fresh [`IscsiSession`] (login restarts the
 /// sequence numbers). Returns when `stop` is set, or on a caller bug
 /// (work buffer too small).
 ///
@@ -113,7 +113,7 @@ pub fn serve<D: ScsiDevice>(
                 continue;
             }
         };
-        let mut session = Session::new();
+        let mut session = IscsiSession::new();
         match serve_conn(&mut conn, work, &mut session, devs) {
             Ok(()) => crate::info!("connection from {peer} ended"),
             Err(e) => return Err(e),
@@ -136,7 +136,7 @@ mod tests {
     }
 
     /// Null-separated login request text (matches the mock initiator).
-    const REQ_TEXT: &str = "InitiatorName=iqn.1994-05.com.redhat:test\0TargetName=iqn.1970-01.local.snowscsi:target\0SessionType=Normal\0HeaderDigest=None\0DataDigest=None\0InitialR2T=Yes\0ImmediateData=Yes\0MaxRecvDataSegmentLength=8192\0";
+    const REQ_TEXT: &str = "InitiatorName=iqn.1994-05.com.redhat:test\0TargetName=iqn.1970-01.local.snowscsi:target\0IscsiSessionType=Normal\0HeaderDigest=None\0DataDigest=None\0InitialR2T=Yes\0ImmediateData=Yes\0MaxRecvDataSegmentLength=8192\0";
 
     /// One-PDU Login Request BHS: I=1, T=1, CSG=1, NSG=3.
     fn login_bhs(dsl: u32, itt: u32) -> [u8; 48] {

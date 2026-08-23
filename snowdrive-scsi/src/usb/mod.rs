@@ -19,7 +19,9 @@ pub mod target;
 pub use bot::{BotDir, Cbw, Csw, CswStatus};
 pub use gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 pub use io::{BotIo, BotIoErr};
-pub use target::{BotEvent, BotNeed, BotSession, BotStep, BotStepResult, BotTargetError};
+pub use target::{
+    BotSession, BotStepResult, BotTargetError, SessionEvent, SessionNeed, SessionStep,
+};
 
 /// Command Block Wrapper signature (`"USBC"`, BOT §5.1) — stored little
 /// endian in the raw 31-byte CBW.

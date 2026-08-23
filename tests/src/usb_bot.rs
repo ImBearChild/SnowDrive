@@ -12,8 +12,8 @@ use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
 use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::{Device, ScsiDevice};
 use snowdrive_scsi::usb::{
-    BotEvent, BotIo, BotIoErr, BotNeed, BotSession, BotStep, BotStepResult, CtrlAck, CtrlReply,
-    CtrlReq, Gadget, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
+    BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
+    SessionNeed, SessionStep, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
 };
 use std::sync::atomic::Ordering;
 
@@ -99,20 +99,20 @@ fn serve_once(
     stalled: &mut bool,
 ) -> Option<BotStepResult> {
     match session.need() {
-        BotNeed::NeedOut { len, probe } => match io.try_recv_out(&mut recv[..len]) {
+        SessionNeed::NeedOut { len, probe } => match io.try_recv_out(&mut recv[..len]) {
             Ok(n) => {
-                let step = session.poll(BotEvent::OutRecv { data: &recv[..n] }, work, devs);
+                let step = session.poll(SessionEvent::OutRecv { data: &recv[..n] }, work, devs);
                 match step {
-                    BotStep::Done(BotStepResult::Stalled) => on_stalled(session, io, stalled),
-                    BotStep::Done(r) => Some(r),
+                    SessionStep::Done(BotStepResult::Stalled) => on_stalled(session, io, stalled),
+                    SessionStep::Done(r) => Some(r),
                     _ => None,
                 }
             }
             Err(BotIoErr::WouldBlock) => {
                 if probe {
                     // No more data ends the overrun drain → CSW.
-                    let step = session.poll(BotEvent::OutIdle, work, devs);
-                    if let BotStep::Done(r) = step {
+                    let step = session.poll(SessionEvent::OutIdle, work, devs);
+                    if let SessionStep::Done(r) = step {
                         return Some(r);
                     }
                 } else {
@@ -122,18 +122,18 @@ fn serve_once(
             }
             Err(_) => panic!("mock bulk-OUT I/O error"),
         },
-        BotNeed::NeedIn { len } => {
+        SessionNeed::NeedIn { len } => {
             let bytes = session.out_slice(&work[..]);
             assert_eq!(bytes.len(), len);
             io.send_in(bytes).unwrap();
-            let step = session.poll(BotEvent::InSent, work, devs);
-            if let BotStep::Done(r) = step {
+            let step = session.poll(SessionEvent::InSent, work, devs);
+            if let SessionStep::Done(r) = step {
                 return Some(r);
             }
             None
         }
-        BotNeed::Done(BotStepResult::Stalled) => on_stalled(session, io, stalled),
-        BotNeed::Done(r) => Some(r),
+        SessionNeed::Done(BotStepResult::Stalled) => on_stalled(session, io, stalled),
+        SessionNeed::Done(r) => Some(r),
     }
 }
 
@@ -757,7 +757,7 @@ fn control_requests_get_max_lun_and_bot_reset() {
     assert_eq!(reply.sent.lock().unwrap().as_slice(), &[0u8]);
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 31,
             probe: false
         }
@@ -770,7 +770,7 @@ fn control_requests_get_max_lun_and_bot_reset() {
     assert!(acked.acked.load(Ordering::SeqCst), "ack called after reset");
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 31,
             probe: false
         }
@@ -781,7 +781,7 @@ fn control_requests_get_max_lun_and_bot_reset() {
     assert!(serve_ctrl_once(&mut s, &mut gadget));
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 31,
             probe: false
         }
@@ -815,7 +815,7 @@ fn bot_reset_interrupts_data_phase() {
     .is_none());
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 512,
             probe: false
         }
@@ -834,7 +834,7 @@ fn bot_reset_interrupts_data_phase() {
     .is_none());
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 384,
             probe: false
         }
@@ -848,7 +848,7 @@ fn bot_reset_interrupts_data_phase() {
     assert!(acked.acked.load(Ordering::SeqCst));
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 31,
             probe: false
         }
@@ -993,7 +993,7 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
     // Back in Command, ready for the next CBW.
     assert_eq!(
         s.need(),
-        BotNeed::NeedOut {
+        SessionNeed::NeedOut {
             len: 31,
             probe: false
         }

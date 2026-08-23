@@ -56,8 +56,8 @@ use snowdrive_scsi::MIN_DATA_LEN;
 
 #[cfg(target_os = "linux")]
 use snowdrive_scsi::usb::{
-    BotEvent, BotIo, BotIoErr, BotNeed, BotSession, BotStep, BotStepResult, CtrlAck, CtrlReply,
-    CtrlReq, Gadget,
+    BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
+    SessionNeed, SessionStep,
 };
 #[cfg(target_os = "linux")]
 use usb_gadget::function::custom::{
@@ -1465,7 +1465,7 @@ fn serve_bot(
             continue;
         }
         match session.need() {
-            BotNeed::NeedOut { len, probe } => {
+            SessionNeed::NeedOut { len, probe } => {
                 // probe = non-blocking overrun drain (no wait); everything
                 // else bounds the ctrl/stop check latency.
                 let timeout = if probe {
@@ -1479,15 +1479,16 @@ fn serve_bot(
                 let aio_len = round_up_mps(len);
                 match ffs_bot.recv_out(&mut recv[..aio_len], Some(timeout)) {
                     Ok(n) => {
-                        let step = session.poll(BotEvent::OutRecv { data: &recv[..n] }, work, devs);
-                        if let BotStep::Done(r) = step {
+                        let step =
+                            session.poll(SessionEvent::OutRecv { data: &recv[..n] }, work, devs);
+                        if let SessionStep::Done(r) = step {
                             handle_done(r, &mut stalled, ffs_bot)?;
                         }
                     }
                     Err(BotIoErr::WouldBlock) => {
                         if probe {
-                            let step = session.poll(BotEvent::OutIdle, work, devs);
-                            if let BotStep::Done(r) = step {
+                            let step = session.poll(SessionEvent::OutIdle, work, devs);
+                            if let SessionStep::Done(r) = step {
                                 handle_done(r, &mut stalled, ffs_bot)?;
                             }
                         }
@@ -1504,7 +1505,7 @@ fn serve_bot(
                     Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
                 }
             }
-            BotNeed::NeedIn { len } => {
+            SessionNeed::NeedIn { len } => {
                 let data = session.out_slice(&work[..]);
                 if data.len() != len {
                     return Err("internal: out_slice length mismatch".to_string());
@@ -1522,12 +1523,12 @@ fn serve_bot(
                         return Err("unexpected WouldBlock on bulk IN send".to_string());
                     }
                 }
-                let step = session.poll(BotEvent::InSent, work, devs);
-                if let BotStep::Done(r) = step {
+                let step = session.poll(SessionEvent::InSent, work, devs);
+                if let SessionStep::Done(r) = step {
                     handle_done(r, &mut stalled, ffs_bot)?;
                 }
             }
-            BotNeed::Done(r) => handle_done(r, &mut stalled, ffs_bot)?,
+            SessionNeed::Done(r) => handle_done(r, &mut stalled, ffs_bot)?,
         }
     }
 }

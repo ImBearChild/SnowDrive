@@ -109,7 +109,7 @@ impl CDBlockDevice {
     }
 
     /// CHECK CONDITION helper for non-SPC commands (SBC/MMC dispatch).
-    pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome<'static> {
+    pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome {
         self.set_sense(key, asc, 0);
         CommandOutcome::CheckCondition
     }
@@ -127,8 +127,8 @@ impl CDBlockDevice {
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer.
     pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, base_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.base_lba),
+        let (dir, transfer_len, base_byte) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -149,7 +149,7 @@ impl CDBlockDevice {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        let actual = base_lba * u64::from(block_size) + transfer_offset;
+        let actual = base_byte + transfer_offset;
         if self.check_bounds(actual, buf.len()).is_err() {
             self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
             return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
@@ -173,8 +173,8 @@ impl CDBlockDevice {
     /// Write `buf` for the current WRITE transfer (host → device).
     /// This device is read-only; any write is rejected with DATA PROTECT.
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
-        let (dir, transfer_len, _block_size, _base_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+        let (dir, transfer_len, _base_byte) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -208,12 +208,12 @@ impl CDBlockDevice {
     /// set (READ 6/10/12/16, READ CAPACITY 10/16) is handled here; write
     /// commands (WRITE 6/10/12/16, SYNCHRONIZE CACHE) return DATA PROTECT;
     /// unknown MMC opcodes return INVALID COMMAND.
-    pub fn do_cmd<'a>(
+    pub fn do_cmd(
         &mut self,
         cdb: &[u8],
-        data: &'a mut [u8],
+        data: &mut [u8],
         dsl: usize,
-    ) -> Result<CommandOutcome<'a>, Error> {
+    ) -> Result<CommandOutcome, Error> {
         self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
@@ -267,12 +267,7 @@ impl CDBlockDevice {
     }
 
     /// Shared READ(6/10/12/16) handler (2048-byte sectors, backend read).
-    pub(crate) fn read_cmd<'a>(
-        &mut self,
-        lba: u64,
-        count: u32,
-        data: &'a mut [u8],
-    ) -> CommandOutcome<'a> {
+    pub(crate) fn read_cmd(&mut self, lba: u64, count: u32, _data: &mut [u8]) -> CommandOutcome {
         if count == 0 {
             return CommandOutcome::Status;
         }
@@ -286,17 +281,14 @@ impl CDBlockDevice {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         };
         let transfer_len = u64::from(bytes);
+        let base_byte = lba * u64::from(SECTOR_SIZE);
         self.pending = Some(PendingXfer {
-            base_lba: lba,
-            current_lba: lba,
+            base_byte,
             block_size: SECTOR_SIZE,
             dir: XferDir::Out,
             transfer_len,
         });
-        CommandOutcome::DataIn {
-            transfer_len,
-            immediate: &data[0..0],
-        }
+        CommandOutcome::OutXfer { len: transfer_len }
     }
 
     /// LBA range check: `lba + count` must not exceed `max_lba + 1`.
@@ -307,12 +299,12 @@ impl CDBlockDevice {
                 .is_some_and(|end| end <= self.max_lba() + 1)
     }
 
-    pub(crate) fn read_capacity_10_cmd<'a>(
+    pub(crate) fn read_capacity_10_cmd(
         &mut self,
         pmi: bool,
         req_lba: u32,
-        data: &'a mut [u8],
-    ) -> CommandOutcome<'a> {
+        data: &mut [u8],
+    ) -> CommandOutcome {
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
@@ -321,18 +313,15 @@ impl CDBlockDevice {
         buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
         buf[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         data[0..8].copy_from_slice(&buf);
-        CommandOutcome::DataIn {
-            transfer_len: 8,
-            immediate: &data[0..8],
-        }
+        CommandOutcome::OutInline { len: 8 }
     }
 
-    pub(crate) fn read_capacity_16_cmd<'a>(
+    pub(crate) fn read_capacity_16_cmd(
         &mut self,
         sa: u8,
         alloc: u32,
-        data: &'a mut [u8],
-    ) -> CommandOutcome<'a> {
+        data: &mut [u8],
+    ) -> CommandOutcome {
         if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
@@ -342,10 +331,7 @@ impl CDBlockDevice {
         buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         let n = 32.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            immediate: &data[0..n],
-        }
+        CommandOutcome::OutInline { len: n as u64 }
     }
 
     /// READ TOC/PMA/ATIP (0x43) — minimal implementation (MMC-6 §6.25).
@@ -356,7 +342,7 @@ impl CDBlockDevice {
     /// returns just the lead-out descriptor; MSF selects MSF-form addresses
     /// (LBA 0 → 00:02:00); the response is clamped to the allocation length
     /// without shrinking the TOC Data Length field.
-    fn read_toc_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn read_toc_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> CommandOutcome {
         let msf = cdb[1] & 0x02 != 0;
         let format = cdb[2] & 0x0F;
         let track = cdb[6];
@@ -414,10 +400,7 @@ impl CDBlockDevice {
         };
         let n = n.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            immediate: &data[0..n],
-        }
+        CommandOutcome::OutInline { len: n as u64 }
     }
 
     /// Lead-out start LBA: the number of sectors in the image.
@@ -447,7 +430,7 @@ impl CDBlockDevice {
     /// features; RT=10b filters to the Starting Feature Number and higher;
     /// RT=11b is rejected. The response is clamped to the allocation length
     /// without shrinking the Data Length field.
-    fn get_configuration_cmd<'a>(&mut self, cdb: &[u8], data: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn get_configuration_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> CommandOutcome {
         let rt = cdb[1] & 0x03;
         let start = (u16::from(cdb[2]) << 8) | u16::from(cdb[3]);
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
@@ -514,10 +497,7 @@ impl CDBlockDevice {
 
         let n = off.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            immediate: &data[0..n],
-        }
+        CommandOutcome::OutInline { len: n as u64 }
     }
 
     /// Current profile for GET CONFIGURATION: CD-ROM up to 700 MiB, DVD-ROM
@@ -575,12 +555,7 @@ impl SpcDevice for CDBlockDevice {
 }
 
 impl ScsiDevice for CDBlockDevice {
-    fn do_cmd<'a>(
-        &mut self,
-        cdb: &[u8],
-        data: &'a mut [u8],
-        dsl: usize,
-    ) -> Result<CommandOutcome<'a>, Error> {
+    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> Result<CommandOutcome, Error> {
         self.do_cmd(cdb, data, dsl)
     }
 
@@ -604,7 +579,7 @@ impl ScsiDevice for CDBlockDevice {
         DeviceType::Cdrom
     }
 
-    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome<'static> {
+    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome {
         // CDBlock accepts MODE SELECT as no-op.
         CommandOutcome::Status
     }
@@ -717,17 +692,16 @@ mod tests {
     fn do_data_in(dev: &mut CDBlockDevice, cdb: &[u8], work: &mut [u8], buf: &mut [u8]) -> usize {
         let outcome = dev.do_cmd(cdb, work, 0).unwrap();
         match outcome {
-            CommandOutcome::DataIn {
-                transfer_len,
-                immediate,
-            } => {
-                assert!(transfer_len as usize <= buf.len());
-                let n = transfer_len as usize;
-                if immediate.is_empty() {
-                    assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
-                } else {
-                    buf[..n].copy_from_slice(&immediate[..n]);
-                }
+            CommandOutcome::OutXfer { len } => {
+                assert!(len as usize <= buf.len());
+                let n = len as usize;
+                assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
+                n
+            }
+            CommandOutcome::OutInline { len } => {
+                assert!(len as usize <= buf.len());
+                let n = len as usize;
+                buf[..n].copy_from_slice(&work[..n]);
                 n
             }
             _ => panic!("expected DataIn"),
@@ -735,7 +709,7 @@ mod tests {
     }
 
     /// Check condition sense from a do_cmd dispatch.
-    fn check_condition(dev: &CDBlockDevice, outcome: CommandOutcome<'_>) -> (SenseKey, u8) {
+    fn check_condition(dev: &CDBlockDevice, outcome: CommandOutcome) -> (SenseKey, u8) {
         match outcome {
             CommandOutcome::CheckCondition => {
                 let s = dev.peek_sense().expect("sense should be set");
@@ -788,7 +762,7 @@ mod tests {
         cdb[8] = 1;
         let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
         match outcome {
-            CommandOutcome::DataIn { transfer_len, .. } => assert_eq!(transfer_len, 2048),
+            CommandOutcome::OutXfer { len } => assert_eq!(len, 2048),
             _ => panic!("expected DataIn"),
         }
         let mut big = [0u8; 4096];

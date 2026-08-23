@@ -183,15 +183,13 @@ pub trait SpcDevice {
 }
 
 /// Execute one parsed SPC command against `dev`. Synthesized responses are
-/// written into `data[0..]` and borrowed back via
-/// [`CommandOutcome::DataIn`]. `_dsl` is reserved for the incoming data
-/// segment length (unused by the current SPC command set).
-pub fn execute_spc<'a, D: SpcDevice>(
+/// written into `data[0..]` and returned as [`CommandOutcome::OutInline`].
+pub fn execute_spc<D: SpcDevice>(
     dev: &mut D,
     cmd: SpcCommand,
-    data: &'a mut [u8],
-    dsl: usize,
-) -> CommandOutcome<'a> {
+    data: &mut [u8],
+    _dsl: usize,
+) -> CommandOutcome {
     match cmd {
         SpcCommand::TestUnitReady => CommandOutcome::Status,
 
@@ -202,10 +200,7 @@ pub fn execute_spc<'a, D: SpcDevice>(
             let n = n.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
             *dev.sense_mut() = Sense::clear();
-            CommandOutcome::DataIn {
-                transfer_len: n as u64,
-                immediate: &data[0..n],
-            }
+            CommandOutcome::OutInline { len: n as u64 }
         }
 
         SpcCommand::Inquiry { evpd, page, alloc } => inquiry(dev, evpd, page, alloc, data),
@@ -234,10 +229,7 @@ pub fn execute_spc<'a, D: SpcDevice>(
             buf[header_len..total].copy_from_slice(page_bytes);
             let n = total.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
-            CommandOutcome::DataIn {
-                transfer_len: n as u64,
-                immediate: &data[0..n],
-            }
+            CommandOutcome::OutInline { len: n as u64 }
         }
 
         SpcCommand::ModeSelect { long: _, alloc } => {
@@ -245,14 +237,9 @@ pub fn execute_spc<'a, D: SpcDevice>(
                 return CommandOutcome::Status;
             }
             let expected = alloc as usize;
-            let imm = dsl.min(expected).min(data.len());
-            if imm < expected {
-                return CommandOutcome::ParamOut {
-                    expected_len: expected,
-                    immediate: &data[..imm],
-                };
+            CommandOutcome::InParam {
+                expected_len: expected,
             }
-            CommandOutcome::Status
         }
 
         SpcCommand::PreventAllow { prevent } => {
@@ -289,22 +276,19 @@ pub fn execute_spc<'a, D: SpcDevice>(
         SpcCommand::ReceiveDiagnosticResults { alloc } => {
             let n = 4.min(alloc as usize);
             data[0..n].fill(0);
-            CommandOutcome::DataIn {
-                transfer_len: n as u64,
-                immediate: &data[0..n],
-            }
+            CommandOutcome::OutInline { len: n as u64 }
         }
     }
 }
 
 /// INQUIRY handler: standard data and VPD pages 0x00/0x80/0x83 (SPC-4 §6.4).
-fn inquiry<'a, D: SpcDevice>(
+fn inquiry<D: SpcDevice>(
     dev: &mut D,
     evpd: bool,
     page: u8,
     alloc: u16,
-    data: &'a mut [u8],
-) -> CommandOutcome<'a> {
+    data: &mut [u8],
+) -> CommandOutcome {
     if evpd {
         let data_out: &[u8] = match page {
             0x00 => {
@@ -342,10 +326,7 @@ fn inquiry<'a, D: SpcDevice>(
             _ => return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD),
         };
         let n = data_out.len().min(alloc as usize);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            immediate: &data[0..n],
-        }
+        CommandOutcome::OutInline { len: n as u64 }
     } else {
         if page != 0 {
             return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -370,20 +351,17 @@ fn inquiry<'a, D: SpcDevice>(
         }
         let n = INQUIRY_STD_LEN.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::DataIn {
-            transfer_len: n as u64,
-            immediate: &data[0..n],
-        }
+        CommandOutcome::OutInline { len: n as u64 }
     }
 }
 
 /// Set sense and return CHECK CONDITION (ASCQ 0).
-fn cc<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8) -> CommandOutcome<'a> {
+fn cc<D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8) -> CommandOutcome {
     cc_q(dev, key, asc, 0)
 }
 
 /// Set sense with an explicit ASCQ and return CHECK CONDITION.
-fn cc_q<'a, D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8, ascq: u8) -> CommandOutcome<'a> {
+fn cc_q<D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8, ascq: u8) -> CommandOutcome {
     let s = Sense::new(key, asc, ascq);
     *dev.sense_mut() = s;
     CommandOutcome::CheckCondition
@@ -458,29 +436,25 @@ mod tests {
     }
 
     /// Extract the DataIn payload, returning the number of bytes transferred.
-    fn data_in(outcome: CommandOutcome<'_>, buf: &mut [u8]) -> usize {
+    fn data_in(outcome: CommandOutcome, work: &[u8], buf: &mut [u8]) -> usize {
         match outcome {
-            CommandOutcome::DataIn {
-                transfer_len,
-                immediate,
-                ..
-            } => {
-                assert!(transfer_len as usize <= buf.len());
-                let n = transfer_len as usize;
-                buf[..n].copy_from_slice(&immediate[..n]);
+            CommandOutcome::OutInline { len } => {
+                assert!(len as usize <= buf.len());
+                let n = len as usize;
+                buf[..n].copy_from_slice(&work[..n]);
                 n
             }
-            _ => panic!("expected DataIn"),
+            _ => panic!("expected OutInline"),
         }
     }
 
-    fn run<'a>(dev: &mut TestDev, cdb: &[u8], work: &'a mut [u8]) -> CommandOutcome<'a> {
+    fn run(dev: &mut TestDev, cdb: &[u8], work: &mut [u8]) -> CommandOutcome {
         execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
     }
 
     /// Run a command that yields Status or CheckCondition (no borrowed
-    /// payload) and return a `'static` copy of the outcome.
-    fn run_static(dev: &mut TestDev, cdb: &[u8]) -> CommandOutcome<'static> {
+    /// payload) and return a copy of the outcome.
+    fn run_static(dev: &mut TestDev, cdb: &[u8]) -> CommandOutcome {
         let mut w = work();
         match run(dev, cdb, &mut w) {
             CommandOutcome::Status => CommandOutcome::Status,
@@ -492,7 +466,8 @@ mod tests {
     /// Run a DataIn command and copy the payload into `buf`.
     fn run_data(dev: &mut TestDev, cdb: &[u8], buf: &mut [u8]) -> usize {
         let mut w = work();
-        data_in(run(dev, cdb, &mut w), buf)
+        let outcome = run(dev, cdb, &mut w);
+        data_in(outcome, &w, buf)
     }
 
     #[test]

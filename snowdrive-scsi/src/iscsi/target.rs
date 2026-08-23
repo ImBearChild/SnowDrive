@@ -1,10 +1,10 @@
 //! iSCSI target protocol state machine (RFC 3720 §5 / §10).
 //!
-//! [`Session`] is a pure, non-blocking protocol state machine: it never
+//! [`IscsiSession`] is a pure, non-blocking protocol state machine: it never
 //! blocks and never touches platform I/O.  A driver feeds one
-//! [`IscsiEvent::PduReceived`] per [`Session::poll`] call and learns the
-//! next need from the returned [`IscsiStep`].  The blocking
-//! [`Session::step`] wrapper drives the same state machine over a `Conn`.
+//! [`SessionEvent::PduReceived`] per [`IscsiSession::poll`] call and learns the
+//! next need from the returned [`SessionStep`].  The blocking
+//! [`IscsiSession::step`] wrapper drives the same state machine over a `Conn`.
 //!
 //! Key fixes over the legacy C implementation: CID read at
 //! byte 20-21 (from iscsi_pdu), Data-Out ITT/TTT/BufferOffset/DataSN
@@ -26,20 +26,20 @@ use crate::scsi::scsi::{asc, opcode_from_cdb, opcode_name, Sense, SenseKey};
 
 // ── Public types ─────────────────────────────────────────────────────
 
-/// One event fed from the driver to [`Session::poll`].
+/// One event fed from the driver to [`IscsiSession::poll`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IscsiEvent {
+pub enum SessionEvent {
     /// A complete iSCSI PDU has been received into the work buffer.
     /// `dsl` is the data-segment length (from the BHS header).
     PduReceived { dsl: u32 },
 }
 
-/// The core's next need, returned by [`Session::poll`].
+/// The core's next need, returned by [`IscsiSession::poll`].
 ///
 /// `NeedSend` borrows the work buffer; the driver must consume (send) the
 /// slice before calling `poll` again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IscsiStep<'a> {
+pub enum SessionStep<'a> {
     /// Receive the next complete PDU from the wire into the work buffer.
     NeedRecv,
     /// Send `data` to the wire (a complete PDU: BHS + optional data +
@@ -52,7 +52,7 @@ pub enum IscsiStep<'a> {
     Error(TargetError),
 }
 
-/// Result of one [`Session::step`] call.
+/// Result of one [`IscsiSession::step`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResult {
     /// A PDU was consumed but nothing was sent (out-of-window CmdSN, §3.2.2.1).
@@ -262,7 +262,7 @@ const SKIP_KEYS: &[&str] = &[
 ///
 /// `cmd_sn` is the last consumed CmdSN; non-immediate commands are accepted
 /// only when `CmdSN == cmd_sn + 1` (queue depth 1, MaxCmdSN = ExpCmdSN).
-pub struct Session {
+pub struct IscsiSession {
     cmd_sn: u32,
     stat_sn: Cell<u32>,
     stage: LoginStage,
@@ -324,13 +324,13 @@ enum IscsiState {
     Closed,
 }
 
-impl Default for Session {
+impl Default for IscsiSession {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Session {
+impl IscsiSession {
     /// Create a session in the default (pre-login) state.
     pub fn new() -> Self {
         crate::info!("new iSCSI session");
@@ -359,17 +359,17 @@ impl Session {
     /// it is the CDB/Data-In/Data-Out staging area.
     pub fn poll<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: IscsiEvent,
+        ev: SessionEvent,
         work: &'a mut [u8],
         devs: &mut [D],
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         match self.state {
             IscsiState::RecvPdu => self.poll_recv(ev, work, devs),
             IscsiState::DataIn { .. } => self.poll_data_in(work, devs),
             IscsiState::R2tSend { .. } => self.poll_r2t_send(work),
             IscsiState::R2tCollect { .. } => self.poll_r2t_collect(ev, work, devs),
             IscsiState::ParamCollect { .. } => self.poll_param_collect(ev, work, devs),
-            IscsiState::Closed => IscsiStep::Closed,
+            IscsiState::Closed => SessionStep::Closed,
         }
     }
 
@@ -394,9 +394,9 @@ impl Session {
         // Phase 1: receive and process the first PDU.
         match recv_pdu(conn, work) {
             Ok(dsl) => {
-                let r = self.poll(IscsiEvent::PduReceived { dsl }, work, devs);
+                let r = self.poll(SessionEvent::PduReceived { dsl }, work, devs);
                 match r {
-                    IscsiStep::NeedSend(data) => {
+                    SessionStep::NeedSend(data) => {
                         let len = data.len();
 
                         let _ = r;
@@ -410,9 +410,9 @@ impl Session {
                             self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
                         }
                     }
-                    IscsiStep::NeedRecv => return StepResult::Idle,
-                    IscsiStep::Closed => return StepResult::Closed,
-                    IscsiStep::Error(e) => return StepResult::Error(e),
+                    SessionStep::NeedRecv => return StepResult::Idle,
+                    SessionStep::Closed => return StepResult::Closed,
+                    SessionStep::Error(e) => return StepResult::Error(e),
                 }
             }
             Err(()) => return StepResult::Closed,
@@ -452,7 +452,7 @@ impl Session {
                                         status::CHECK_CONDITION,
                                         sense.as_ref(),
                                     );
-                                    if let IscsiStep::NeedSend(data) = r {
+                                    if let SessionStep::NeedSend(data) = r {
                                         let l = data.len();
                                         let _ = r;
                                         let _ = write_all(conn, &work[..l]);
@@ -493,8 +493,8 @@ impl Session {
                 }
                 // R2tSend: build R2T (no StatSN advance; only final response advances).
                 IscsiState::R2tSend { .. } => {
-                    let r = self.poll(IscsiEvent::PduReceived { dsl: 0 }, work, devs);
-                    if let IscsiStep::NeedSend(data) = r {
+                    let r = self.poll(SessionEvent::PduReceived { dsl: 0 }, work, devs);
+                    if let SessionStep::NeedSend(data) = r {
                         let len = data.len();
                         let _ = r;
                         if write_all(conn, &work[..len]).is_err() {
@@ -507,9 +507,9 @@ impl Session {
                 IscsiState::R2tCollect { .. } | IscsiState::ParamCollect { .. } => {
                     match recv_pdu(conn, work) {
                         Ok(dsl) => {
-                            let r = self.poll(IscsiEvent::PduReceived { dsl }, work, devs);
+                            let r = self.poll(SessionEvent::PduReceived { dsl }, work, devs);
                             match r {
-                                IscsiStep::NeedSend(data) => {
+                                SessionStep::NeedSend(data) => {
                                     let len = data.len();
                                     let _ = r;
                                     if write_all(conn, &work[..len]).is_err() {
@@ -517,9 +517,9 @@ impl Session {
                                     }
                                     self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
                                 }
-                                IscsiStep::NeedRecv => continue,
-                                IscsiStep::Closed => return StepResult::Closed,
-                                IscsiStep::Error(e) => return StepResult::Error(e),
+                                SessionStep::NeedRecv => continue,
+                                SessionStep::Closed => return StepResult::Closed,
+                                SessionStep::Error(e) => return StepResult::Error(e),
                             }
                         }
                         Err(()) => return StepResult::Closed,
@@ -538,17 +538,17 @@ impl Session {
 
     fn poll_recv<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: IscsiEvent,
+        ev: SessionEvent,
         work: &'a mut [u8],
         devs: &mut [D],
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         // Validate work buffer up front (same as the old step()).
         if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-            return IscsiStep::Error(TargetError::WorkBufTooSmall);
+            return SessionStep::Error(TargetError::WorkBufTooSmall);
         }
 
         match ev {
-            IscsiEvent::PduReceived { dsl } => {
+            SessionEvent::PduReceived { dsl } => {
                 let pdu = Pdu {
                     bhs: Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap()),
                     dsl: dsl as usize,
@@ -592,7 +592,7 @@ impl Session {
         &'a mut self,
         work: &'a mut [u8],
         devs: &mut [D],
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::DataIn {
             transfer_len,
@@ -634,10 +634,10 @@ impl Session {
             chunk: next,
             lun,
         };
-        IscsiStep::NeedSend(&work[..BHS_SIZE + next])
+        SessionStep::NeedSend(&work[..BHS_SIZE + next])
     }
 
-    fn poll_r2t_send<'a>(&'a mut self, work: &'a mut [u8]) -> IscsiStep<'a> {
+    fn poll_r2t_send<'a>(&'a mut self, work: &'a mut [u8]) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::R2tSend {
             itt,
@@ -678,15 +678,15 @@ impl Session {
             burst_remaining: burst,
             lun,
         };
-        IscsiStep::NeedSend(&work[..BHS_SIZE])
+        SessionStep::NeedSend(&work[..BHS_SIZE])
     }
 
     fn poll_r2t_collect<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: IscsiEvent,
+        ev: SessionEvent,
         work: &'a mut [u8],
         devs: &mut [D],
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::R2tCollect {
             itt,
@@ -702,7 +702,7 @@ impl Session {
             unreachable!()
         };
 
-        let IscsiEvent::PduReceived { dsl } = ev;
+        let SessionEvent::PduReceived { dsl } = ev;
         let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
         let pdu_dsl = dsl as usize;
 
@@ -781,15 +781,15 @@ impl Session {
             burst_remaining,
             lun,
         };
-        IscsiStep::NeedRecv
+        SessionStep::NeedRecv
     }
 
     fn poll_param_collect<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: IscsiEvent,
+        ev: SessionEvent,
         work: &'a mut [u8],
         devs: &mut [D],
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::ParamCollect {
             itt,
@@ -808,7 +808,7 @@ impl Session {
             unreachable!()
         };
 
-        let IscsiEvent::PduReceived { dsl } = ev;
+        let SessionEvent::PduReceived { dsl } = ev;
         let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
         let pdu_dsl = dsl as usize;
 
@@ -903,7 +903,7 @@ impl Session {
             acc_offset,
             lun,
         };
-        IscsiStep::NeedRecv
+        SessionStep::NeedRecv
     }
 
     /// Build and send a ParamOut R2T PDU.
@@ -913,7 +913,7 @@ impl Session {
         itt: u32,
         buffer_offset: u64,
         r2t_sn: u32,
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::ParamCollect {
             expected, received, ..
@@ -942,12 +942,12 @@ impl Session {
         {
             *burst_remaining = burst;
         }
-        IscsiStep::NeedSend(&work[..BHS_SIZE])
+        SessionStep::NeedSend(&work[..BHS_SIZE])
     }
 
     // ── Login Phase ───────────────────────────────────────────────
 
-    fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
+    fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let req = &pdu.bhs;
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
@@ -1019,7 +1019,7 @@ impl Session {
         } else {
             self.stage = LoginStage::from_csg(req_csg).unwrap_or(LoginStage::Security);
         }
-        IscsiStep::NeedSend(&work[..total + pad])
+        SessionStep::NeedSend(&work[..total + pad])
     }
 
     /// Parse initiator key=value text into a response, updating negotiated
@@ -1114,12 +1114,12 @@ impl Session {
         work: &'a mut [u8],
         devs: &mut [D],
         pdu: &Pdu,
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return IscsiStep::NeedRecv;
+            return SessionStep::NeedRecv;
         }
         self.cmd_sn = recv_cmd_sn;
 
@@ -1161,8 +1161,9 @@ impl Session {
         let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..], pdu.dsl) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
-                return IscsiStep::Error(TargetError::WorkBufTooSmall)
+                return SessionStep::Error(TargetError::WorkBufTooSmall)
             }
+            Err(_) => return SessionStep::Error(TargetError::Internal),
         };
 
         match outcome {
@@ -1188,78 +1189,71 @@ impl Session {
                 }
                 self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref())
             }
-            CommandOutcome::DataIn {
-                transfer_len,
-                immediate,
-            } => {
-                if !immediate.is_empty() {
-                    let n = immediate.len();
-                    crate::debug!("  -> DataIn (synthesized, {} bytes)", n);
-                    self.send_data_in_final(work, itt, n, 0, 0, status::GOOD)
-                } else {
-                    crate::debug!("  -> DataIn (backend, transfer_len={})", transfer_len);
-                    let chunk = (transfer_len as usize).min(work.len() - BHS_SIZE);
-                    if lun < devs.len() {
-                        let dev = &mut devs[lun];
-                        match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
-                            XferOutcome::Ok => {}
-                            XferOutcome::Error(_) => {
-                                let sense = dev.take_sense();
-                                return self.send_scsi_response(
-                                    work,
-                                    itt,
-                                    status::CHECK_CONDITION,
-                                    sense.as_ref(),
-                                );
-                            }
+            CommandOutcome::OutInline { len } => {
+                crate::debug!("  -> OutInline (synthesized, {} bytes)", len);
+                let n = len as usize;
+                self.send_data_in_final(work, itt, n, 0, 0, status::GOOD)
+            }
+            CommandOutcome::OutXfer { len: transfer_len } => {
+                crate::debug!("  -> OutXfer (backend, transfer_len={})", transfer_len);
+                let chunk = (transfer_len as usize).min(work.len() - BHS_SIZE);
+                if lun < devs.len() {
+                    let dev = &mut devs[lun];
+                    match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
+                        XferOutcome::Ok => {}
+                        XferOutcome::Error(_) => {
+                            let sense = dev.take_sense();
+                            return self.send_scsi_response(
+                                work,
+                                itt,
+                                status::CHECK_CONDITION,
+                                sense.as_ref(),
+                            );
                         }
                     }
-                    if chunk as u64 == transfer_len {
-                        // All data fits in one chunk — send as final Data-In (F+S).
-                        let mut dib = Bhs::new();
-                        dib.set_opcode(op::SCSI_DATA_IN);
-                        dib.set_itt(itt);
-                        dib.set_flags(flag::F_BIT | flag::S_BIT);
-                        dib.set_status(status::GOOD);
-                        dib.set_stat_sn(self.stat_sn.get());
-                        dib.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
-                        dib.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-                        dib.set_data_segment_len(chunk as u32);
-                        work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
-                        self.state = IscsiState::RecvPdu;
-                    } else {
-                        // Multi-chunk: first chunk is intermediate (F=0, S=0).
-                        let mut dib = Bhs::new();
-                        dib.set_opcode(op::SCSI_DATA_IN);
-                        dib.set_itt(itt);
-                        dib.set_data_segment_len(chunk as u32);
-                        work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
-                        self.state = IscsiState::DataIn {
-                            transfer_len,
-                            sent: chunk as u64,
-                            itt,
-                            chunk,
-                            lun,
-                        };
-                    }
-                    IscsiStep::NeedSend(&work[..BHS_SIZE + chunk])
                 }
+                if chunk as u64 == transfer_len {
+                    // All data fits in one chunk — send as final Data-In (F+S).
+                    let mut dib = Bhs::new();
+                    dib.set_opcode(op::SCSI_DATA_IN);
+                    dib.set_itt(itt);
+                    dib.set_flags(flag::F_BIT | flag::S_BIT);
+                    dib.set_status(status::GOOD);
+                    dib.set_stat_sn(self.stat_sn.get());
+                    dib.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+                    dib.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+                    dib.set_data_segment_len(chunk as u32);
+                    work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
+                    self.state = IscsiState::RecvPdu;
+                } else {
+                    // Multi-chunk: first chunk is intermediate (F=0, S=0).
+                    let mut dib = Bhs::new();
+                    dib.set_opcode(op::SCSI_DATA_IN);
+                    dib.set_itt(itt);
+                    dib.set_data_segment_len(chunk as u32);
+                    work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
+                    self.state = IscsiState::DataIn {
+                        transfer_len,
+                        sent: chunk as u64,
+                        itt,
+                        chunk,
+                        lun,
+                    };
+                }
+                SessionStep::NeedSend(&work[..BHS_SIZE + chunk])
             }
-            CommandOutcome::DataOut {
-                transfer_len,
-                immediate,
-            } => {
-                // Consume the immediate data first (write to backend), then
-                // drive R2T/Data-Out.
-                let received = immediate.len() as u64;
+            CommandOutcome::InXfer { len: transfer_len } => {
+                // Host→device write: consume immediate data already in work.
+                let received = (pdu.dsl as u64).min(transfer_len);
                 crate::debug!(
-                    "  -> DataOut transfer_len={} immediate={}",
+                    "  -> InXfer transfer_len={} immediate={}",
                     transfer_len,
                     received
                 );
                 if received > 0 && lun < devs.len() {
                     let dev = &mut devs[lun];
-                    match dev.xfer_in(0, immediate) {
+                    let imm = &work[BHS_SIZE..BHS_SIZE + received as usize];
+                    match dev.xfer_in(0, imm) {
                         XferOutcome::Ok => {}
                         XferOutcome::Error(_) => {
                             let sense = dev.take_sense();
@@ -1287,21 +1281,18 @@ impl Session {
                 };
                 self.poll_r2t_send(work)
             }
-            CommandOutcome::ParamOut {
-                expected_len,
-                immediate,
-            } => {
+            CommandOutcome::InParam { expected_len } => {
                 let expected = expected_len as u64;
-                let received = immediate.len() as u64;
-                crate::debug!("  -> ParamOut expected={} immediate={}", expected, received);
+                let received = (pdu.dsl as u64).min(expected);
+                crate::debug!("  -> InParam expected={} immediate={}", expected, received);
                 if expected > 0 && !w_bit {
                     return self.reject(work, reject::PROTOCOL_ERROR, bhs);
                 }
-                if received > expected {
+                if (pdu.dsl as u64) > expected {
                     return self.reject(work, reject::PROTOCOL_ERROR, bhs);
                 }
                 if expected as usize > work.len() - BHS_SIZE {
-                    return IscsiStep::Error(TargetError::WorkBufTooSmall);
+                    return SessionStep::Error(TargetError::WorkBufTooSmall);
                 }
 
                 let mut cdb_buf = [0u8; 16];
@@ -1377,14 +1368,14 @@ impl Session {
         work: &'a mut [u8],
         itt: u32,
         num_luns: usize,
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         let list_len = u32::try_from(num_luns)
             .ok()
             .and_then(|n| n.checked_mul(8))
             .unwrap_or(u32::MAX);
         let total = 8usize + (list_len as usize);
         if total > work.len() - BHS_SIZE {
-            return IscsiStep::Error(TargetError::WorkBufTooSmall);
+            return SessionStep::Error(TargetError::WorkBufTooSmall);
         }
         work[BHS_SIZE..BHS_SIZE + 4].copy_from_slice(&list_len.to_be_bytes());
         for b in &mut work[BHS_SIZE + 4..BHS_SIZE + 8] {
@@ -1404,13 +1395,13 @@ impl Session {
 
     // ── Full Feature: Task Management / NOP / Logout ─────────────
 
-    fn handle_tmf<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
+    fn handle_tmf<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
 
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return IscsiStep::NeedRecv;
+            return SessionStep::NeedRecv;
         }
         self.cmd_sn = recv_cmd_sn;
 
@@ -1431,10 +1422,10 @@ impl Session {
         work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
-        IscsiStep::NeedSend(&work[..BHS_SIZE + pad])
+        SessionStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
-    fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
+    fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
         let mut resp = Bhs::new();
         resp.set_opcode(op::NOP_IN);
@@ -1454,10 +1445,10 @@ impl Session {
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
-        IscsiStep::NeedSend(&work[..total + pad])
+        SessionStep::NeedSend(&work[..total + pad])
     }
 
-    fn handle_logout<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> IscsiStep<'a> {
+    fn handle_logout<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
         let mut resp = Bhs::new();
         resp.set_opcode(op::LOGOUT_RESP);
@@ -1470,7 +1461,7 @@ impl Session {
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
         self.state = IscsiState::Closed;
-        IscsiStep::NeedSend(&work[..BHS_SIZE + pad])
+        SessionStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
     // ── Response PDU builders ─────────────────────────────────────
@@ -1481,7 +1472,7 @@ impl Session {
         itt: u32,
         scsi_status: u8,
         sense: Option<&Sense>,
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_RESP);
@@ -1505,7 +1496,7 @@ impl Session {
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
-        IscsiStep::NeedSend(&work[..total + pad])
+        SessionStep::NeedSend(&work[..total + pad])
     }
 
     /// Single final Data-In (F=1, S=1) with status — used for synthesized
@@ -1518,7 +1509,7 @@ impl Session {
         buffer_offset: u32,
         data_sn: u32,
         scsi_status: u8,
-    ) -> IscsiStep<'a> {
+    ) -> SessionStep<'a> {
         self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
@@ -1535,12 +1526,12 @@ impl Session {
         let total = BHS_SIZE + data_len;
         let pad = pdu_pad_len(data_len as u32) as usize;
         work[total..total + pad].fill(0);
-        IscsiStep::NeedSend(&work[..total + pad])
+        SessionStep::NeedSend(&work[..total + pad])
     }
 
     /// Send a Reject and close the connection.  The data segment carries
     /// the full header of the rejected PDU; ITT = 0xffffffff (fix #18).
-    fn reject<'a>(&'a mut self, work: &'a mut [u8], reason: u8, rejected: &Bhs) -> IscsiStep<'a> {
+    fn reject<'a>(&'a mut self, work: &'a mut [u8], reason: u8, rejected: &Bhs) -> SessionStep<'a> {
         crate::warn!(
             "rejecting {} (0x{:02X}) reason={} (0x{:02X})",
             iscsi_opcode_name(rejected.opcode()),
@@ -1563,7 +1554,7 @@ impl Session {
         let pad = pdu_pad_len(BHS_SIZE as u32) as usize;
         work[total..total + pad].fill(0);
         self.state = IscsiState::Closed;
-        IscsiStep::NeedSend(&work[..total + pad])
+        SessionStep::NeedSend(&work[..total + pad])
     }
 }
 
@@ -1574,7 +1565,7 @@ impl Session {
 pub fn serve_conn<C: Conn, D: ScsiDevice>(
     conn: &mut C,
     work: &mut [u8],
-    session: &mut Session,
+    session: &mut IscsiSession,
     devs: &mut [D],
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
@@ -1757,7 +1748,7 @@ mod tests {
                 BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
                     .unwrap(),
             ];
-        let mut session = Session::new();
+        let mut session = IscsiSession::new();
         let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
 
         // Build a Login Request BHS (I=1, T=1, CSG=1, NSG=3).
@@ -1776,13 +1767,13 @@ mod tests {
 
         // Poll: should get NeedSend (Login Response).
         match session.poll(
-            IscsiEvent::PduReceived {
+            SessionEvent::PduReceived {
                 dsl: login_text.len() as u32,
             },
             &mut work,
             &mut devs,
         ) {
-            IscsiStep::NeedSend(data) => {
+            SessionStep::NeedSend(data) => {
                 assert!(data.len() >= BHS_SIZE);
                 let resp_op = data[0] & 0x3F;
                 assert_eq!(resp_op, op::LOGIN_RESP);
@@ -1807,8 +1798,8 @@ mod tests {
         work[..48].copy_from_slice(&scsi_bhs);
         work[48..].fill(0);
 
-        match session.poll(IscsiEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
-            IscsiStep::NeedSend(data) => {
+        match session.poll(SessionEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            SessionStep::NeedSend(data) => {
                 assert!(data.len() > BHS_SIZE);
                 // First byte of INQUIRY response: PDT = 0x00 (direct access).
                 assert_eq!(data[BHS_SIZE] & 0x1F, 0x00);
@@ -1828,7 +1819,7 @@ mod tests {
                 BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
                     .unwrap(),
             ];
-        let mut session = Session::new();
+        let mut session = IscsiSession::new();
         let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
 
         // Login first.
@@ -1843,7 +1834,7 @@ mod tests {
         work[..48].copy_from_slice(&login_bhs);
         work[48..48 + login_text.len()].copy_from_slice(login_text);
         let _ = session.poll(
-            IscsiEvent::PduReceived {
+            SessionEvent::PduReceived {
                 dsl: login_text.len() as u32,
             },
             &mut work,
@@ -1857,8 +1848,8 @@ mod tests {
         scsi_bhs[4] = 1; // TotalAHSLength = 1 → invalid
         work[..48].copy_from_slice(&scsi_bhs);
 
-        match session.poll(IscsiEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
-            IscsiStep::NeedSend(data) => {
+        match session.poll(SessionEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            SessionStep::NeedSend(data) => {
                 assert_eq!(data[0] & 0x3F, op::REJECT);
                 assert_eq!(session.stage(), LoginStage::FullFeature);
             }

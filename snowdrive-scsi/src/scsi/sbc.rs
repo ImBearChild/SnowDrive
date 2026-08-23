@@ -133,12 +133,12 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
 
 /// Execute one parsed SBC command against `dev` (SPC commands never reach
 /// here — `do_cmd` dispatches `SbcCommand::Spc` to `execute_spc`).
-pub(crate) fn execute_sbc<'a, B: BlockStorage>(
+pub(crate) fn execute_sbc<B: BlockStorage>(
     dev: &mut BlockDevice<B>,
     cmd: SbcCommand,
-    data: &'a mut [u8],
+    data: &mut [u8],
     dsl: usize,
-) -> CommandOutcome<'a> {
+) -> CommandOutcome {
     match cmd {
         SbcCommand::Read6 { lba, count } => {
             dev.read_cmd(dev.max_lba(), u64::from(lba), count, data)
