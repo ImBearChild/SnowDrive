@@ -1158,7 +1158,7 @@ impl IscsiSession {
         );
 
         let dev = &mut devs[lun];
-        let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..], pdu.dsl) {
+        let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..]) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
                 return SessionStep::Error(TargetError::WorkBufTooSmall)
@@ -1733,7 +1733,7 @@ fn parse_u32(v: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iscsi::pdu::{BHS_SIZE, MAX_DATA_SEGMENT};
+    use crate::iscsi::pdu::BHS_SIZE;
 
     /// Verify poll model round-trips: Login → Full Feature → SCSI INQUIRY
     /// → Logout produces the same logical flow as the old step() model.

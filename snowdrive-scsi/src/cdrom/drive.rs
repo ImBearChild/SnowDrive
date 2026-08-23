@@ -309,7 +309,6 @@ impl<'a> CdromDrive<'a> {
         &mut self,
         cdb: &[u8],
         data: &mut [u8],
-        dsl: usize,
     ) -> Result<CommandOutcome, crate::scsi::device::Error> {
         if data.len() < crate::MIN_DATA_LEN {
             return Err(crate::scsi::device::Error::WorkBufTooSmall);
@@ -360,12 +359,12 @@ impl<'a> CdromDrive<'a> {
         {
             return Ok(self.mode_sense_write_params(long, alloc, data));
         }
-        if let Some(SpcCommand::ModeSelect { long, alloc }) = spc {
-            return Ok(self.mode_select_cmd(long, alloc, data, dsl));
+        if let Some(SpcCommand::ModeSelect { alloc, .. }) = spc {
+            return Ok(self.mode_select_cmd(alloc));
         }
 
         let outcome = if let Some(cmd) = spc {
-            execute_spc(self, cmd, data, dsl)
+            execute_spc(self, cmd, data)
         } else {
             let Some(op) = cdb_opcode(cdb) else {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
@@ -374,7 +373,7 @@ impl<'a> CdromDrive<'a> {
                 return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
             }
             match op {
-                op::FORMAT_UNIT => self.format_unit_cmd(cdb, data, dsl),
+                op::FORMAT_UNIT => self.format_unit_cmd(cdb),
                 // ── READ(6/10/12/16) ────────────────────────────
                 op::READ_6 | op::READ_10 | op::READ_12 | op::READ_16 => {
                     let Some((lba, count)) = cdb_read_args(op, cdb) else {
@@ -404,19 +403,14 @@ impl<'a> CdromDrive<'a> {
                             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
                         };
                         let transfer_len = bytes;
-                        let received = dsl.min(data.len()).min(transfer_len as usize);
-                        if received as u64 > transfer_len {
-                            self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
-                        } else {
-                            self.pending = Some(PendingXfer {
-                                base_byte: lba * u64::from(SECTOR_SIZE),
+                        self.pending = Some(PendingXfer {
+                            base_byte: lba * u64::from(SECTOR_SIZE),
 
-                                block_size: SECTOR_SIZE,
-                                dir: XferDir::In,
-                                transfer_len,
-                            });
-                            CommandOutcome::InXfer { len: transfer_len }
-                        }
+                            block_size: SECTOR_SIZE,
+                            dir: XferDir::In,
+                            transfer_len,
+                        });
+                        CommandOutcome::InXfer { len: transfer_len }
                     }
                 }
 
@@ -563,25 +557,18 @@ impl<'a> CdromDrive<'a> {
         CommandOutcome::OutInline { len: n as u64 }
     }
 
-    fn mode_select_cmd(
-        &mut self,
-        long: bool,
-        alloc: u16,
-        data: &mut [u8],
-        dsl: usize,
-    ) -> CommandOutcome {
+    fn mode_select_cmd(&mut self, alloc: u16) -> CommandOutcome {
         let expected = alloc as usize;
         if expected == 0 {
             return CommandOutcome::Status;
         }
-        let imm = dsl.min(expected).min(data.len());
-        if imm < expected {
-            return CommandOutcome::InParam {
-                expected_len: expected,
-            };
+        // The parameter list is validated in `complete_mode_select` (via
+        // `complete_param`) once the transport has collected it. Whether the
+        // list arrived as iSCSI immediate data or is gathered via R2T /
+        // bulk-Data-Out is the transport's concern, not the device's.
+        CommandOutcome::InParam {
+            expected_len: expected,
         }
-        // Full parameter already present (iSCSI Immediate or direct test).
-        self.complete_mode_select(long, alloc, &data[..expected])
     }
 
     fn complete_mode_select(&mut self, long: bool, _alloc: u16, data: &[u8]) -> CommandOutcome {
@@ -614,21 +601,16 @@ impl<'a> CdromDrive<'a> {
         CommandOutcome::Status
     }
 
-    fn format_unit_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> CommandOutcome {
+    fn format_unit_cmd(&mut self, cdb: &[u8]) -> CommandOutcome {
         if self.media.is_none() {
             return self.not_ready();
         }
         if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let expected = 12usize;
-        let imm = dsl.min(expected).min(data.len());
-        if imm < expected {
-            return CommandOutcome::InParam {
-                expected_len: expected,
-            };
-        }
-        self.complete_format_unit(cdb, &data[..expected])
+        // 12-byte parameter list; completion happens in `complete_format_unit`
+        // (via `complete_param`) after the transport collects it.
+        CommandOutcome::InParam { expected_len: 12 }
     }
 
     fn complete_format_unit(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
@@ -1125,9 +1107,8 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
         &mut self,
         cdb: &[u8],
         data: &mut [u8],
-        dsl: usize,
     ) -> Result<CommandOutcome, crate::scsi::device::Error> {
-        self.do_cmd(cdb, data, dsl)
+        self.do_cmd(cdb, data)
     }
 
     fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
@@ -1235,7 +1216,7 @@ mod tests {
     use crate::cdrom::common::CurrentProfile;
     use crate::cdrom::media::FlatMedia;
     use crate::scsi::backend::{BlockBackend, RamBackend};
-    use crate::scsi::device::{XferError, XferOutcome};
+    use crate::scsi::device::{ScsiDevice, XferOutcome};
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
@@ -1318,7 +1299,7 @@ mod tests {
         cdb[0] = op::INQUIRY;
         cdb[4] = 96;
         let mut buf = [0u8; 96];
-        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &w, &mut buf);
+        let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
         assert!(n >= 95);
         assert_eq!(buf[0] & 0x1F, 0x05); // PDT = CD-ROM
         assert_eq!(&buf[8..16], b"SnowSCSI");
@@ -1330,7 +1311,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
@@ -1345,7 +1326,7 @@ mod tests {
         cdb[0] = op::GET_CONFIGURATION;
         cdb[8] = 64;
         let mut buf = [0u8; 64];
-        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &w, &mut buf);
+        let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
         assert!(n >= 8);
         // Empty tray → profile 0000h.
         assert_eq!(buf[6], 0x00);
@@ -1358,7 +1339,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_NOT_PRESENT);
     }
@@ -1372,7 +1353,7 @@ mod tests {
         cdb[2] = 0x2A;
         cdb[4] = 100;
         let mut buf = [0u8; 128];
-        let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &w, &mut buf);
+        let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
         // 4-byte MODE SENSE(6) header + 64-byte 0x2A page.
         assert_eq!(n, 4 + 64);
         assert_eq!(buf[4], 0x2A);
@@ -1391,7 +1372,11 @@ mod tests {
         w[6] = 0x41;
         w[7] = 0xC4;
         assert_eq!(
-            dev.do_cmd(&select, &mut w, 56).unwrap(),
+            dev.do_cmd(&select, &mut w).unwrap(),
+            CommandOutcome::InParam { expected_len: 56 }
+        );
+        assert_eq!(
+            dev.complete_param(&select, &w[..56]),
             CommandOutcome::Status
         );
         assert!(dev.mode_page_05_valid);
@@ -1400,7 +1385,7 @@ mod tests {
         sense[0] = op::MODE_SENSE_6;
         sense[2] = 0x05;
         sense[4] = 60;
-        let outcome = dev.do_cmd(&sense, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&sense, &mut w).unwrap();
         match outcome {
             CommandOutcome::OutInline { len } => {
                 assert_eq!(len, 4 + 52);
@@ -1427,8 +1412,12 @@ mod tests {
         w[2..4].copy_from_slice(&8u16.to_be_bytes());
         w[8] = 0x00; // full format
         w[10..12].copy_from_slice(&2048u16.to_be_bytes());
-        let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::InParam { expected_len: 12 });
+        assert_eq!(
+            dev.complete_param(&cdb, &w[..12]),
+            CommandOutcome::CheckCondition
+        );
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.key, SenseKey::DataProtect);
         assert_eq!(s.asc, asc::WRITE_PROTECTED);
@@ -1446,7 +1435,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.key, SenseKey::UnitAttention);
@@ -1456,7 +1445,7 @@ mod tests {
         assert_eq!(taken.key, SenseKey::UnitAttention);
         assert!(dev.peek_sense().is_none());
         // Next TUR should not be UA again (may be NOT READY if no media).
-        let outcome2 = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome2 = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome2 {
             CommandOutcome::CheckCondition => {
                 let s = dev.peek_sense().unwrap();
@@ -1479,7 +1468,7 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
-        let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let _ = dev.do_cmd(&cdb, &mut w).unwrap();
         // UA should now be cleared via REQUEST SENSE.
         assert!(dev.peek_sense().is_none());
     }
@@ -1496,7 +1485,7 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::INQUIRY;
         cdb[4] = 96;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert!(matches!(outcome, CommandOutcome::OutInline { .. }));
         // UA is NOT cleared by INQUIRY.
         assert!(dev.peek_sense().is_some());
@@ -1509,7 +1498,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 6];
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
@@ -1524,7 +1513,7 @@ mod tests {
 
         // Initially empty tray → NOT READY.
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_NOT_PRESENT);
         // Clear NOT READY sense before proceeding (simulate REQUEST SENSE or autosense)
@@ -1548,7 +1537,7 @@ mod tests {
 
         // TUR → CC(UA 28h/00h).
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         {
             let s = dev.peek_sense().unwrap();
@@ -1559,13 +1548,13 @@ mod tests {
         // REQUEST SENSE still returns the UA sense.
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
-        let outcome_rs = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome_rs = dev.do_cmd(&cdb, &mut w).unwrap();
         assert!(matches!(outcome_rs, CommandOutcome::OutInline { .. }));
         assert!(dev.peek_sense().is_none());
 
         // TUR → GOOD.
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::Status);
 
         // START STOP LoEj=1, Load=0 → eject.
@@ -1576,7 +1565,7 @@ mod tests {
 
         // TUR → CC(UA 28h/00h) then → NOT READY 3Ah/02h.
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         {
             let s = dev.peek_sense().unwrap();
@@ -1586,10 +1575,10 @@ mod tests {
         // REQUEST SENSE → clears UA.
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
-        let _ = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let _ = dev.do_cmd(&cdb, &mut w).unwrap();
         // TUR → NOT READY 3Ah/02h (tray open).
         cdb[0] = op::TEST_UNIT_READY;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
@@ -1607,7 +1596,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.key, SenseKey::UnitAttention);
@@ -1648,8 +1637,12 @@ mod tests {
             w[2..4].copy_from_slice(&8u16.to_be_bytes());
             w[8] = 0x01; // Spare Area Expansion — must be rejected
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
-            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+            assert_eq!(outcome, CommandOutcome::InParam { expected_len: 12 });
+            assert_eq!(
+                dev.complete_param(&cdb, &w[..12]),
+                CommandOutcome::CheckCondition
+            );
             assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
             assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
         }
@@ -1684,8 +1677,12 @@ mod tests {
             w[4..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // non-zero init pattern with IP=0
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
-            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+            assert_eq!(outcome, CommandOutcome::InParam { expected_len: 12 });
+            assert_eq!(
+                dev.complete_param(&cdb, &w[..12]),
+                CommandOutcome::CheckCondition
+            );
             assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
             assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
         }
@@ -1719,7 +1716,7 @@ mod tests {
             cdb[0] = op::WRITE_10;
             cdb[5] = 0;
             cdb[8] = 1;
-            let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             match outcome {
                 CommandOutcome::InXfer { len } => {
                     let mut pat = [0xA5u8; 2048];
@@ -1741,14 +1738,14 @@ mod tests {
             w[2..4].copy_from_slice(&8u16.to_be_bytes());
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
-            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             assert_eq!(outcome, CommandOutcome::Status);
             // Verify data still present (not cleared) via READ + xfer_out
             let mut cdb = [0u8; 10];
             cdb[0] = op::READ_10;
             cdb[5] = 0;
             cdb[8] = 1;
-            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut out = [0u8; 2048];
             let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
             assert_eq!(n, 2048);
@@ -1779,7 +1776,7 @@ mod tests {
                 cdb[0] = op::WRITE_10;
                 cdb[5] = 1; // lba 1
                 cdb[8] = 1;
-                let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+                let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
                 match outcome {
                     CommandOutcome::InXfer { .. } => {
                         let pat = [0x5A; 2048];
@@ -1797,8 +1794,9 @@ mod tests {
             w[2..4].copy_from_slice(&8u16.to_be_bytes());
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
-            let outcome = dev.do_cmd(&cdb, &mut w, 12).unwrap();
-            assert_eq!(outcome, CommandOutcome::Status);
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+            assert_eq!(outcome, CommandOutcome::InParam { expected_len: 12 });
+            assert_eq!(dev.complete_param(&cdb, &w[..12]), CommandOutcome::Status);
             // Consume UA from format (autosense)
             let _ = dev.take_sense();
             // Verify cleared via READ + xfer_out
@@ -1807,7 +1805,7 @@ mod tests {
             cdb[0] = op::READ_10;
             cdb[5] = 1;
             cdb[8] = 1;
-            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut out = [0u8; 2048];
             let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
             assert_eq!(n, 2048);
@@ -1817,7 +1815,7 @@ mod tests {
             cdb[0] = op::READ_10;
             cdb[5] = 16;
             cdb[8] = 1;
-            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut sec = [0u8; 2048];
             let n = data_in_xfer(&mut dev, outcome, &w, &mut sec);
             assert_eq!(n, 2048);
@@ -1849,7 +1847,7 @@ mod tests {
                 cdb[8] = 0x08; // alloc 2048
                 cdb[9] = 0x00;
                 let mut out = [0u8; 4096];
-                let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &w, &mut out);
+                let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut out);
                 assert!(n >= 4, "format {:02X} should succeed", fmt);
                 let len = u16::from_be_bytes([out[0], out[1]]) as usize;
                 if fmt == 0x08 {
@@ -1873,7 +1871,7 @@ mod tests {
                 cdb[0] = op::READ_DVD_STRUCTURE;
                 cdb[7] = fmt;
                 cdb[8] = 0x08;
-                let outcome = dev2.do_cmd(&cdb, &mut w, 0).unwrap();
+                let outcome = dev2.do_cmd(&cdb, &mut w).unwrap();
                 assert_eq!(outcome, CommandOutcome::CheckCondition);
                 assert_eq!(dev2.peek_sense().unwrap().key, SenseKey::IllegalRequest);
             }
@@ -1901,12 +1899,12 @@ mod tests {
             let mut w = work();
             let mut cdb = [0u8; 6];
             cdb[0] = op::TEST_UNIT_READY;
-            assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+            assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
             // READ/WRITE should not return MEDIUM NOT FORMATTED
             let mut cdb10 = [0u8; 10];
             cdb10[0] = op::READ_10;
             cdb10[8] = 0x01;
-            let out = dev.do_cmd(&cdb10, &mut w, 0).unwrap();
+            let out = dev.do_cmd(&cdb10, &mut w).unwrap();
             assert!(matches!(out, CommandOutcome::OutInline { .. }));
             // consume READ via xfer to clear pending for next WRITE
             if let CommandOutcome::OutInline { len } = out {
@@ -1914,7 +1912,7 @@ mod tests {
                 let _ = dev.xfer_out(0, &mut dummy);
             }
             cdb10[0] = op::WRITE_10;
-            let out2 = dev.do_cmd(&cdb10, &mut w, 2048).unwrap();
+            let out2 = dev.do_cmd(&cdb10, &mut w).unwrap();
             assert!(matches!(out2, CommandOutcome::InXfer { .. }));
             // Clear pending for next test by doing xfer_in with dummy
             if let CommandOutcome::InXfer { len } = out2 {
@@ -1930,10 +1928,11 @@ mod tests {
             w2[8] = 0x00;
             w2[10..12].copy_from_slice(&2048u16.to_be_bytes());
             assert_eq!(
-                dev.do_cmd(&cdbf, &mut w2, 12).unwrap(),
-                CommandOutcome::Status
+                dev.do_cmd(&cdbf, &mut w2).unwrap(),
+                CommandOutcome::InParam { expected_len: 12 }
             );
-            let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+            assert_eq!(dev.complete_param(&cdbf, &w2[..12]), CommandOutcome::Status);
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             assert_eq!(outcome, CommandOutcome::CheckCondition);
             let s = dev.peek_sense().unwrap();
             assert_eq!(s.key, SenseKey::UnitAttention);
@@ -1941,8 +1940,8 @@ mod tests {
             let mut cdb_rs = [0u8; 6];
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;
-            let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
-            assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+            let _ = dev.do_cmd(&cdb_rs, &mut w).unwrap();
+            assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
         }
     }
 
@@ -1966,7 +1965,7 @@ mod tests {
                 cdb[0] = op::READ_DISC_INFORMATION;
                 cdb[8] = 0xFF;
                 let mut buf = [0u8; 256];
-                let n = data_in(dev.do_cmd(&cdb, &mut w, 0).unwrap(), &w, &mut buf);
+                let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
                 assert!(n >= 3, "READ DISC INFORMATION returned {n} bytes");
                 // byte 2: erasable(4) | state_of_last_session(3:2) | disc_status(1:0)
                 buf[2] & 0x03
@@ -1994,14 +1993,15 @@ mod tests {
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             assert_eq!(
-                dev.do_cmd(&cdbf, &mut w, 12).unwrap(),
-                CommandOutcome::Status
+                dev.do_cmd(&cdbf, &mut w).unwrap(),
+                CommandOutcome::InParam { expected_len: 12 }
             );
+            assert_eq!(dev.complete_param(&cdbf, &w[..12]), CommandOutcome::Status);
             // Consume UA from format
             let mut cdb_rs = [0u8; 6];
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;
-            let _ = dev.do_cmd(&cdb_rs, &mut w, 0).unwrap();
+            let _ = dev.do_cmd(&cdb_rs, &mut w).unwrap();
             assert_eq!(disc_status(&mut dev), 0, "after FORMAT UNIT: empty");
 
             // 3) Write AVDP at LBA 256 directly via xfer_in
@@ -2028,7 +2028,7 @@ mod tests {
             cdb[4] = 1;
             cdb[5] = 0;
             w[..2048].copy_from_slice(&avdp);
-            let outcome = dev.do_cmd(&cdb, &mut w, 2048).unwrap();
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             match outcome {
                 CommandOutcome::InXfer { .. } => {
                     assert_eq!(dev.xfer_in(0, &avdp), XferOutcome::Ok);

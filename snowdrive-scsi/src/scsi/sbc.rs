@@ -137,29 +137,28 @@ pub(crate) fn execute_sbc<B: BlockStorage>(
     dev: &mut BlockDevice<B>,
     cmd: SbcCommand,
     data: &mut [u8],
-    dsl: usize,
 ) -> CommandOutcome {
     match cmd {
         SbcCommand::Read6 { lba, count } => {
             dev.read_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Write6 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Read10 { lba, count } => {
             dev.read_cmd(dev.max_lba(), u64::from(lba), u32::from(count), data)
         }
         SbcCommand::Write10 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), u32::from(count), data, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), u32::from(count), data)
         }
         SbcCommand::Read12 { lba, count } => {
             dev.read_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Write12 { lba, count } => {
-            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data, dsl)
+            dev.write_cmd(dev.max_lba(), u64::from(lba), count, data)
         }
         SbcCommand::Read16 { lba, count } => dev.read_cmd(dev.max_lba(), lba, count, data),
-        SbcCommand::Write16 { lba, count } => dev.write_cmd(dev.max_lba(), lba, count, data, dsl),
+        SbcCommand::Write16 { lba, count } => dev.write_cmd(dev.max_lba(), lba, count, data),
         SbcCommand::ReadCapacity10 { pmi, lba } => dev.read_capacity_10_cmd(pmi, lba, data),
         SbcCommand::ReadCapacity16 { sa, alloc } => dev.read_capacity_16_cmd(sa, alloc, data),
         SbcCommand::SynchronizeCache => {

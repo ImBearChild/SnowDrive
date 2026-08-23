@@ -184,18 +184,12 @@ impl<B: BlockStorage> BlockDevice<B> {
     }
 
     /// Process one SCSI command (`snowscsi_do_cmd`). `data` must be at
-    /// least [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length of data
-    /// already received into `data[0..dsl]` (immediate data for WRITE).
+    /// least [`crate::MIN_DATA_LEN`] bytes.
     ///
     /// The CDB is parsed by [`parse_sbc`]: SPC commands are dispatched to
     /// [`execute_spc`] (via the `SbcCommand::Spc` fall-through), SBC commands
     /// to [`execute_sbc`]; unknown opcodes yield INVALID COMMAND.
-    pub fn do_cmd(
-        &mut self,
-        cdb: &[u8],
-        data: &mut [u8],
-        dsl: usize,
-    ) -> Result<CommandOutcome, Error> {
+    pub fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
@@ -204,8 +198,8 @@ impl<B: BlockStorage> BlockDevice<B> {
             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
         };
         let outcome = match cmd {
-            SbcCommand::Spc(cmd) => execute_spc(self, cmd, data, dsl),
-            cmd => execute_sbc(self, cmd, data, dsl),
+            SbcCommand::Spc(cmd) => execute_spc(self, cmd, data),
+            cmd => execute_sbc(self, cmd, data),
         };
         Ok(outcome)
     }
@@ -246,7 +240,6 @@ impl<B: BlockStorage> BlockDevice<B> {
         lba: u64,
         count: u32,
         _data: &mut [u8],
-        _dsl: usize,
     ) -> CommandOutcome {
         if count == 0 {
             return CommandOutcome::Status;
@@ -363,8 +356,8 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
 }
 
 impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
-    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> Result<CommandOutcome, Error> {
-        self.do_cmd(cdb, data, dsl)
+    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
+        self.do_cmd(cdb, data)
     }
 
     fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
@@ -510,7 +503,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb10(op::READ_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, [0u8; 512]);
@@ -525,7 +518,7 @@ mod tests {
         w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb10(op::WRITE_10, 10, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
@@ -535,7 +528,7 @@ mod tests {
         }
 
         let cdb = make_cdb10(op::READ_10, 10, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, pattern.as_slice());
@@ -547,7 +540,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb10(op::READ_10, 2048, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
@@ -560,7 +553,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = 0xFF;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_COMMAND);
@@ -573,7 +566,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 8];
         data_in(&mut dev, outcome, &w, &mut buf);
         let max_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -591,7 +584,7 @@ mod tests {
         cdb[0] = op::SERVICE_ACTION_IN;
         cdb[1] = 0x10;
         cdb[13] = 0x20;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 32];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(&buf[..8], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xFF]);
@@ -607,7 +600,7 @@ mod tests {
         let mut cdb = [0u8; 16];
         cdb[0] = op::SERVICE_ACTION_IN;
         cdb[1] = 0xFF;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
@@ -619,7 +612,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb6(op::READ_6, 0, 0); /* 0 = 256 blocks */
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = vec![0u8; 256 * 512];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, vec![0u8; 256 * 512]);
@@ -634,7 +627,7 @@ mod tests {
         w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb6(op::WRITE_6, 5, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
@@ -644,7 +637,7 @@ mod tests {
         }
 
         let cdb = make_cdb6(op::READ_6, 5, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, pattern.as_slice());
@@ -661,7 +654,7 @@ mod tests {
         w[0..1024].copy_from_slice(&pattern);
 
         let cdb = make_cdb12(op::WRITE_12, 20, 2);
-        let outcome = dev.do_cmd(&cdb, &mut w, 1024).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
@@ -671,7 +664,7 @@ mod tests {
         }
 
         let cdb = make_cdb12(op::READ_12, 20, 2);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, pattern.as_slice());
@@ -688,7 +681,7 @@ mod tests {
         w[0..1024].copy_from_slice(&pattern);
 
         let cdb = make_cdb16(op::WRITE_16, 30, 2);
-        let outcome = dev.do_cmd(&cdb, &mut w, 1024).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
@@ -698,7 +691,7 @@ mod tests {
         }
 
         let cdb = make_cdb16(op::READ_16, 30, 2);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, pattern.as_slice());
@@ -710,7 +703,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb6(op::READ_6, 2048, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
@@ -722,7 +715,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb12(op::READ_12, 2048, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
@@ -734,7 +727,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb16(op::READ_16, 2048, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
@@ -747,7 +740,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = op::SYNCHRONIZE_CACHE_10;
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
     }
 
     #[test]
@@ -759,12 +752,12 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::PREVENT_ALLOW;
         cdb[4] = 0x01;
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
 
         let mut cdb = [0u8; 6];
         cdb[0] = op::START_STOP_UNIT;
         cdb[4] = 0x02; /* LoEj=1, Load=0 (eject) */
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::MEDIUM_REMOVAL_PREVENTED);
@@ -776,7 +769,7 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::START_STOP_UNIT;
         cdb[4] = 0x00; /* stop */
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
     }
 
     #[test]
@@ -787,7 +780,7 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::READ_CAPACITY_10;
         cdb[5] = 0x01; /* PMI=0, LBA=1 */
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
@@ -799,7 +792,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut small = [0u8; 100];
         let cdb = make_cdb10(op::READ_10, 0, 1);
-        assert_eq!(dev.do_cmd(&cdb, &mut small, 0), Err(Error::WorkBufTooSmall));
+        assert_eq!(dev.do_cmd(&cdb, &mut small), Err(Error::WorkBufTooSmall));
     }
 
     #[cfg(feature = "std")]
@@ -821,7 +814,7 @@ mod tests {
         w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
@@ -832,7 +825,7 @@ mod tests {
 
         let mut cdb = [0u8; 10];
         cdb[0] = op::SYNCHRONIZE_CACHE_10;
-        assert_eq!(dev.do_cmd(&cdb, &mut w, 0).unwrap(), CommandOutcome::Status);
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[..512], pattern.as_slice());
@@ -853,7 +846,7 @@ mod tests {
         let mut w = work();
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len: _ } => {
                 let r = dev.xfer_in(0, &w[0..512]);
@@ -865,7 +858,7 @@ mod tests {
         }
 
         let cdb = make_cdb10(op::READ_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
         data_in(&mut dev, outcome, &w, &mut buf);
         assert_eq!(buf, [0u8; 512]);
@@ -880,7 +873,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb10(op::READ_10, 0, 2); // 1024 bytes
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::OutXfer { len } => {
                 assert_eq!(len, 1024);
@@ -901,7 +894,7 @@ mod tests {
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
         let cdb = make_cdb10(op::WRITE_10, 0, 2);
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
@@ -910,7 +903,7 @@ mod tests {
                 assert_eq!(dev.xfer_in(600, &payload[600..]), XferOutcome::Ok);
                 // Verify via read.
                 let cdb = make_cdb10(op::READ_10, 0, 2);
-                let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+                let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
                 match outcome {
                     CommandOutcome::OutXfer { len } => {
                         assert_eq!(len, 1024);

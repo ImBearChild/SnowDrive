@@ -1269,7 +1269,6 @@ mod tests {
             &mut self,
             cdb: &[u8],
             data: &'a mut [u8],
-            dsl: usize,
         ) -> Result<snowdrive_scsi::scsi::device::CommandOutcome, snowdrive_scsi::scsi::device::Error>
         {
             if data.len() < snowdrive_scsi::MIN_DATA_LEN {

@@ -200,26 +200,19 @@ impl CDBlockDevice {
     }
 
     /// Process one SCSI command (mirrors `BlockDevice::do_cmd`). `data`
-    /// must be at least [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length
-    /// of data already received (immediate data, never used by this
-    /// read-only device).
+    /// must be at least [`crate::MIN_DATA_LEN`] bytes.
     ///
     /// Dispatch order: SPC commands go to [`execute_spc`]; the SBC read-only
     /// set (READ 6/10/12/16, READ CAPACITY 10/16) is handled here; write
     /// commands (WRITE 6/10/12/16, SYNCHRONIZE CACHE) return DATA PROTECT;
     /// unknown MMC opcodes return INVALID COMMAND.
-    pub fn do_cmd(
-        &mut self,
-        cdb: &[u8],
-        data: &mut [u8],
-        dsl: usize,
-    ) -> Result<CommandOutcome, Error> {
+    pub fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
         let outcome = if let Some(cmd) = parse_spc(cdb) {
-            execute_spc(self, cmd, data, dsl)
+            execute_spc(self, cmd, data)
         } else {
             // Total: `do_cmd` is public API — reject CDBs shorter than
             // their opcode group's fixed length (SPC-4 §7.3) before any
@@ -555,8 +548,8 @@ impl SpcDevice for CDBlockDevice {
 }
 
 impl ScsiDevice for CDBlockDevice {
-    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> Result<CommandOutcome, Error> {
-        self.do_cmd(cdb, data, dsl)
+    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
+        self.do_cmd(cdb, data)
     }
 
     fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
@@ -690,7 +683,7 @@ mod tests {
     /// Run one full SCSI command via `do_cmd` and fetch the payload, reading
     /// backend-resident DataIn through `xfer_out` when `immediate` is empty.
     fn do_data_in(dev: &mut CDBlockDevice, cdb: &[u8], work: &mut [u8], buf: &mut [u8]) -> usize {
-        let outcome = dev.do_cmd(cdb, work, 0).unwrap();
+        let outcome = dev.do_cmd(cdb, work).unwrap();
         match outcome {
             CommandOutcome::OutXfer { len } => {
                 assert!(len as usize <= buf.len());
@@ -728,7 +721,7 @@ mod tests {
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = 0xFF;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(
             check_condition(&dev, outcome),
             (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
@@ -737,7 +730,7 @@ mod tests {
         // device does not implement → INVALID COMMAND (plan §8.1b).
         let mut cdb = [0u8; 10];
         cdb[0] = 0x51;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(
             check_condition(&dev, outcome),
             (SenseKey::IllegalRequest, asc::INVALID_COMMAND)
@@ -760,7 +753,7 @@ mod tests {
         cdb[0] = op::READ_10;
         cdb[5] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::OutXfer { len } => assert_eq!(len, 2048),
             _ => panic!("expected DataIn"),

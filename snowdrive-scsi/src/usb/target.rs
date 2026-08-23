@@ -432,7 +432,7 @@ impl BotSession {
         }
 
         let lun = cbw.lun as usize;
-        let outcome = match devs[lun].do_cmd(cdb, data, 0) {
+        let outcome = match devs[lun].do_cmd(cdb, data) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
                 return SessionStep::Done(BotStepResult::Error(BotTargetError::WorkBufTooSmall));
@@ -1064,7 +1064,7 @@ mod tests {
         cdb[5] = (lba & 0xFF) as u8;
         cdb[7] = ((nblocks >> 8) & 0xFF) as u8;
         cdb[8] = (nblocks & 0xFF) as u8;
-        let outcome = dev.do_cmd(&cdb, &mut work, 0).expect("READ setup");
+        let outcome = dev.do_cmd(&cdb, &mut work).expect("READ setup");
         match outcome {
             CommandOutcome::OutInline { len: transfer_len } => {
                 assert!(transfer_len >= buf.len() as u64);

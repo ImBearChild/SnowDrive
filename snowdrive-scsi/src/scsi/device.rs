@@ -152,10 +152,9 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// equally.
 pub trait ScsiDevice {
     /// Process one SCSI command. `data` must be at least
-    /// [`crate::MIN_DATA_LEN`] bytes; `dsl` is the length of data already
-    /// received into `data[0..dsl]`. For `OutInline` the device writes the
+    /// [`crate::MIN_DATA_LEN`] bytes. For `OutInline` the device writes the
     /// response into `data[0..len]` and returns `OutInline { len }`.
-    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> Result<CommandOutcome, Error>;
+    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error>;
 
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer (0 ≤ off < transfer_len).
@@ -207,13 +206,13 @@ pub enum Device<'a> {
 }
 
 impl ScsiDevice for Device<'_> {
-    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8], dsl: usize) -> Result<CommandOutcome, Error> {
+    fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         match self {
-            Self::Block(dev) => dev.do_cmd(cdb, data, dsl),
+            Self::Block(dev) => dev.do_cmd(cdb, data),
             #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.do_cmd(cdb, data, dsl),
+            Self::CdBlock(dev) => dev.do_cmd(cdb, data),
             #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.do_cmd(cdb, data, dsl),
+            Self::Cdrom(dev) => dev.do_cmd(cdb, data),
         }
     }
 
@@ -300,7 +299,7 @@ mod tests {
         let mut cdb = [0u8; 6];
         cdb[0] = op::INQUIRY;
         cdb[4] = 96;
-        match dev.do_cmd(&cdb, w, 0).unwrap() {
+        match dev.do_cmd(&cdb, w).unwrap() {
             CommandOutcome::OutInline { len } => {
                 assert!(len >= 1);
                 w[0]
@@ -324,7 +323,7 @@ mod tests {
         cdb[5] = 0;
         cdb[7] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
@@ -354,7 +353,7 @@ mod tests {
         cdb[0] = op::WRITE_10;
         cdb[5] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
@@ -391,7 +390,7 @@ mod tests {
         cdb[0] = op::READ_10;
         cdb[5] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::OutXfer { len } => {
                 assert_eq!(len, 2048);
@@ -407,7 +406,7 @@ mod tests {
         cdb[0] = op::WRITE_10;
         cdb[5] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len: _ } => {
                 let r = dev.xfer_in(0, &w[0..512]);
@@ -466,7 +465,7 @@ mod tests {
         cdb[4] = (first >> 8) as u8;
         cdb[5] = first as u8;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::OutXfer { len } => {
                 assert_eq!(len, 2048);
@@ -481,7 +480,7 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::WRITE_10;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w, 512).unwrap();
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome {
             CommandOutcome::InXfer { len: _ } => {
                 let r = dev.xfer_in(0, &w[0..512]);

@@ -184,12 +184,7 @@ pub trait SpcDevice {
 
 /// Execute one parsed SPC command against `dev`. Synthesized responses are
 /// written into `data[0..]` and returned as [`CommandOutcome::OutInline`].
-pub fn execute_spc<D: SpcDevice>(
-    dev: &mut D,
-    cmd: SpcCommand,
-    data: &mut [u8],
-    _dsl: usize,
-) -> CommandOutcome {
+pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) -> CommandOutcome {
     match cmd {
         SpcCommand::TestUnitReady => CommandOutcome::Status,
 
@@ -449,7 +444,7 @@ mod tests {
     }
 
     fn run(dev: &mut TestDev, cdb: &[u8], work: &mut [u8]) -> CommandOutcome {
-        execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
+        execute_spc(dev, parse_spc(cdb).unwrap(), work)
     }
 
     /// Run a command that yields Status or CheckCondition (no borrowed

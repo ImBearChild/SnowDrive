@@ -10,7 +10,7 @@
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
 use snowdrive_scsi::scsi::block::BlockDevice;
-use snowdrive_scsi::scsi::device::{Device, ScsiDevice};
+use snowdrive_scsi::scsi::device::Device;
 use snowdrive_scsi::usb::{
     BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
     SessionNeed, SessionStep, CBW_LEN, CBW_SIGNATURE, CSW_LEN,

@@ -1068,7 +1068,7 @@ pub fn build_read_disc_info(data: &mut [u8], alloc: u16, info: &DiscInfo) -> Com
 mod tests {
     use super::*;
     use crate::scsi::device::{CommandOutcome, DeviceType};
-    use crate::scsi::scsi::{op, Sense, SenseKey};
+    use crate::scsi::scsi::{op, Sense};
     use crate::scsi::spc::{execute_spc, parse_spc, DeviceIdentity, SpcDevice, SpcEffect};
     /// Minimal test device for exercising SPC commands through execute_spc.
     struct TestDev {
@@ -1119,7 +1119,7 @@ mod tests {
         }
     }
     fn run(dev: &mut TestDev, cdb: &[u8], work: &mut [u8]) -> CommandOutcome {
-        execute_spc(dev, parse_spc(cdb).unwrap(), work, 0)
+        execute_spc(dev, parse_spc(cdb).unwrap(), work)
     }
     fn run_data(dev: &mut TestDev, cdb: &[u8], buf: &mut [u8]) -> usize {
         let mut w = work();
