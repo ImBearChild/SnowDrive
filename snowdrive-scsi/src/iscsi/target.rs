@@ -291,6 +291,7 @@ enum IscsiState {
         received: u64,
         r2t_sn: u32,
         data_sn: u32,
+        lun: usize,
     },
     /// Collecting Data-Out PDUs for the current R2T burst.
     R2tCollect {
@@ -301,6 +302,7 @@ enum IscsiState {
         data_sn: u32,
         expected_bo: u32,
         burst_remaining: u64,
+        lun: usize,
     },
     /// Collecting ParamOut data via R2T.
     ParamCollect {
@@ -315,6 +317,7 @@ enum IscsiState {
         cdb_len: usize,
         /// Accumulation offset into work[BHS_SIZE..].
         acc_offset: usize,
+        lun: usize,
     },
     /// Stalled after invalid CBW (iSCSI: fatal protocol error).
     /// Only `reset()` or a new connection unfreezes.
@@ -642,6 +645,7 @@ impl Session {
             received,
             r2t_sn,
             data_sn,
+            lun,
         } = st
         else {
             unreachable!()
@@ -672,6 +676,7 @@ impl Session {
             data_sn,
             expected_bo: received as u32,
             burst_remaining: burst,
+            lun,
         };
         IscsiStep::NeedSend(&work[..BHS_SIZE])
     }
@@ -691,6 +696,7 @@ impl Session {
             mut data_sn,
             mut expected_bo,
             mut burst_remaining,
+            lun,
         } = st
         else {
             unreachable!()
@@ -719,19 +725,18 @@ impl Session {
             return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
         }
 
-        if pdu_dsl > 0 {
-            if let Some(dev) = devs.first_mut() {
-                match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
-                    XferOutcome::Ok => {}
-                    XferOutcome::Error(_) => {
-                        let sense = dev.take_sense();
-                        return self.send_scsi_response(
-                            work,
-                            itt,
-                            status::CHECK_CONDITION,
-                            sense.as_ref(),
-                        );
-                    }
+        if pdu_dsl > 0 && lun < devs.len() {
+            let dev = &mut devs[lun];
+            match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
+                XferOutcome::Ok => {}
+                XferOutcome::Error(_) => {
+                    let sense = dev.take_sense();
+                    return self.send_scsi_response(
+                        work,
+                        itt,
+                        status::CHECK_CONDITION,
+                        sense.as_ref(),
+                    );
                 }
             }
         }
@@ -760,6 +765,7 @@ impl Session {
                 received,
                 r2t_sn: r2t_sn + 1,
                 data_sn: 0,
+                lun,
             };
             return self.poll_r2t_send(work);
         }
@@ -773,6 +779,7 @@ impl Session {
             data_sn,
             expected_bo,
             burst_remaining,
+            lun,
         };
         IscsiStep::NeedRecv
     }
@@ -795,6 +802,7 @@ impl Session {
             cdb,
             cdb_len,
             mut acc_offset,
+            lun,
         } = st
         else {
             unreachable!()
@@ -839,14 +847,22 @@ impl Session {
             // All data collected — complete the parameter.
             let cdb_slice = &cdb[..cdb_len];
             let param_data = &work[BHS_SIZE..BHS_SIZE + expected as usize];
-            let outcome = devs[0].complete_param(cdb_slice, param_data);
+            let outcome = if lun < devs.len() {
+                devs[lun].complete_param(cdb_slice, param_data)
+            } else {
+                CommandOutcome::CheckCondition
+            };
             return match outcome {
                 CommandOutcome::Status => self.send_scsi_response(work, itt, status::GOOD, None),
                 CommandOutcome::StatusWithSense => {
                     self.send_scsi_response(work, itt, status::GOOD, None)
                 }
                 CommandOutcome::CheckCondition => {
-                    let sense = devs[0].take_sense();
+                    let sense = if lun < devs.len() {
+                        devs[lun].take_sense()
+                    } else {
+                        None
+                    };
                     self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref())
                 }
                 _ => {
@@ -869,6 +885,7 @@ impl Session {
                 cdb,
                 cdb_len,
                 acc_offset,
+                lun,
             };
             return self.send_param_r2t(work, itt, received, r2t_sn + 1);
         }
@@ -884,6 +901,7 @@ impl Session {
             cdb,
             cdb_len,
             acc_offset,
+            lun,
         };
         IscsiStep::NeedRecv
     }
@@ -1265,6 +1283,7 @@ impl Session {
                     received,
                     r2t_sn: 0,
                     data_sn: 0,
+                    lun,
                 };
                 self.poll_r2t_send(work)
             }
@@ -1291,10 +1310,14 @@ impl Session {
 
                 if received == expected {
                     // All present — complete immediately.
-                    let outcome2 = devs[0].complete_param(
-                        &cdb_buf[..cdb_len],
-                        &work[BHS_SIZE..BHS_SIZE + expected as usize],
-                    );
+                    let outcome2 = if lun < devs.len() {
+                        devs[lun].complete_param(
+                            &cdb_buf[..cdb_len],
+                            &work[BHS_SIZE..BHS_SIZE + expected as usize],
+                        )
+                    } else {
+                        CommandOutcome::CheckCondition
+                    };
                     return match outcome2 {
                         CommandOutcome::Status => {
                             self.send_scsi_response(work, itt, status::GOOD, None)
@@ -1303,7 +1326,11 @@ impl Session {
                             self.send_scsi_response(work, itt, status::GOOD, None)
                         }
                         CommandOutcome::CheckCondition => {
-                            let sense = devs[0].take_sense();
+                            let sense = if lun < devs.len() {
+                                devs[lun].take_sense()
+                            } else {
+                                None
+                            };
                             self.send_scsi_response(
                                 work,
                                 itt,
@@ -1337,6 +1364,7 @@ impl Session {
                     cdb: cdb_buf,
                     cdb_len,
                     acc_offset,
+                    lun,
                 };
                 self.send_param_r2t(work, itt, received, 0)
             }
