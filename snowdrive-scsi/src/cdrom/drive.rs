@@ -682,7 +682,7 @@ impl<'a> CdromDrive<'a> {
             dir: XferDir::Out,
             transfer_len,
         });
-        CommandOutcome::OutInline { len: transfer_len }
+        CommandOutcome::OutXfer { len: transfer_len }
     }
 
     // ── READ CAPACITY ───────────────────────────────────────────────
@@ -1695,8 +1695,6 @@ mod tests {
     #[test]
     #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_tryout_does_not_clear() {
-        return;
-
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udf_void")]
         {
@@ -1739,6 +1737,13 @@ mod tests {
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+            let outcome = match outcome {
+                CommandOutcome::InParam { expected_len } => {
+                    assert_eq!(expected_len, 12);
+                    dev.complete_param(&cdb, &w[..expected_len])
+                }
+                _ => outcome,
+            };
             assert_eq!(outcome, CommandOutcome::Status);
             // Verify data still present (not cleared) via READ + xfer_out
             let mut cdb = [0u8; 10];
@@ -1905,9 +1910,9 @@ mod tests {
             cdb10[0] = op::READ_10;
             cdb10[8] = 0x01;
             let out = dev.do_cmd(&cdb10, &mut w).unwrap();
-            assert!(matches!(out, CommandOutcome::OutInline { .. }));
+            assert!(matches!(out, CommandOutcome::OutXfer { .. }));
             // consume READ via xfer to clear pending for next WRITE
-            if let CommandOutcome::OutInline { len } = out {
+            if let CommandOutcome::OutXfer { len } = out {
                 let mut dummy = vec![0u8; len as usize];
                 let _ = dev.xfer_out(0, &mut dummy);
             }

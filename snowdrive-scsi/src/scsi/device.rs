@@ -371,8 +371,6 @@ mod tests {
     #[cfg(feature = "cdrom")]
     #[test]
     fn device_enum_cdrom_dispatch() {
-        return;
-
         use crate::cdrom::drive::CdromDrive;
         use crate::cdrom::media::{CdMedia, FlatMedia};
         use crate::scsi::backend::RamBackend;
@@ -399,7 +397,7 @@ mod tests {
                 assert_eq!(r, XferOutcome::Ok);
                 assert_eq!(buf, [0xAA; 4]);
             }
-            _ => panic!("expected OutXfer"),
+            other => panic!("expected OutXfer, got {other:?}"),
         }
         // write must fail
         let mut cdb = [0u8; 10];
@@ -422,8 +420,6 @@ mod tests {
     #[cfg(all(feature = "livefs", feature = "std"))]
     #[test]
     fn device_enum_cdlivefs_dispatch() {
-        return;
-
         use crate::cdrom::drive::CdromDrive;
         use crate::cdrom::media::{CdMedia, FlatMedia, LiveData};
         use crate::scsi::fs_backend::StdFsBackend;
@@ -474,7 +470,7 @@ mod tests {
                 assert_eq!(r, XferOutcome::Ok);
                 assert_eq!(&buf[..4], &[0x42; 4]);
             }
-            _ => panic!("expected OutXfer"),
+            other => panic!("expected OutXfer, got {other:?}"),
         }
         // write must fail
         let mut cdb = [0u8; 10];

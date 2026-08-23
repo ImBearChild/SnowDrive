@@ -645,8 +645,6 @@ mod tests {
 
     #[test]
     fn block_write_read_roundtrip_12() {
-        return;
-
         let mut ram = [0u8; 1024 * 1024];
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
@@ -658,7 +656,7 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert_eq!(dev.xfer_in(0, &w[0..1024]), XferOutcome::Ok);
             }
             _ => panic!("expected InXfer"),
         }
@@ -667,13 +665,11 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
         data_in(&mut dev, outcome, &w, &mut buf);
-        assert_eq!(buf, pattern.as_slice());
+        assert_eq!(&buf, &pattern[..]);
     }
 
     #[test]
     fn block_write_read_roundtrip_16() {
-        return;
-
         let mut ram = [0u8; 1024 * 1024];
         let mut dev = ram_dev(&mut ram);
         let mut w = work();
@@ -685,7 +681,7 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert_eq!(dev.xfer_in(0, &w[0..1024]), XferOutcome::Ok);
             }
             _ => panic!("expected InXfer"),
         }
@@ -694,7 +690,7 @@ mod tests {
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
         data_in(&mut dev, outcome, &w, &mut buf);
-        assert_eq!(buf, pattern.as_slice());
+        assert_eq!(&buf, &pattern[..]);
     }
 
     #[test]

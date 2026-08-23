@@ -1607,8 +1607,6 @@ mod tests {
     }
     #[test]
     fn dvd_ram_mandatory_features_table212() {
-        return;
-
         // MMC-6 Table 212 mandatory for DVD-RAM: 0000,0001,0002,0003,0010,001F,0020,0023,0024,0100,0105,0107
         let media = MediaState {
             profile: CurrentProfile::DvdRam,
@@ -1629,6 +1627,7 @@ mod tests {
             build_get_config_response_for_media(&mut tmp, &UDFRW_CAPS, &media, 0x00, 0x0000, 512);
         let mut check = [0u8; 512];
         let n = data_in(outcome, &tmp, &mut check);
+        assert!(n > 0);
         // Walk and collect codes and header checks
         let mut codes = Vec::new();
         let mut off = 8;
@@ -1715,7 +1714,7 @@ mod tests {
             512,
         );
         let mut buf2 = [0u8; 512];
-        let n2 = data_in(out2, &tmp, &mut buf2);
+        let n2 = data_in(out2, &tmp2, &mut buf2);
         let mut off2 = 8;
         let mut ver_off = None;
         while off2 + 4 <= n2 {

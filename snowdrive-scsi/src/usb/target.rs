@@ -1066,11 +1066,11 @@ mod tests {
         cdb[8] = (nblocks & 0xFF) as u8;
         let outcome = dev.do_cmd(&cdb, &mut work).expect("READ setup");
         match outcome {
-            CommandOutcome::OutInline { len: transfer_len } => {
-                assert!(transfer_len >= buf.len() as u64);
+            CommandOutcome::OutXfer { len } => {
+                assert!(len >= buf.len() as u64);
                 assert_eq!(dev.xfer_out(0, buf), XferOutcome::Ok);
             }
-            _ => panic!("expected DataIn"),
+            other => panic!("expected OutXfer, got {other:?}"),
         }
     }
 
@@ -1223,8 +1223,6 @@ mod tests {
 
     #[test]
     fn write_10_writes_received_data_and_probes_overrun() {
-        return;
-
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
@@ -1286,8 +1284,6 @@ mod tests {
 
     #[test]
     fn data_out_overrun_is_drained_to_short_packet() {
-        return;
-
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
@@ -1456,8 +1452,6 @@ mod tests {
 
     #[test]
     fn failed_data_out_drains_declared_then_csw() {
-        return;
-
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
@@ -1825,8 +1819,6 @@ mod tests {
 
     #[test]
     fn step_drives_write_with_data_phase() {
-        return;
-
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();

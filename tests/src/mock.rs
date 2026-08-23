@@ -1121,8 +1121,6 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_cdrom_flat_and_live_dispatch() {
-        return;
-
         use snowdrive_scsi::cdrom::drive::CdromDrive;
         use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
         use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
