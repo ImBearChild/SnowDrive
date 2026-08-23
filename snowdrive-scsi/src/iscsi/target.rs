@@ -1196,7 +1196,9 @@ impl IscsiSession {
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
                 crate::debug!("  -> OutXfer (backend, transfer_len={})", transfer_len);
-                let chunk = (transfer_len as usize).min(work.len() - BHS_SIZE);
+                let chunk = (transfer_len as usize)
+                    .min(work.len() - BHS_SIZE)
+                    .min(self.max_recv_data_segment as usize);
                 if lun < devs.len() {
                     let dev = &mut devs[lun];
                     match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
@@ -1854,6 +1856,85 @@ mod tests {
                 assert_eq!(session.stage(), LoginStage::FullFeature);
             }
             other => panic!("expected NeedSend for Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_in_respects_max_recv_data_segment() {
+        use crate::scsi::backend::{BlockBackend, RamBackend};
+        use crate::scsi::block::BlockDevice;
+        use crate::scsi::scsi::op as scsi_op;
+
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs =
+            [
+                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
+                    .unwrap(),
+            ];
+        let mut session = IscsiSession::new();
+        let mut work = vec![0u8; 8192 + BHS_SIZE];
+
+        // Login negotiating MaxRecvDataSegmentLength=1024 (small).
+        let login_text = b"InitiatorName=iqn.test\0MaxRecvDataSegmentLength=1024\0";
+        let mut login_bhs = [0u8; 48];
+        login_bhs[0] = op::LOGIN_REQ | 0x40;
+        login_bhs[1] =
+            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
+        login_bhs[5] = (login_text.len() >> 16) as u8;
+        login_bhs[6] = (login_text.len() >> 8) as u8;
+        login_bhs[7] = login_text.len() as u8;
+        work[..48].copy_from_slice(&login_bhs);
+        work[48..48 + login_text.len()].copy_from_slice(login_text);
+        match session.poll(
+            SessionEvent::PduReceived {
+                dsl: login_text.len() as u32,
+            },
+            &mut work,
+            &mut devs,
+        ) {
+            SessionStep::NeedSend(_) => {}
+            other => panic!("expected login response, got {other:?}"),
+        }
+        assert_eq!(session.stage(), LoginStage::FullFeature);
+        // Negotiated max should be clipped to 1024 (work 8192 → cap 8192, initiator 1024).
+        assert_eq!(session.max_recv_data_segment, 1024);
+
+        // READ_10 for 8 blocks = 4096 bytes, which exceeds negotiated max.
+        let mut cdb = [0u8; 10];
+        cdb[0] = scsi_op::READ_10;
+        cdb[8] = 8;
+        let mut scsi_bhs = [0u8; 48];
+        scsi_bhs[0] = op::SCSI_CMD | 0x40;
+        scsi_bhs[1] = 0x80;
+        scsi_bhs[16..20].copy_from_slice(&1u32.to_be_bytes());
+        scsi_bhs[24..28].copy_from_slice(&1u32.to_be_bytes());
+        scsi_bhs[32..42].copy_from_slice(&cdb);
+        work[..48].copy_from_slice(&scsi_bhs);
+        work[48..].fill(0);
+
+        // First Data-In should be clipped to 1024, not 4096 or work capacity.
+        match session.poll(SessionEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            SessionStep::NeedSend(data) => {
+                let bhs = crate::iscsi::pdu::Bhs::from_bytes(data[..48].try_into().unwrap());
+                assert_eq!(bhs.opcode(), op::SCSI_DATA_IN);
+                assert_eq!(bhs.data_segment_len(), 1024);
+                assert_eq!(data.len(), BHS_SIZE + 1024);
+                // Also verify state is DataIn with same chunk.
+                match session.state {
+                    IscsiState::DataIn { chunk, .. } => assert_eq!(chunk, 1024),
+                    other => panic!("expected DataIn state, got {other:?}"),
+                }
+            }
+            other => panic!("expected NeedSend Data-In, got {other:?}"),
+        }
+
+        // Second chunk should also be 1024.
+        match session.poll(SessionEvent::PduReceived { dsl: 0 }, &mut work, &mut devs) {
+            SessionStep::NeedSend(data) => {
+                let bhs = crate::iscsi::pdu::Bhs::from_bytes(data[..48].try_into().unwrap());
+                assert_eq!(bhs.data_segment_len(), 1024);
+            }
+            other => panic!("expected second Data-In, got {other:?}"),
         }
     }
 }
