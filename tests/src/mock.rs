@@ -1237,4 +1237,239 @@ mod tests {
         let _ = std::fs::remove_file(&iso);
         let _ = std::fs::remove_dir_all(&tree);
     }
+
+    // ── ParamOut / DataOut LUN routing (O7 regression) ────────────────
+
+    fn mode_select6_bhs(lun: u8, alloc: u8, itt: u32, cmd_sn: u32, dsl: u32) -> [u8; 48] {
+        let mut bhs = [0u8; 48];
+        bhs[0] = op::SCSI_CMD;
+        bhs[1] = 0x20; // W bit
+        bhs[5] = (dsl >> 16) as u8;
+        bhs[6] = (dsl >> 8) as u8;
+        bhs[7] = dsl as u8;
+        bhs[9] = lun;
+        bhs[16..20].copy_from_slice(&be32(itt));
+        bhs[24..28].copy_from_slice(&be32(cmd_sn));
+        bhs[28..32].copy_from_slice(&be32(cmd_sn));
+        bhs[32] = 0x15; // MODE SELECT(6)
+        bhs[36] = alloc;
+        bhs
+    }
+
+    struct TrackingParamDevice {
+        lun: usize,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        sense: Option<snowdrive_scsi::scsi::scsi::Sense>,
+    }
+
+    impl snowdrive_scsi::scsi::device::ScsiDevice for TrackingParamDevice {
+        fn do_cmd<'a>(
+            &mut self,
+            cdb: &[u8],
+            data: &'a mut [u8],
+            dsl: usize,
+        ) -> Result<
+            snowdrive_scsi::scsi::device::CommandOutcome<'a>,
+            snowdrive_scsi::scsi::device::Error,
+        > {
+            if data.len() < snowdrive_scsi::MIN_DATA_LEN {
+                return Err(snowdrive_scsi::scsi::device::Error::WorkBufTooSmall);
+            }
+            if cdb.first() == Some(&0x15) {
+                let alloc = cdb[4] as usize;
+                if alloc == 0 {
+                    return Ok(snowdrive_scsi::scsi::device::CommandOutcome::Status);
+                }
+                let imm = dsl.min(alloc).min(data.len());
+                return Ok(snowdrive_scsi::scsi::device::CommandOutcome::ParamOut {
+                    expected_len: alloc,
+                    immediate: &data[..imm],
+                });
+            }
+            Ok(snowdrive_scsi::scsi::device::CommandOutcome::Status)
+        }
+
+        fn xfer_out(
+            &mut self,
+            _transfer_offset: u64,
+            _buf: &mut [u8],
+        ) -> snowdrive_scsi::scsi::device::XferOutcome {
+            snowdrive_scsi::scsi::device::XferOutcome::Ok
+        }
+
+        fn xfer_in(
+            &mut self,
+            _transfer_offset: u64,
+            _buf: &[u8],
+        ) -> snowdrive_scsi::scsi::device::XferOutcome {
+            snowdrive_scsi::scsi::device::XferOutcome::Ok
+        }
+
+        fn peek_sense(&self) -> Option<&snowdrive_scsi::scsi::scsi::Sense> {
+            self.sense.as_ref()
+        }
+
+        fn take_sense(&mut self) -> Option<snowdrive_scsi::scsi::scsi::Sense> {
+            self.sense.take()
+        }
+
+        fn device_type(&self) -> snowdrive_scsi::scsi::device::DeviceType {
+            snowdrive_scsi::scsi::device::DeviceType::Block
+        }
+
+        fn complete_param(
+            &mut self,
+            _cdb: &[u8],
+            _data: &[u8],
+        ) -> snowdrive_scsi::scsi::device::CommandOutcome<'static> {
+            self.calls.lock().unwrap().push(self.lun);
+            snowdrive_scsi::scsi::device::CommandOutcome::Status
+        }
+    }
+
+    #[test]
+    fn param_out_immediate_routes_by_lun() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let d0 = TrackingParamDevice {
+            lun: 0,
+            calls: calls.clone(),
+            sense: None,
+        };
+        let d1 = TrackingParamDevice {
+            lun: 1,
+            calls: calls.clone(),
+            sense: None,
+        };
+        let mut devs = [d0, d1];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // MODE SELECT(6) to LUN 1 with all 12 bytes immediate — handle_scsi_cmd immediate path.
+        let itt = 0xA1A1;
+        let param = vec![0xAAu8; 12];
+        let bhs = mode_select6_bhs(1, 12, itt, 0, 12);
+        conn.feed_padded(&bhs, &param);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::GOOD);
+        let v = calls.lock().unwrap().clone();
+        assert_eq!(
+            v,
+            vec![1],
+            "immediate ParamOut must route to LUN 1, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn param_out_r2t_routes_by_lun() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let d0 = TrackingParamDevice {
+            lun: 0,
+            calls: calls.clone(),
+            sense: None,
+        };
+        let d1 = TrackingParamDevice {
+            lun: 1,
+            calls: calls.clone(),
+            sense: None,
+        };
+        let mut devs = [d0, d1];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // MODE SELECT(6) to LUN 1 with 6 of 12 bytes immediate — needs R2T.
+        let itt = 0xB2B2;
+        let imm = vec![0xBBu8; 6];
+        let bhs = mode_select6_bhs(1, 12, itt, 0, 6);
+        conn.feed_padded(&bhs, &imm);
+        // Remaining 6 bytes via Data-Out.
+        let rest = vec![0xCCu8; 6];
+        let dout = dataout_bhs(itt, 1, 0, 6, 6);
+        conn.feed_padded(&dout, &rest);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        // Expect R2T then SCSI Response.
+        let (r2t, _) = conn.take_pdu().unwrap();
+        assert_eq!(r2t[0] & 0x3F, op::R2T);
+        assert_eq!(&r2t[16..20], &be32(itt));
+        assert_eq!(&r2t[40..44], &be32(6)); // BufferOffset
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(resp[3], status::GOOD);
+        let v = calls.lock().unwrap().clone();
+        assert_eq!(v, vec![1], "R2T ParamOut must route to LUN 1, got {v:?}");
+    }
+
+    #[test]
+    fn data_out_r2t_routes_by_lun() {
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let mut ram0 = vec![0u8; 16 * 1024];
+        let mut ram1 = vec![0u8; 16 * 1024];
+        let d0 = BlockDevice::new(RamBackend::new(&mut ram0), 512).unwrap();
+        let d1 = BlockDevice::new(RamBackend::new(&mut ram1), 512).unwrap();
+        let mut devs = [d0, d1];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        // WRITE(10) LUN 1, LBA 0, 1 block, no immediate — R2T path.
+        let itt = 0xC3C3;
+        let bhs = write10_bhs(0, 1, itt, 0, 0);
+        let mut bhs1 = bhs;
+        bhs1[9] = 1;
+        conn.feed(&bhs1, &[]);
+        let payload = vec![0x5Au8; 512];
+        let dout = dataout_bhs(itt, 1, 0, 0, 512);
+        conn.feed_padded(&dout, &payload);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (r2t, _) = conn.take_pdu().unwrap();
+        assert_eq!(r2t[0] & 0x3F, op::R2T);
+        assert_eq!(&r2t[40..44], &be32(0));
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(resp[3], status::GOOD);
+        // Only ram1 (LUN 1) must have been written.
+        {
+            use embedded_io::{Read, Seek};
+            // Check LUN 0 unchanged.
+            let b = devs[0].backend();
+            let mut buf = [0u8; 512];
+            let mut b_mut = b;
+            // Need mutable access via backend; we already have &mut devs, so re-borrow.
+        }
+        // Verify via direct RAM buffers (devs own the backend mutably, but rams are moved).
+        // Instead read back via READ.
+        let read = read10_bhs(0, 1, 0xD1, 1);
+        let mut read1 = read;
+        read1[9] = 1;
+        conn.feed(&read1, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (_, data) = conn.take_pdu().unwrap();
+        assert_eq!(data, payload, "LUN 1 data must match written payload");
+        // LUN 0 should still be zero.
+        let read0 = read10_bhs(0, 1, 0xD2, 2);
+        conn.feed(&read0, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (_, data0) = conn.take_pdu().unwrap();
+        assert_eq!(data0, vec![0u8; 512], "LUN 0 must remain untouched");
+    }
 }
