@@ -127,8 +127,8 @@ impl CDBlockDevice {
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer.
     pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, current_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+        let (dir, transfer_len, block_size, base_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.base_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -149,8 +149,7 @@ impl CDBlockDevice {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        let intra = transfer_offset % u64::from(block_size);
-        let actual = current_lba * u64::from(block_size) + intra;
+        let actual = base_lba * u64::from(block_size) + transfer_offset;
         if self.check_bounds(actual, buf.len()).is_err() {
             self.set_sense(SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0);
             return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
@@ -168,17 +167,13 @@ impl CDBlockDevice {
                 embedded_io::ErrorKind::Other,
             )));
         }
-        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
-        if let Some(p) = self.pending.as_mut() {
-            p.current_lba = p.current_lba.saturating_add(blocks);
-        }
         XferOutcome::Ok
     }
 
     /// Write `buf` for the current WRITE transfer (host → device).
     /// This device is read-only; any write is rejected with DATA PROTECT.
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
-        let (dir, transfer_len, _block_size, _current_lba) = match self.pending {
+        let (dir, transfer_len, _block_size, _base_lba) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);

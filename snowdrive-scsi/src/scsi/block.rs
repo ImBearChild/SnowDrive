@@ -96,8 +96,8 @@ impl<B: BlockStorage> BlockDevice<B> {
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer.
     pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, current_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+        let (dir, transfer_len, block_size, base_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.base_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -118,8 +118,7 @@ impl<B: BlockStorage> BlockDevice<B> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        let intra = transfer_offset % u64::from(block_size);
-        let actual = current_lba * u64::from(block_size) + intra;
+        let actual = base_lba * u64::from(block_size) + transfer_offset;
         if self.check_bounds(actual, buf.len()).is_err() {
             self.set_sense(SenseKey::MediumError, 0x11, 0);
             return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
@@ -137,17 +136,13 @@ impl<B: BlockStorage> BlockDevice<B> {
                 embedded_io::ErrorKind::Other,
             )));
         }
-        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
-        if let Some(p) = self.pending.as_mut() {
-            p.current_lba = p.current_lba.saturating_add(blocks);
-        }
         XferOutcome::Ok
     }
 
     /// Write `buf` for the current WRITE transfer (host → device).
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, current_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+        let (dir, transfer_len, block_size, base_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.base_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -168,8 +163,7 @@ impl<B: BlockStorage> BlockDevice<B> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        let intra = transfer_offset % u64::from(block_size);
-        let actual = current_lba * u64::from(block_size) + intra;
+        let actual = base_lba * u64::from(block_size) + transfer_offset;
         if self.check_bounds(actual, buf.len()).is_err() {
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
             return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
@@ -186,10 +180,6 @@ impl<B: BlockStorage> BlockDevice<B> {
             return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
                 embedded_io::ErrorKind::Other,
             )));
-        }
-        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
-        if let Some(p) = self.pending.as_mut() {
-            p.current_lba = p.current_lba.saturating_add(blocks);
         }
         XferOutcome::Ok
     }
@@ -913,5 +903,68 @@ mod tests {
         assert_eq!(buf, [0u8; 512]);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn xfer_non_aligned_split_read() {
+        let expected: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let mut ram = expected.clone();
+        let mut dev = ram_dev(&mut ram);
+        let mut w = work();
+        let cdb = make_cdb10(op::READ_10, 0, 2); // 1024 bytes
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataIn {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 1024);
+                assert!(immediate.is_empty());
+                let mut chunk1 = vec![0u8; 600];
+                assert_eq!(dev.xfer_out(0, &mut chunk1), XferOutcome::Ok);
+                assert_eq!(chunk1, expected[0..600]);
+                let mut chunk2 = vec![0u8; 424];
+                assert_eq!(dev.xfer_out(600, &mut chunk2), XferOutcome::Ok);
+                assert_eq!(chunk2, expected[600..1024]);
+            }
+            _ => panic!("expected DataIn"),
+        }
+    }
+
+    #[test]
+    fn xfer_non_aligned_split_write() {
+        let mut ram = vec![0u8; 4096];
+        let mut dev = ram_dev(&mut ram);
+        let mut w = work();
+        let cdb = make_cdb10(op::WRITE_10, 0, 2);
+        let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+        match outcome {
+            CommandOutcome::DataOut {
+                transfer_len,
+                immediate,
+            } => {
+                assert_eq!(transfer_len, 1024);
+                assert!(immediate.is_empty());
+                let payload: Vec<u8> = (0..1024).map(|i| ((i * 7) % 251) as u8).collect();
+                assert_eq!(dev.xfer_in(0, &payload[0..600]), XferOutcome::Ok);
+                assert_eq!(dev.xfer_in(600, &payload[600..]), XferOutcome::Ok);
+                // Verify via read.
+                let cdb = make_cdb10(op::READ_10, 0, 2);
+                let outcome = dev.do_cmd(&cdb, &mut w, 0).unwrap();
+                match outcome {
+                    CommandOutcome::DataIn {
+                        transfer_len: _,
+                        immediate,
+                    } => {
+                        assert!(immediate.is_empty());
+                        let mut buf = vec![0u8; 1024];
+                        assert_eq!(dev.xfer_out(0, &mut buf), XferOutcome::Ok);
+                        assert_eq!(buf, payload);
+                    }
+                    _ => panic!("expected DataIn"),
+                }
+            }
+            _ => panic!("expected DataOut"),
+        }
     }
 }

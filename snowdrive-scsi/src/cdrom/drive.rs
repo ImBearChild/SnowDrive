@@ -194,8 +194,8 @@ impl<'a> CdromDrive<'a> {
     // ── xfer helpers ──────────────────────────────────────────────
 
     pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, current_lba) = match self.pending {
-            Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
+        let (dir, transfer_len, block_size, base_lba) = match self.pending {
+            Some(p) => (p.dir, p.transfer_len, p.block_size, p.base_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
                 return XferOutcome::Error(XferError::NoCommand);
@@ -216,8 +216,7 @@ impl<'a> CdromDrive<'a> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        let intra = transfer_offset % u64::from(block_size);
-        let actual = current_lba * u64::from(SECTOR_SIZE) + intra;
+        let actual = base_lba * u64::from(block_size) + transfer_offset;
         let res = if let Some(ref mut m) = self.media {
             m.read_data(actual, buf)
         } else {
@@ -237,15 +236,11 @@ impl<'a> CdromDrive<'a> {
             }
             return XferOutcome::Error(XferError::Storage(e));
         }
-        let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
-        if let Some(p) = self.pending.as_mut() {
-            p.current_lba = p.current_lba.saturating_add(blocks);
-        }
         XferOutcome::Ok
     }
 
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
-        let (dir, transfer_len, block_size, current_lba) = match self.pending {
+        let (dir, transfer_len, block_size, base_lba) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.block_size, p.current_lba),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
@@ -271,21 +266,14 @@ impl<'a> CdromDrive<'a> {
             self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
             return XferOutcome::Error(XferError::WriteProtected);
         }
-        let intra = transfer_offset % u64::from(block_size);
-        let actual = current_lba * u64::from(SECTOR_SIZE) + intra;
+        let actual = base_lba * u64::from(block_size) + transfer_offset;
         let res = if let Some(ref mut m) = self.media {
             m.write_data(actual, buf)
         } else {
             Err(crate::cdrom::media::MediaError::WriteProtected)
         };
         match res {
-            Ok(()) => {
-                let blocks = (buf.len() as u64).div_ceil(u64::from(block_size));
-                if let Some(p) = self.pending.as_mut() {
-                    p.current_lba = p.current_lba.saturating_add(blocks);
-                }
-                XferOutcome::Ok
-            }
+            Ok(()) => XferOutcome::Ok,
             Err(e) => match e {
                 crate::cdrom::media::MediaError::WriteProtected => {
                     self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);

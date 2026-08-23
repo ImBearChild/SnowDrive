@@ -1441,17 +1441,7 @@ mod tests {
         let (resp, _) = conn.take_pdu().unwrap();
         assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
         assert_eq!(resp[3], status::GOOD);
-        // Only ram1 (LUN 1) must have been written.
-        {
-            use embedded_io::{Read, Seek};
-            // Check LUN 0 unchanged.
-            let b = devs[0].backend();
-            let mut buf = [0u8; 512];
-            let mut b_mut = b;
-            // Need mutable access via backend; we already have &mut devs, so re-borrow.
-        }
-        // Verify via direct RAM buffers (devs own the backend mutably, but rams are moved).
-        // Instead read back via READ.
+        // Verify via READ back.
         let read = read10_bhs(0, 1, 0xD1, 1);
         let mut read1 = read;
         read1[9] = 1;
@@ -1471,5 +1461,52 @@ mod tests {
         );
         let (_, data0) = conn.take_pdu().unwrap();
         assert_eq!(data0, vec![0u8; 512], "LUN 0 must remain untouched");
+    }
+
+    #[test]
+    fn large_read_non_aligned_chunks_via_session() {
+        // Regression for O1: 262096 % 512 = 464, so a 307200-byte READ
+        // (600 blocks) with a 256 KiB work buffer splits as 262096 + 45104.
+        // The old `current_lba*512 + offset%512` skipped 512 bytes on the
+        // second chunk; the fixed `base*512 + offset` is correct.
+        let mut conn = MockConn::new();
+        let mut session = Session::default();
+        let mut work = vec![0u8; 256 * 1024];
+        let mut ram = vec![0u8; 2 * 1024 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected = ram[0..600 * 512].to_vec();
+        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        let cmd = read10_bhs(0, 600, 0x7777, 0);
+        conn.feed(&cmd, &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let mut collected = Vec::new();
+        let mut saw_data_in = 0;
+        let mut last_bo = 0u32;
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                let bo = u32::from_be_bytes([bhs[40], bhs[41], bhs[42], bhs[43]]);
+                assert_eq!(bo, last_bo, "BufferOffset must be contiguous");
+                last_bo += data.len() as u32;
+                collected.extend_from_slice(&data);
+                saw_data_in += 1;
+                if bhs[1] & flag::F_BIT != 0 {
+                    assert_ne!(bhs[1] & flag::S_BIT, 0, "final Data-In must have S bit");
+                }
+            }
+        }
+        assert!(
+            saw_data_in >= 2,
+            "expected >=2 Data-In PDUs, got {saw_data_in}"
+        );
+        assert_eq!(collected.len(), 600 * 512);
+        assert_eq!(collected, expected, "large READ must be byte-exact");
     }
 }
