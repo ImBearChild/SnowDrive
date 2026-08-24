@@ -5,7 +5,8 @@
 //! [`crate::scsi::spc`]; READ commands return an empty `immediate` and
 //! the target fetches the data via `xfer_out`.
 
-use crate::scsi::backend::{BlockStorage, BlockStorageError};
+use crate::common::block_storage::{FlatData, WritableFlatData};
+use crate::scsi::backend::BlockStorageError;
 use crate::scsi::device::{
     CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
 };
@@ -17,33 +18,78 @@ use crate::scsi::spc::{
 
 const CLEAR_SENSE: Sense = Sense::clear();
 
-/// Direct-access block device (device_internal.h `snowscsi_device`).
-pub struct BlockDevice<B: BlockStorage> {
-    backend: B,
+/// Optical profile sector size (CD-ROM Mode 1 data).
+pub const CD_SECTOR_SIZE: u32 = 2048;
+
+/// INQUIRY identity for the optical read-only profile (the former
+/// `CDBlockDevice`, plan §8.1b): SCSI family with the SPC-4 and MMC-6
+/// version descriptors replacing the block device's SBC.
+pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
+    vendor: *b"SnowSCSI",
+    product: *b"HyperMulti DVD  ",
+    revision: *b"0100",
+    version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
+};
+
+/// Write-path capability captured at construction time (`disk()` only).
+///
+/// Plain `fn` pointers parameterized by the backend type — no trait bound
+/// on the struct itself, so a read-only backend (`FlatData` only) can
+/// never reach the write path.
+#[derive(Clone, Copy)]
+pub(crate) struct WriteOps<D> {
+    write_at: fn(&mut D, u64, &[u8]) -> Result<(), BlockStorageError>,
+    sync: fn(&mut D) -> Result<(), BlockStorageError>,
+}
+
+/// SCSI LUN over an offset-addressed byte plane.
+///
+/// Two profiles share this one type:
+///
+/// - [`BlockDevice::disk`] — writable direct-access device (PDT 0x00,
+///   `BLOCK_IDENTITY`). Requires `D: WritableFlatData`.
+/// - [`BlockDevice::cdrom`] — read-only optical profile (PDT 0x05,
+///   `CDBLOCK_IDENTITY`, 2048-byte sectors, writes rejected with DATA
+///   PROTECT). Accepts any `D: FlatData`, including generated sources
+///   such as live ISO9660. This is the former `CDBlockDevice`, now over
+///   any backend instead of only files.
+pub struct BlockDevice<D: FlatData> {
+    backend: D,
     sector_size: u32,
+    /// Policy writability (second kind of "not writable"): a disk opened
+    /// from a read-only image reports DATA PROTECT even though its
+    /// backend could write.
+    writable: bool,
+    /// Capability capture (first kind): `None` ⇒ the plane cannot write,
+    /// ever. Set iff constructed via `disk()`.
+    write_ops: Option<WriteOps<D>>,
+    identity: DeviceIdentity,
+    pdt: DeviceType,
     sense: Option<Sense>,
     pending: Option<PendingXfer>,
     prevent_removal: bool,
 }
 
-impl<B: BlockStorage> BlockDevice<B> {
-    /// Create a block device over `backend` with the given sector size.
-    pub fn new(backend: B, sector_size: u32) -> Result<Self, Error> {
-        if sector_size == 0 {
-            return Err(Error::InvalidSectorSize);
-        }
+impl<D: FlatData> BlockDevice<D> {
+    /// Read-only optical profile (the former `CDBlockDevice`): sector size
+    /// fixed at 2048, every write rejected with DATA PROTECT, MODE SELECT
+    /// accepted as a no-op, START STOP ignored.
+    pub fn cdrom(backend: D) -> Result<Self, Error> {
         Ok(Self {
             backend,
-            sector_size,
+            sector_size: CD_SECTOR_SIZE,
+            writable: false,
+            write_ops: None,
+            identity: CDBLOCK_IDENTITY,
+            pdt: DeviceType::Cdrom,
             sense: None,
             pending: None,
             prevent_removal: false,
         })
     }
 
-    /// Raw backend access for the target data path (READ reads chunks,
-    /// WRITE writes received data back).
-    pub fn backend(&mut self) -> &mut B {
+    /// Raw plane access for the target data path and wrapper authors.
+    pub fn backend(&mut self) -> &mut D {
         &mut self.backend
     }
 
@@ -52,7 +98,7 @@ impl<B: BlockStorage> BlockDevice<B> {
     }
 
     pub fn device_type(&self) -> DeviceType {
-        DeviceType::Block
+        self.pdt
     }
 
     pub fn peek_sense(&self) -> Option<&Sense> {
@@ -73,7 +119,7 @@ impl<B: BlockStorage> BlockDevice<B> {
         nblocks.saturating_sub(1)
     }
 
-    pub(crate) fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
+    pub fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
         self.sense = Some(Sense::new(key, asc, ascq));
     }
 
@@ -90,6 +136,15 @@ impl<B: BlockStorage> BlockDevice<B> {
             return Err(BlockStorageError::OutOfBounds);
         }
         Ok(())
+    }
+
+    /// Flush via the captured sync op (`SYNCHRONIZE CACHE`, shutdown).
+    /// Read-only profiles are always clean.
+    pub(crate) fn sync_backend(&mut self) -> Result<(), BlockStorageError> {
+        match self.write_ops.as_ref() {
+            Some(ops) => (ops.sync)(&mut self.backend),
+            None => Ok(()),
+        }
     }
 
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
@@ -118,27 +173,23 @@ impl<B: BlockStorage> BlockDevice<B> {
             return XferOutcome::Error(XferError::Overrun);
         }
         let actual = base_byte + transfer_offset;
-        if self.check_bounds(actual, buf.len()).is_err() {
+        if let Err(e) = self.check_bounds(actual, buf.len()) {
             self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
+            return XferOutcome::Error(XferError::Storage(e));
         }
-        if embedded_io::Seek::seek(&mut self.backend, embedded_io::SeekFrom::Start(actual)).is_err()
-        {
+        if let Err(e) = self.backend.read_at(actual, buf) {
             self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
-                embedded_io::ErrorKind::Other,
-            )));
-        }
-        if embedded_io::Read::read_exact(&mut self.backend, buf).is_err() {
-            self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
-                embedded_io::ErrorKind::Other,
-            )));
+            return XferOutcome::Error(XferError::Storage(e));
         }
         XferOutcome::Ok
     }
 
     /// Write `buf` for the current WRITE transfer (host → device).
+    ///
+    /// Rejection order: transfer bookkeeping first, then the two kinds of
+    /// "not writable" — capability (`write_ops: None`) and policy
+    /// (`writable: false`) — both DATA PROTECT, then bounds, then the
+    /// actual plane write.
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
@@ -162,23 +213,19 @@ impl<B: BlockStorage> BlockDevice<B> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
+        if !self.writable {
+            self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+            return XferOutcome::Error(XferError::WriteProtected);
+        }
         let actual = base_byte + transfer_offset;
-        if self.check_bounds(actual, buf.len()).is_err() {
+        if let Err(e) = self.check_bounds(actual, buf.len()) {
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::OutOfBounds));
+            return XferOutcome::Error(XferError::Storage(e));
         }
-        if embedded_io::Seek::seek(&mut self.backend, embedded_io::SeekFrom::Start(actual)).is_err()
-        {
+        let ops = self.write_ops.as_ref().expect("writable ⇒ write_ops");
+        if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
-                embedded_io::ErrorKind::Other,
-            )));
-        }
-        if embedded_io::Write::write_all(&mut self.backend, buf).is_err() {
-            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return XferOutcome::Error(XferError::Storage(BlockStorageError::Io(
-                embedded_io::ErrorKind::Other,
-            )));
+            return XferOutcome::Error(XferError::Storage(e));
         }
         XferOutcome::Ok
     }
@@ -241,6 +288,11 @@ impl<B: BlockStorage> BlockDevice<B> {
         count: u32,
         _data: &mut [u8],
     ) -> CommandOutcome {
+        if !self.writable {
+            // Read-only profile/image: immediate DATA PROTECT (the former
+            // CDBlockDevice behavior).
+            return self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED);
+        }
         if count == 0 {
             return CommandOutcome::Status;
         }
@@ -311,13 +363,45 @@ impl<B: BlockStorage> BlockDevice<B> {
     }
 }
 
-impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
+impl<D: WritableFlatData> BlockDevice<D> {
+    /// Writable direct-access disk (PDT 0x00, `BLOCK_IDENTITY`). Only
+    /// backends that can actually write reach this constructor —
+    /// "writable if writable".
+    pub fn disk(backend: D, sector_size: u32) -> Result<Self, Error> {
+        if sector_size == 0 {
+            return Err(Error::InvalidSectorSize);
+        }
+        Ok(Self {
+            backend,
+            sector_size,
+            writable: true,
+            write_ops: Some(WriteOps {
+                write_at: D::write_at,
+                sync: D::sync,
+            }),
+            identity: BLOCK_IDENTITY,
+            pdt: DeviceType::Block,
+            sense: None,
+            pending: None,
+            prevent_removal: false,
+        })
+    }
+
+    /// Policy switch for read-only *disk* images (PDT 0x00 but RO): the
+    /// backend stays writable-capable, the device refuses writes. serve 前
+    /// 设置；对 `cdrom()` profile 无意义（恒只读）。
+    pub fn set_writable(&mut self, writable: bool) {
+        self.writable = writable;
+    }
+}
+
+impl<D: FlatData> SpcDevice for BlockDevice<D> {
     fn device_type(&self) -> DeviceType {
-        DeviceType::Block
+        self.pdt
     }
 
     fn identity(&self) -> &DeviceIdentity {
-        &BLOCK_IDENTITY
+        &self.identity
     }
 
     fn id(&self) -> u64 {
@@ -343,6 +427,11 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
+        // Optical profile accepts and ignores START STOP (former
+        // CDBlockDevice behavior); disk honors prevent/allow removal.
+        if self.pdt == DeviceType::Cdrom {
+            return SpcEffect::Good;
+        }
         if loej && !load && self.prevent_removal {
             SpcEffect::RemovalPrevented
         } else {
@@ -355,7 +444,7 @@ impl<B: BlockStorage> SpcDevice for BlockDevice<B> {
     }
 }
 
-impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
+impl<D: FlatData> ScsiDevice for BlockDevice<D> {
     fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.do_cmd(cdb, data)
     }
@@ -377,18 +466,23 @@ impl<B: BlockStorage> ScsiDevice for BlockDevice<B> {
     }
 
     fn device_type(&self) -> DeviceType {
-        DeviceType::Block
+        self.pdt
     }
 
     fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome {
-        // Block device accepts any MODE SELECT parameter (no-op).
+        // Both profiles accept any MODE SELECT parameter (no-op).
         CommandOutcome::Status
+    }
+
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        self.sync_backend()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::block_storage::FlatData;
     use crate::scsi::backend::RamBackend;
     use crate::scsi::scsi::op;
 
@@ -455,13 +549,13 @@ mod tests {
     }
 
     fn ram_dev<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
-        BlockDevice::new(RamBackend::new(ram), 512).unwrap()
+        BlockDevice::disk(RamBackend::new(ram), 512).unwrap()
     }
 
     /// Extract the DataIn payload (backend read via xfer_out or work-resident).
     /// Returns the number of bytes transferred. For OutInline, copies from work.
-    fn data_in<B: BlockStorage>(
-        dev: &mut BlockDevice<B>,
+    fn data_in<D: FlatData>(
+        dev: &mut BlockDevice<D>,
         outcome: CommandOutcome,
         work: &[u8],
         buf: &mut [u8],
@@ -494,7 +588,7 @@ mod tests {
     #[test]
     fn block_create_rejects_zero_sector() {
         let mut ram = [0u8; 512];
-        assert!(BlockDevice::new(RamBackend::new(&mut ram), 0).is_err());
+        assert!(BlockDevice::disk(RamBackend::new(&mut ram), 0).is_err());
     }
 
     #[test]
@@ -804,7 +898,7 @@ mod tests {
 
         let backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), true).unwrap();
-        let mut dev = BlockDevice::new(backend, 512).unwrap();
+        let mut dev = BlockDevice::disk(backend, 512).unwrap();
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
         w[0..512].copy_from_slice(&pattern);
@@ -838,7 +932,7 @@ mod tests {
 
         let backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), false).unwrap();
-        let mut dev = BlockDevice::new(backend, 512).unwrap();
+        let mut dev = BlockDevice::disk(backend, 512).unwrap();
         let mut w = work();
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);

@@ -43,6 +43,7 @@
 use core::cmp::Ordering;
 use heapless::{String, Vec};
 
+use snowdrive_common::block_storage::{BlockStorageError, FlatData};
 use snowdrive_common::fs_storage::{DirEntry, FsError, FsStorage, OpenOptions};
 
 /// Sector size for ISO 9660.
@@ -1337,7 +1338,8 @@ impl From<IsoError> for CdLiveFsError {
 /// ISO9660/Joliet LBA layout, and serves sectors on the fly.
 ///
 /// Implements [`embedded_io::Read`] + [`embedded_io::Seek`] so it can be
-/// used as a standalone ISO image reader without any SCSI dependency.
+/// used as a standalone ISO image reader without any SCSI dependency, and
+/// [`FlatData`] so it slots into a CD-ROM media tray like any image.
 pub struct LiveData<F: FsStorage> {
     #[allow(dead_code)] // kept for lifetime / ownership
     fs: F,
@@ -1411,6 +1413,35 @@ impl<F: FsStorage> LiveData<F> {
             .map_err(|_| embedded_io::ErrorKind::Other)?;
         sector[got..need].fill(0);
         Ok(())
+    }
+}
+
+// ── FlatData: slot-usable read-only plane ──────────────────
+
+impl<F: FsStorage> FlatData for LiveData<F> {
+    fn read_at(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        use embedded_io::{Read, Seek};
+        let mut off = byte_offset;
+        let mut dst = buf;
+        while !dst.is_empty() {
+            let lba = (off / u64::from(crate::SECTOR_SIZE)) as u32;
+            let within = (off % u64::from(crate::SECTOR_SIZE)) as usize;
+            let n = (crate::SECTOR_SIZE as usize - within).min(dst.len());
+            let mut tmp = [0u8; crate::SECTOR_SIZE as usize];
+            self.seek(embedded_io::SeekFrom::Start(
+                lba as u64 * u64::from(crate::SECTOR_SIZE),
+            ))
+            .map_err(|_| BlockStorageError::OutOfBounds)?;
+            Read::read(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
+            dst[..n].copy_from_slice(&tmp[within..within + n]);
+            off += n as u64;
+            dst = &mut dst[n..];
+        }
+        Ok(())
+    }
+
+    fn capacity(&self) -> u64 {
+        self.size()
     }
 }
 

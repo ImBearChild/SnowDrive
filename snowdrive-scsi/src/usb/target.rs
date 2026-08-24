@@ -1013,7 +1013,7 @@ mod tests {
 
     /// A 64 KiB block device over stack-owned RAM.
     fn test_dev(ram: &mut [u8]) -> BlockDevice<BlockBackend<'_>> {
-        BlockDevice::new(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap()
+        BlockDevice::disk(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap()
     }
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {

@@ -1,7 +1,7 @@
 //! UdfRw media layer (UDF RW).
 //!
-//! A random-writable DVD-RAM over any [`BlockStorage`] backend, built on the
-//! pure volume skeleton of [`crate::udf_void`].
+//! A random-writable DVD-RAM over any [`WritableFlatData`] byte plane,
+//! built on the pure volume skeleton of [`crate::udf_void`].
 //!
 //! - **Materialize** an empty UDF 2.01 volume into the backend (only when
 //!   `mkfs=true` is specified at CLI open time) by streaming the structured
@@ -20,18 +20,36 @@
 //! writes it later. This layer never parses UDF contents.
 
 use crate::cdrom::common::SECTOR_SIZE;
-use crate::scsi::backend::{BlockStorage, BlockStorageError};
+use crate::common::block_storage::{BlockStorageError, FlatData, WritableFlatData};
 use crate::udf_void::{
     compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError,
 };
 
 /// A random-writable DVD-RAM (UDF 2.01 plain build) over a byte plane.
-pub struct UdfRwMedia<B: BlockStorage> {
-    backend: B,
+pub struct UdfRwMedia<D: WritableFlatData> {
+    backend: D,
     layout: Layout,
 }
 
-impl<B: BlockStorage> UdfRwMedia<B> {
+/// Open policy for [`UdfRwMedia::open_or_materialize`] (replaces the old
+/// `force_mkfs: bool` trap parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Use the existing backend content as-is (no UDF detection — the
+    /// layout is computed from capacity).
+    AsIs,
+    /// Materialize a fresh UDF 2.01 volume (destructive).
+    Materialize,
+}
+
+/// Parameters for [`UdfRwMedia::open_or_materialize`].
+pub struct UdfRwOptions<'s> {
+    pub mode: OpenMode,
+    /// Scratch space (≥ 1 byte) backing the SBD CRC computation.
+    pub scratch: &'s mut [u8],
+}
+
+impl<D: WritableFlatData> UdfRwMedia<D> {
     /// Whether `backend` already holds a formatted UdfRw volume — a valid
     /// AVDP at sector 256 (tag id 2 + checksum + CRC).
     ///
@@ -39,15 +57,10 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     /// The logical medium is always formatted (logical blocks always exist).
     /// This function is used only by CLI `mkfs` policy to decide whether
     /// to materialize a new UDF volume.
-    pub fn has_udf(backend: &mut B) -> bool {
+    pub fn has_udf(backend: &mut D) -> bool {
         let mut sector = [0u8; SECTOR_SIZE as usize];
         let off = u64::from(crate::udf_void::AVDP_LBA) * u64::from(SECTOR_SIZE);
-        if backend.seek(embedded_io::SeekFrom::Start(off)).is_err()
-            || backend.read_exact(&mut sector).is_err()
-        {
-            return false;
-        }
-        is_avdp(&sector)
+        backend.read_at(off, &mut sector).is_ok() && is_avdp(&sector)
     }
 
     /// Open an existing volume, or materialize a fresh one into `backend`.
@@ -61,18 +74,18 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     /// `force_mkfs` is true, a new UDF 2.01 volume is materialized
     /// (destructive).
     pub fn open_or_materialize(
-        backend: B,
+        backend: D,
         label: &str,
-        force_mkfs: bool,
-        scratch: &mut [u8],
+        opts: UdfRwOptions<'_>,
     ) -> Result<Self, UdfRwError> {
-        let b = backend;
-        if force_mkfs {
-            Self::materialize(b, label, scratch)
-        } else {
-            let layout =
-                compute_layout(sectors_of(b.capacity())?, label).map_err(UdfRwError::Layout)?;
-            Ok(Self { backend: b, layout })
+        match opts.mode {
+            OpenMode::Materialize => Self::materialize(backend, label, opts.scratch),
+            OpenMode::AsIs => {
+                let capacity = <D as FlatData>::capacity(&backend);
+                let layout =
+                    compute_layout(sectors_of(Ok(capacity))?, label).map_err(UdfRwError::Layout)?;
+                Ok(Self { backend, layout })
+            }
         }
     }
 
@@ -80,12 +93,12 @@ impl<B: BlockStorage> UdfRwMedia<B> {
     /// (destructive). Writes only the structured sectors; free space stays
     /// zero. `scratch` (≥ 1 byte) backs the SBD CRC computation.
     pub fn materialize(
-        mut backend: B,
+        mut backend: D,
         label: &str,
         scratch: &mut [u8],
     ) -> Result<Self, UdfRwError> {
-        let layout =
-            compute_layout(sectors_of(backend.capacity())?, label).map_err(UdfRwError::Layout)?;
+        let layout = compute_layout(sectors_of(Ok(<D as FlatData>::capacity(&backend)))?, label)
+            .map_err(UdfRwError::Layout)?;
 
         let mut sector = [0u8; SECTOR_SIZE as usize];
 
@@ -113,12 +126,7 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         gen_sector(&layout, layout.sbd_lba, &mut sector);
         patch_sbd_crc(&mut sector, crc);
         let off = u64::from(layout.sbd_lba) * u64::from(SECTOR_SIZE);
-        backend
-            .seek(embedded_io::SeekFrom::Start(off))
-            .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
-        backend
-            .write_all(&sector)
-            .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
+        backend.write_at(off, &sector).map_err(UdfRwError::Block)?;
         for lba in (layout.sbd_lba + 1)..(layout.sbd_lba + layout.sbd_sectors) {
             write_sector(&mut backend, &layout, lba, &mut sector)?;
         }
@@ -130,7 +138,7 @@ impl<B: BlockStorage> UdfRwMedia<B> {
 
     /// Capacity in bytes (the backend length).
     pub fn capacity(&self) -> u64 {
-        BlockStorage::capacity(&self.backend)
+        self.backend.capacity()
     }
 
     /// Largest readable LBA (`capacity / 2048 − 1`, saturating).
@@ -148,35 +156,24 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         &self.layout
     }
 
-    /// Raw backend access.
-    pub fn backend(&mut self) -> &mut B {
+    /// Raw plane access.
+    pub fn backend(&mut self) -> &mut D {
         &mut self.backend
     }
 
     /// Read from the byte plane (target data path).
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        self.backend
-            .seek(embedded_io::SeekFrom::Start(offset))
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
-        self.backend
-            .read_exact(buf)
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
+        self.backend.read_at(offset, buf)
     }
 
     /// Write to the byte plane (target data path).
     pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
-        self.backend
-            .seek(embedded_io::SeekFrom::Start(offset))
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
-        self.backend
-            .write_all(buf)
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
+        self.backend.write_at(offset, buf)
     }
 
     /// Flush the byte plane.
     pub fn sync(&mut self) -> Result<(), BlockStorageError> {
-        BlockStorage::sync(&mut self.backend)
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
+        self.backend.sync()
     }
 
     /// FORMAT UNIT for the emulated DVD-RAM medium.
@@ -197,12 +194,7 @@ impl<B: BlockStorage> UdfRwMedia<B> {
         let mut offset = 0u64;
         while offset < self.capacity() {
             let len = (self.capacity() - offset).min(zeroes.len() as u64) as usize;
-            self.backend
-                .seek(embedded_io::SeekFrom::Start(offset))
-                .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
-            self.backend
-                .write_all(&zeroes[..len])
-                .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
+            self.backend.write_at(offset, &zeroes[..len])?;
             offset += len as u64;
         }
         Ok(())
@@ -211,51 +203,22 @@ impl<B: BlockStorage> UdfRwMedia<B> {
 
 /// Floor `capacity` to whole 2048-byte sectors, rejecting volumes that do
 /// not fit in the UDF void address space.
-fn sectors_of(capacity: u64) -> Result<u32, UdfRwError> {
+fn sectors_of(capacity: Result<u64, BlockStorageError>) -> Result<u32, UdfRwError> {
+    let capacity = capacity?;
+
     u32::try_from(capacity / u64::from(SECTOR_SIZE)).map_err(|_| UdfRwError::CapacityTooLarge)
 }
 
 /// Generate and write one structured sector at `lba`.
-fn write_sector<B: BlockStorage>(
-    backend: &mut B,
+fn write_sector<D: WritableFlatData>(
+    backend: &mut D,
     layout: &Layout,
     lba: u32,
     sector: &mut [u8; SECTOR_SIZE as usize],
 ) -> Result<(), UdfRwError> {
     gen_sector(layout, lba, sector);
     let off = u64::from(lba) * u64::from(SECTOR_SIZE);
-    backend
-        .seek(embedded_io::SeekFrom::Start(off))
-        .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))?;
-    backend
-        .write_all(sector)
-        .map_err(|_| UdfRwError::Block(BlockStorageError::Io(embedded_io::ErrorKind::Other)))
-}
-
-#[allow(dead_code)]
-fn write_at<B: BlockStorage>(
-    backend: &mut B,
-    lba: u32,
-    sector: &[u8; SECTOR_SIZE as usize],
-) -> Result<(), BlockStorageError> {
-    let off = u64::from(lba) * u64::from(SECTOR_SIZE);
-    backend
-        .seek(embedded_io::SeekFrom::Start(off))
-        .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
-    backend
-        .write_all(sector)
-        .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
-}
-
-#[allow(dead_code)]
-fn write_sector_io<B: BlockStorage>(
-    backend: &mut B,
-    layout: &Layout,
-    lba: u32,
-    sector: &mut [u8; SECTOR_SIZE as usize],
-) -> Result<(), BlockStorageError> {
-    gen_sector(layout, lba, sector);
-    write_at(backend, lba, sector)
+    backend.write_at(off, sector).map_err(UdfRwError::Block)
 }
 
 // ── Error type ──────────────────────────────────────────────────────

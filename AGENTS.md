@@ -57,9 +57,9 @@ making changes. Crate names at a glance:
 
 | Component | Status |
 |-----------|--------|
-| `snowdrive-common` | Done — `BlockStorage`/`FsStorage` seams + logging macros (`log`/`defmt` dispatch). |
+| `snowdrive-common` | Done — capability ladder `FlatData`(① read) → `WritableFlatData`(② write+sync) → `BlockStorage`(③ embedded-io entry; blankets lift ③ into ①/②) + erased slot refs `FlatRef`/`RwRef`; plus `FsStorage` seam and logging macros. |
 | `snowdrive-disc` | Done — ISO9660/Joliet live-generation (`live.rs`), moved out of the old `iso9660` module. `LiveData`/`LiveDataBuilder`/`compute_layout`. |
-| `snowdrive-scsi::scsi` | Done — `BlockDevice` (SBC+SPC), `CDBlockDevice` (lazy read-only ISO), `FileBackend`/`RamBackend`/`StdFsBackend`, `Device` enum (`Block`/`CdBlock`/`Cdrom`). Recent refactor: generic `SenseState` for pending sense (`REQUEST SENSE` deferral). |
+| `snowdrive-scsi::scsi` | Done — seam-first rewrite: one `BlockDevice<D: FlatData>` with two profiles (`disk()` writable PDT 0x00 / `cdrom()` read-only PDT 0x05, the former `CDBlockDevice`, over ANY plane incl. user backends); transports are generic over `D: ScsiDevice` (+ blanket for `&mut T`) so users implement their own LUNs; the closed `Device` enum is removed. |
 | `snowdrive-scsi::cdrom` | Done — `CdromDrive` dispatches all MMC commands; media types `FlatMedia` (full MMC), `LiveData`/`LiveDataBuilder` (livefs), `UdfRwMedia` (DVD-RAM, `udf_void`). Full MMC surface: READ TOC, GET CONFIGURATION, READ DISC INFORMATION, READ BUFFER CAPACITY, READ CAPACITY, DVD physical format, prevent/allow removal, tray exchange, pending Unit Attention. Legacy `CdromDevice`/`CdLiveFsDevice`/`UdfRwDevice` removed. |
 | `snowdrive-scsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine, BSD `TcpStream` transport behind `std`. Recent fixes: StatSN/DataSN/BufferOffset sequencing and the R2T/Data-In state machine. |
 | `snowdrive-scsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (non-blocking `BotSession::poll`). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowdrive-cli` under `cfg(target_os = "linux")`. |
@@ -104,8 +104,13 @@ git checkout legacy
   and `snowdrive-scsi`; `snowdrive-cli` uses `#![forbid(unsafe_code)]`.
   `snowdrive-tests` is the only crate that allows `unsafe` (libiscsi FFI).
   RFC 3720 only, no RFC 7143. `__*` files never committed.
-- **Device/`Device` semantics**: a single `Device<'_>` enum is what both
-  transports drive (`do_cmd` / `BotSession`). The CLI owns the borrowed backends
-  (RAM disks in `Vec<Vec<u8>>`, outliving the `Device` list) and calls
-  `sync()`/`sync_media()` on graceful shutdown. Dual-mount of the same path
+- **LUN model**: both transports drive any `D: ScsiDevice` via
+  `poll<…, D>(devs: &mut [D])`. Homogeneous arrays use concrete types
+  (`&mut [BlockDevice<B>]`); heterogeneous mixing uses
+  `[&mut dyn ScsiDevice]`. Users implement `ScsiDevice` directly or wrap
+  built-ins (see `ScsiDevice` doc for the canonical wrapper pattern).
+  The CLI owns typed vectors (`disks`/`drives`/`backends`/`lives`) and
+  builds a `Vec<&mut dyn ScsiDevice>`; shutdown flushes via
+  `ScsiDevice::sync()`. See `__SEAM_REWRITE.md` (agent memory) for the
+  full design. Dual-mount of the same path
   across planes is warned but permitted (each LUN is an independent SCSI device).

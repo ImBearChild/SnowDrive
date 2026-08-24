@@ -15,8 +15,7 @@
 use crate::cdrom::common::{CurrentProfile, MediaState};
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
-use crate::scsi::backend::BlockBackend;
-use crate::scsi::backend::BlockStorage;
+use crate::common::block_storage::{FlatData, FlatRef, RwRef};
 use crate::scsi::backend::BlockStorageError;
 
 // ── Geometry constants ─────────────────────────────────
@@ -225,24 +224,46 @@ pub enum MediaEventStatus {
 /// - * `Flat(…)` and `Live(…)`
 /// - * `Bundle(…)`
 pub enum CdMedia<'a> {
-    /// Flat ISO/RAM read-only image.
-    Flat(FlatMedia<BlockBackend<'a>>),
+    /// Read-only disc: flat ISO/RAM image or live-generated ISO9660 —
+    /// anything that speaks [`FlatData`]. Geometry derives from the
+    /// plane capacity at construction time.
+    Ro(FlatMedia<FlatRef<'a>>),
 
-    /// Live ISO9660 from a host directory.
-    #[cfg(all(feature = "livefs", feature = "std"))]
-    Live(Box<FlatMedia<LiveData<crate::scsi::fs_backend::StdFsBackend>>>),
-
-    /// Bundle: multi-track, multi-session disc package (plan ).
-    #[doc(hidden)]
-    Bundle(/* BundleMedia<FsBackend> */),
-
-    /// UDF random-writable DVD-RAM.
+    /// Random-writable DVD-RAM/RW: a UDF 2.01 volume over an erased
+    /// writable plane (`udf_void` feature).
     #[cfg(feature = "udf_void")]
-    UdfRw(UdfRwMedia<BlockBackend<'a>>),
+    Rw(UdfRwMedia<RwRef<'a>>),
+}
 
-    /// Marker for lifetime usage when all other variants are `cfg`-gated.
-    #[doc(hidden)]
-    _Phantom(core::marker::PhantomData<&'a ()>),
+/// Physical tray state: at most one disc, either loaded or parked by a
+/// SCSI-initiated eject (`START STOP loej=1`). A parked disc is logically
+/// NOT PRESENT but its borrow is held until [`CdromDrive::take_media`]
+/// returns it to the application.
+pub enum Tray<'a> {
+    /// No disc.
+    Empty,
+    /// Disc loaded and addressable.
+    Loaded(CdMedia<'a>),
+    /// Disc ejected by the host; awaiting reclaim via `take_media()`.
+    Parked(CdMedia<'a>),
+}
+
+impl<'a> Tray<'a> {
+    /// Take the disc out of any occupied state.
+    pub(crate) fn disc(self) -> Option<CdMedia<'a>> {
+        match self {
+            Tray::Empty => None,
+            Tray::Loaded(m) | Tray::Parked(m) => Some(m),
+        }
+    }
+}
+
+impl<'a> CdMedia<'a> {
+    /// Build a read-only disc over any [`FlatData`] source (ISO image,
+    /// RAM bytes, live-generated ISO9660, user planes).
+    pub fn ro<D: FlatData>(data: &'a mut D) -> Self {
+        Self::Ro(FlatMedia::new(FlatRef::new(data)))
+    }
 }
 
 impl<'a> CdMedia<'a> {
@@ -253,7 +274,7 @@ impl<'a> CdMedia<'a> {
         let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
         match self {
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(_) => MediaState {
+            Self::Rw(_) => MediaState {
                 profile,
                 present: true,
                 ready: true,
@@ -266,7 +287,7 @@ impl<'a> CdMedia<'a> {
                 max_lba,
                 block_size: SECTOR_SIZE,
             },
-            _ => MediaState {
+            Self::Ro(_) => MediaState {
                 profile,
                 present: true,
                 ready: true,
@@ -287,12 +308,9 @@ impl<'a> CdMedia<'a> {
     /// Current Profile for GET CONFIGURATION.
     pub fn profile(&self) -> CurrentProfile {
         match self {
-            Self::Flat(m) => m.profile(),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => m.profile(),
+            Self::Ro(m) => m.profile(),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(_) => CurrentProfile::DvdRam,
-            _ => CurrentProfile::CdRom,
+            Self::Rw(_) => CurrentProfile::DvdRam,
         }
     }
 
@@ -301,36 +319,27 @@ impl<'a> CdMedia<'a> {
     /// Largest readable LBA.
     pub fn max_lba(&self) -> u64 {
         match self {
-            Self::Flat(m) => m.max_lba(),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => m.max_lba(),
+            Self::Ro(m) => m.max_lba(),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.max_lba(),
-            _ => 0,
+            Self::Rw(m) => m.max_lba(),
         }
     }
 
     /// Lead-out start LBA = number of data sectors.
     pub fn lead_out_lba(&self) -> u32 {
         match self {
-            Self::Flat(m) => m.lead_out_lba(),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => m.lead_out_lba(),
+            Self::Ro(m) => m.lead_out_lba(),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.lead_out_lba(),
-            _ => 0,
+            Self::Rw(m) => m.lead_out_lba(),
         }
     }
 
     /// Media capacity in bytes.
     pub fn capacity(&self) -> u64 {
         match self {
-            Self::Flat(m) => FlatData::capacity(&m.data),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => FlatData::capacity(&m.data),
+            Self::Ro(m) => FlatData::capacity(&m.data),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.capacity(),
-            _ => 0,
+            Self::Rw(m) => m.capacity(),
         }
     }
 
@@ -339,49 +348,40 @@ impl<'a> CdMedia<'a> {
     /// Read data from the medium (target data path).
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
         match self {
-            Self::Flat(m) => m.read_data(offset, buf),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => m.read_data(offset, buf),
+            Self::Ro(m) => m.read_data(offset, buf),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.read_data(offset, buf),
-            _ => Err(BlockStorageError::OutOfBounds),
+            Self::Rw(m) => m.read_data(offset, buf),
         }
     }
 
     /// Write data to the medium (target data path).
     pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), MediaError> {
         match self {
-            Self::Flat(m) => m.write_data(offset, buf),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(m) => m.write_data(offset, buf),
+            Self::Ro(_) => Err(MediaError::WriteProtected),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.write_data(offset, buf).map_err(|e| match e {
+            Self::Rw(m) => m.write_data(offset, buf).map_err(|e| match e {
                 BlockStorageError::OutOfBounds => MediaError::OutOfBounds,
                 BlockStorageError::NotWritable => MediaError::WriteProtected,
                 BlockStorageError::Io(_) => MediaError::Io,
             }),
-            _ => Err(MediaError::WriteProtected),
         }
     }
 
     /// Flush the medium (SYNCHRONIZE CACHE).
     pub fn sync(&mut self) -> Result<(), MediaError> {
         match self {
-            Self::Flat(_) => Ok(()),
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(_) => Ok(()),
+            Self::Ro(_) => Ok(()),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.sync().map_err(|_| MediaError::Io),
-            _ => Ok(()),
+            Self::Rw(m) => m.sync().map_err(|_| MediaError::Io),
         }
     }
 
     /// Reinitialize a writable medium using its native format.
     pub fn format_unit(&mut self) -> Result<(), MediaError> {
         match self {
+            Self::Ro(_) => Err(MediaError::WriteProtected),
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => m.format_unit().map_err(|_| MediaError::Io),
-            _ => Err(MediaError::WriteProtected),
+            Self::Rw(m) => m.format_unit().map_err(|_| MediaError::Io),
         }
     }
 
@@ -389,14 +389,8 @@ impl<'a> CdMedia<'a> {
 
     /// Media event status for GET EVENT STATUS NOTIFICATION.
     pub fn event_status(&self) -> MediaEventStatus {
-        match self {
-            Self::Flat(_) => MediaEventStatus::NoChange,
-            #[cfg(all(feature = "livefs", feature = "std"))]
-            Self::Live(_) => MediaEventStatus::NoChange,
-            #[cfg(feature = "udf_void")]
-            Self::UdfRw(_) => MediaEventStatus::NoChange,
-            _ => MediaEventStatus::NoChange,
-        }
+        let _ = self;
+        MediaEventStatus::NoChange
     }
 
     // ── READ DVD STRUCTURE ────────────────────────────
@@ -405,14 +399,14 @@ impl<'a> CdMedia<'a> {
     pub fn dvd_physical_format(&self) -> Option<DvdPhysicalFormat> {
         match self {
             #[cfg(feature = "udf_void")]
-            Self::UdfRw(m) => Some(DvdPhysicalFormat {
+            Self::Rw(m) => Some(DvdPhysicalFormat {
                 disk_category_part_version: 0x10, // DVD-RAM, version 0
                 layer_type: 0x04,                 // single-layer, rewritable
                 data_start: 0x0003_0000,
                 data_end: 0x0003_0000 + m.lead_out_lba(),
                 next_writable: 0x0003_0000 + m.lead_out_lba(),
             }),
-            _ => None,
+            Self::Ro(_) => None,
         }
     }
 
@@ -420,7 +414,7 @@ impl<'a> CdMedia<'a> {
     pub fn supports_dvd_structure_format(&self, format: u8) -> bool {
         #[cfg(feature = "udf_void")]
         {
-            matches!(self, Self::UdfRw(_))
+            matches!(self, Self::Rw(_))
                 && matches!(format, 0 | 0x08 | 0x09 | 0x0A | 0x0B | 0x30 | 0xC0)
         }
         #[cfg(not(feature = "udf_void"))]
@@ -431,8 +425,14 @@ impl<'a> CdMedia<'a> {
     }
 }
 
+// ── FlatMedia ───────────────────────────────────────────────
+
+// `FlatData`/`WritableFlatData` live in `snowdrive-common::block_storage`
+// (the capability ladder); block backends are lifted by blanket impl and
+// generated sources implement `FlatData` directly.
+
 /// Physical format information for READ DVD STRUCTURE format 0
-/// (MMC-6 , Table 398).
+/// (MMC-6, Table 398).
 #[derive(Debug, Clone, Copy)]
 pub struct DvdPhysicalFormat {
     pub disk_category_part_version: u8,
@@ -440,35 +440,6 @@ pub struct DvdPhysicalFormat {
     pub data_start: u32,
     pub data_end: u32,
     pub next_writable: u32,
-}
-
-// ── FlatData / FlatMedia ─────────────────────────────────────
-
-/// Narrow byte-plane interface for flat (read-only) media backends.
-///
-/// Implemented by [`BlockBackend`] (ISO file / RAM disk) and
-/// [`LiveData`] (live ISO9660 generation).  The media layer exposes
-/// geometry on top; the drive layer handles SCSI command dispatch.
-pub trait FlatData {
-    /// Read `buf.len()` bytes starting at `byte_offset`.
-    fn read(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError>;
-
-    /// Capacity in bytes (for geometry derivation).
-    fn capacity(&self) -> u64;
-}
-
-impl FlatData for BlockBackend<'_> {
-    fn read(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        use embedded_io::{Read, Seek};
-        self.seek(embedded_io::SeekFrom::Start(byte_offset))
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))?;
-        self.read_exact(buf)
-            .map_err(|_| BlockStorageError::Io(embedded_io::ErrorKind::Other))
-    }
-
-    fn capacity(&self) -> u64 {
-        BlockStorage::capacity(self)
-    }
 }
 
 /// Flat (read-only) media: single track, single session, finalized.
@@ -483,8 +454,8 @@ pub struct FlatMedia<D: FlatData> {
 }
 
 impl<D: FlatData> FlatMedia<D> {
-    /// Create a flat media from a backend with an explicit profile.
-    pub fn new(data: D, profile: CurrentProfile) -> Self {
+    /// Create a flat media over `data`; geometry derives from its capacity.
+    pub fn new(data: D) -> Self {
         let cap = data.capacity();
         let capacity_sectors = (cap / u64::from(SECTOR_SIZE)).min(u32::MAX as u64) as u32;
         let tracks = [Track {
@@ -508,7 +479,6 @@ impl<D: FlatData> FlatMedia<D> {
             lead_out_lba: capacity_sectors,
             closed: true,
         }];
-        let _ = profile;
         Self {
             data,
             capacity_sectors,
@@ -543,7 +513,7 @@ impl<D: FlatData> FlatMedia<D> {
     }
 
     pub fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        self.data.read(byte_offset, buf)
+        self.data.read_at(byte_offset, buf)
     }
 
     pub fn write_data(&mut self, _offset: u64, _buf: &[u8]) -> Result<(), MediaError> {
@@ -554,35 +524,6 @@ impl<D: FlatData> FlatMedia<D> {
 // ── LiveData re-export from snowdrive-disc ───────────────────
 
 pub use snowdrive_disc::{CdLiveFsError, LiveData, LiveDataBuilder};
-
-// ── FlatData impl for LiveData ─────────────────────────────
-
-impl<F: snowdrive_common::fs_storage::FsStorage> FlatData for LiveData<F> {
-    fn read(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
-        use embedded_io::{Read, Seek};
-        let mut off = byte_offset;
-        let mut dst = buf;
-        while !dst.is_empty() {
-            let lba = (off / u64::from(snowdrive_disc::SECTOR_SIZE)) as u32;
-            let within = (off % u64::from(snowdrive_disc::SECTOR_SIZE)) as usize;
-            let n = (snowdrive_disc::SECTOR_SIZE as usize - within).min(dst.len());
-            let mut tmp = [0u8; snowdrive_disc::SECTOR_SIZE as usize];
-            self.seek(embedded_io::SeekFrom::Start(
-                lba as u64 * u64::from(snowdrive_disc::SECTOR_SIZE),
-            ))
-            .map_err(|_| BlockStorageError::OutOfBounds)?;
-            Read::read(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
-            dst[..n].copy_from_slice(&tmp[within..within + n]);
-            off += n as u64;
-            dst = &mut dst[n..];
-        }
-        Ok(())
-    }
-
-    fn capacity(&self) -> u64 {
-        self.size()
-    }
-}
 
 #[cfg(test)]
 mod tests {

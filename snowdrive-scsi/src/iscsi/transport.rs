@@ -216,7 +216,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut work = vec![0u8; MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         std::thread::scope(|scope| {

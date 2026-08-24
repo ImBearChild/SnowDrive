@@ -290,7 +290,7 @@ fn start_target_n_luns(
         // Coerce each guard to a `&mut [u8]` slice view, build the device.
         let mut devs: Vec<BlockDevice<RamBackend<'_>>> = Vec::with_capacity(n);
         for g in &mut guards {
-            devs.push(BlockDevice::new(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
+            devs.push(BlockDevice::disk(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
         }
         serve_conn(&mut conn, &mut work, &mut session, &mut devs)
     });

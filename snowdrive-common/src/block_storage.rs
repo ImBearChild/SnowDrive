@@ -8,6 +8,7 @@
 //! [`embedded_io::Seek`] — random-access byte storage using standard
 //! embedded-io cursor semantics.
 
+use embedded_io::Error as _;
 use embedded_io::ErrorKind as IoErrorKind;
 
 /// Block-storage error (no_std, `core::error::Error`).
@@ -67,6 +68,147 @@ pub trait BlockStorage: embedded_io::Read + embedded_io::Write + embedded_io::Se
     /// `Write::flush` only reaches the OS page cache; `sync()` calls
     /// through to the platform fsync. RAM backends are no-op.
     fn sync(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Read-only disc data plane: offset-addressed byte source (① in the
+/// capability ladder).
+///
+/// This is the media-layer seam — deliberately NOT [`BlockStorage`]:
+/// the error type is fixed ([`BlockStorageError`], no `Self::Error`
+/// projection) so `&mut dyn FlatData` is object-safe without associated
+/// type bindings, and addressing is explicit-offset rather than
+/// cursor-based (the cursor becomes a private detail of each impl, not a
+/// cross-layer contract).
+///
+/// Implement this directly for generated/streamed sources (live ISO9660,
+/// compressed images). Random-access block backends get it for free via
+/// the blanket impl below.
+pub trait FlatData {
+    /// Read `buf.len()` bytes starting at `off`.
+    ///
+    /// Implementations must bounds-check: `off + buf.len() > capacity()`
+    /// is [`BlockStorageError::OutOfBounds`] (do NOT rely on seek
+    /// truncation / short reads).
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError>;
+
+    /// Backing size in bytes (geometry derivation).
+    fn capacity(&self) -> u64;
+}
+
+/// Writable disc data plane (② in the capability ladder): [`FlatData`]
+/// plus offset-addressed write and flush.
+///
+/// Object-safe by construction (fixed error type) — this is what the
+/// random-writable media slot erases to. Block backends get it via the
+/// blanket impl; implement it directly only for exotic writable planes.
+pub trait WritableFlatData: FlatData {
+    /// Write `buf.len()` bytes at `off`. Same bounds contract as
+    /// [`FlatData::read_at`].
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError>;
+
+    /// Persist pending writes beyond page cache (`fsync` semantics).
+    fn sync(&mut self) -> Result<(), BlockStorageError>;
+}
+
+// Blanket lift: every block backend speaks both disc planes for free.
+// (Only ONE blanket per rung keyed on BlockStorage — and NO bare
+// `FlatData for &mut T` forwarding blanket anywhere: pairing it with
+// these would hit E0119, since a downstream `BlockStorage for &mut _`
+// impl could make them overlap. Runtime erasure therefore goes through
+// the dedicated newtype refs below.)
+impl<B: BlockStorage + ?Sized> FlatData for B {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        let end = off
+            .checked_add(buf.len() as u64)
+            .ok_or(BlockStorageError::OutOfBounds)?;
+        if end > BlockStorage::capacity(self) {
+            return Err(BlockStorageError::OutOfBounds);
+        }
+        self.seek(embedded_io::SeekFrom::Start(off))
+            .map_err(|e| BlockStorageError::Io(e.kind()))?;
+        self.read_exact(buf).map_err(|e| match e {
+            embedded_io::ReadExactError::UnexpectedEof => BlockStorageError::OutOfBounds,
+            embedded_io::ReadExactError::Other(e) => BlockStorageError::Io(e.kind()),
+        })
+    }
+
+    fn capacity(&self) -> u64 {
+        BlockStorage::capacity(self)
+    }
+}
+
+impl<B: BlockStorage + ?Sized> WritableFlatData for B {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        let end = off
+            .checked_add(buf.len() as u64)
+            .ok_or(BlockStorageError::OutOfBounds)?;
+        if end > BlockStorage::capacity(self) {
+            return Err(BlockStorageError::OutOfBounds);
+        }
+        self.seek(embedded_io::SeekFrom::Start(off))
+            .map_err(|e| BlockStorageError::Io(e.kind()))?;
+        self.write_all(buf)
+            .map_err(|e| BlockStorageError::Io(e.kind()))
+    }
+
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        BlockStorage::sync(self).map_err(|e| BlockStorageError::Io(e.kind()))
+    }
+}
+
+/// Erased read-only plane: what the media slot actually stores.
+///
+/// A newtype (rather than bare `&mut dyn FlatData`) keeps coherence
+/// clean against the [`BlockStorage`] blanket above, and gives the slot
+/// a concrete `FlatData` implementor without any reference-forwarding
+/// blanket.
+pub struct FlatRef<'a>(pub(crate) &'a mut dyn FlatData);
+
+impl<'a> FlatRef<'a> {
+    /// Erase any read-only source into a slot-usable plane reference.
+    pub fn new<D: FlatData>(data: &'a mut D) -> Self {
+        Self(data)
+    }
+}
+
+impl FlatData for FlatRef<'_> {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        self.0.read_at(off, buf)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.0.capacity()
+    }
+}
+
+/// Erased writable plane (media slot side).
+pub struct RwRef<'a>(pub(crate) &'a mut dyn WritableFlatData);
+
+impl<'a> RwRef<'a> {
+    /// Erase any writable backend into a slot-usable plane reference.
+    pub fn new<D: WritableFlatData>(data: &'a mut D) -> Self {
+        Self(data)
+    }
+}
+
+impl FlatData for RwRef<'_> {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        self.0.read_at(off, buf)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.0.capacity()
+    }
+}
+
+impl WritableFlatData for RwRef<'_> {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        self.0.write_at(off, buf)
+    }
+
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        self.0.sync()
+    }
 }
 
 /// RAM backend. Wraps a caller-provided `&mut [u8]` and implements

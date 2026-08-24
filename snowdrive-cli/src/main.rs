@@ -45,12 +45,12 @@ use clap::{Args, Parser};
 use snowdrive_scsi::cdrom::drive::CdromDrive;
 use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
 #[cfg(feature = "udf_void")]
-use snowdrive_scsi::cdrom::udfrw::UdfRwMedia;
+use snowdrive_scsi::cdrom::udfrw::{OpenMode, UdfRwMedia, UdfRwOptions};
+use snowdrive_scsi::common::block_storage::RwRef;
 use snowdrive_scsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowdrive_scsi::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowdrive_scsi::scsi::block::BlockDevice;
-use snowdrive_scsi::scsi::cdblock::CDBlockDevice;
-use snowdrive_scsi::scsi::device::Device;
+use snowdrive_scsi::scsi::device::ScsiDevice;
 use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 use snowdrive_scsi::MIN_DATA_LEN;
 
@@ -199,15 +199,33 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // The device pipeline is shared by both transports: parse the specs,
     // validate sources, allocate RAM disks and build the LUN list.
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
-    let mut devices: Vec<Device<'_>> = Vec::new();
-    if build_devices(&args, &mut ram_disks, &mut devices).is_err() {
+    let mut backends: Vec<BlockBackend> = Vec::new();
+    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
+    let mut disks: Vec<BlockDevice<RwRef>> = Vec::new();
+    let mut drives: Vec<CdromDrive> = Vec::new();
+    if build_devices(
+        &args,
+        &mut ram_disks,
+        &mut backends,
+        &mut lives,
+        &mut disks,
+        &mut drives,
+    )
+    .is_err()
+    {
         return ExitCode::FAILURE;
     }
+    // LUN array in protocol order: all --disk LUNs, then all --cdrom LUNs.
+    let mut luns: Vec<&mut dyn ScsiDevice> = disks
+        .iter_mut()
+        .map(|d| d as &mut dyn ScsiDevice)
+        .chain(drives.iter_mut().map(|d| d as &mut dyn ScsiDevice))
+        .collect();
 
     if let Some(selector) = args.usb.as_deref() {
         #[cfg(target_os = "linux")]
         {
-            return run_serve_usb(&args, &mut devices, work_size, selector);
+            return run_serve_usb(&args, &mut luns, work_size, selector);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -272,7 +290,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let mut work = vec![0u8; work_size];
     // Report the actual bound address: `--iscsi 127.0.0.1:0` picks an
     // ephemeral port, so callers (tests) must learn it from this line.
-    log::info!("listening on {bound} with {} LUN(s)", devices.len());
+    log::info!("listening on {bound} with {} LUN(s)", luns.len());
 
     // Auto-config: use open-iscsi to log in and expose a block device.
     // Runs in a helper thread so the blocking `serve` loop can start
@@ -287,7 +305,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         listener,
         &stop,
         &mut work,
-        &mut devices,
+        &mut luns,
         Some(DEFAULT_READ_TIMEOUT),
     );
 
@@ -305,21 +323,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     // Graceful exit: flush backends.
-    sync_devices(&mut devices);
+    sync_devices(&mut luns);
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
 
 /// Flush every backend; errors are reported to stderr but not fatal.
-fn sync_devices(devices: &mut [Device<'_>]) {
-    for (i, dev) in devices.iter_mut().enumerate() {
-        let failed = match dev {
-            Device::Block(d) => d.backend().sync().is_err(),
-            Device::CdBlock(d) => d.backend().sync().is_err(),
-            Device::Cdrom(d) => d.sync_media(),
-        };
-        if failed {
-            eprintln!("snowdrive: sync failed for LUN {i}");
+fn sync_devices(luns: &mut [&mut dyn ScsiDevice]) {
+    for (i, lun) in luns.iter_mut().enumerate() {
+        if let Err(e) = ScsiDevice::sync(lun) {
+            eprintln!("snowdrive: sync failed for LUN {i}: {e}");
         }
     }
 }
@@ -668,321 +681,266 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
 /// the sources, allocate the RAM disks and build the LUN list in order
 /// (all `--disk` devices first, then all `--cdrom` devices).
 ///
-/// `devices` borrows `ram_disks` (RAM-backed LUNs), which must therefore
-/// outlive it. On failure prints the error and returns `Err(())`.
+/// Ownership model: the caller owns every resource — RAM slots
+/// (`ram_disks`), CD-ROM plane backends (`cd_backends`) — and the two
+/// typed LUN vectors borrow from them; the caller then lends the LUNs to
+/// a transport as `&mut dyn ScsiDevice`. On failure prints the error and
+/// returns `Err(())`.
 fn build_devices<'a>(
     args: &ServeArgs,
     ram_disks: &'a mut Vec<Vec<u8>>,
-    devices: &mut Vec<Device<'a>>,
+    backends: &'a mut Vec<BlockBackend<'a>>,
+    lives: &'a mut Vec<LiveData<StdFsBackend>>,
+    disks: &mut Vec<BlockDevice<RwRef<'a>>>,
+    drives: &mut Vec<CdromDrive<'a>>,
 ) -> Result<(), ()> {
+    enum AnySpec<'x> {
+        Disk(&'x DiskSpec),
+        Cdrom(&'x CdromSpec),
+    }
+
     if args.disk.is_empty() && args.cdrom.is_empty() {
         eprintln!("snowdrive: --disk or --cdrom is required (at least one device)");
         return Err(());
     }
 
+    // Parsed specs in LUN order (--disk plane first, then --cdrom).
     let mut disk_specs = Vec::with_capacity(args.disk.len());
     for spec in &args.disk {
-        let parsed = match parse_disk_spec(spec) {
-            Ok(p) => p,
+        match parse_disk_spec(spec) {
+            Ok(p) => disk_specs.push(p),
             Err(msg) => {
                 eprintln!("snowdrive: invalid --disk spec '{spec}': {msg}");
                 return Err(());
             }
-        };
-        disk_specs.push(parsed);
+        }
     }
-
     let mut cdrom_specs = Vec::with_capacity(args.cdrom.len());
     for spec in &args.cdrom {
-        let parsed = match parse_cdrom_spec(spec) {
-            Ok(p) => p,
+        match parse_cdrom_spec(spec) {
+            Ok(p) => cdrom_specs.push(p),
             Err(msg) => {
                 eprintln!("snowdrive: invalid --cdrom spec '{spec}': {msg}");
                 return Err(());
             }
-        };
-        cdrom_specs.push(parsed);
-    }
-
-    // Reject missing sources up front (FileBackend would otherwise create a
-    // fresh empty file when opened writable; CdromDevice/CdLiveFs would
-    // otherwise fail later).
-    for spec in &disk_specs {
-        match spec {
-            DiskSpec::Img { path, .. } | DiskSpec::Cdrom { path } => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return Err(());
-                }
-            }
-            DiskSpec::Ram(_) => {}
         }
     }
-    for spec in &cdrom_specs {
-        match spec {
-            CdromSpec::Flat { path } => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return Err(());
-                }
-            }
-            CdromSpec::Live { dir } => {
-                if !Path::new(dir).is_dir() {
-                    eprintln!("snowdrive: directory not found: {dir}");
-                    return Err(());
-                }
-            }
-            #[cfg(feature = "udf_void")]
-            CdromSpec::UdfRw { .. } => {
-                // Existence / size / mkfs handling happens in build (new
-                // files are created with size=).
-            }
-        }
-    }
-
     for w in check_dual_mount(&dual_mount_specs(&disk_specs, &cdrom_specs)) {
         eprintln!("{w}");
     }
+    let any_specs: Vec<AnySpec> = disk_specs
+        .iter()
+        .map(AnySpec::Disk)
+        .chain(cdrom_specs.iter().map(AnySpec::Cdrom))
+        .collect();
 
-    // Allocate every RAM disk first so the Device array can borrow them
-    // without 'static / Box::leak — disjoint borrows via split_first_mut.
-    // Order: --disk RAM slots, then udfrw=ram: slots (consumed in the same
-    // order by the build loops below).
+    // ── Phase A: own every resource, in LUN order ──────────────────
+    // Exactly one byte-plane backend per non-Live LUN; Live owns its
+    // scanner. RAM slots are consumed from `ram_disks` via a walking
+    // split cursor (no reallocation, disjoint borrows).
     ram_disks.clear();
-    for spec in &disk_specs {
-        if let DiskSpec::Ram(size) = spec {
-            let bytes = match usize::try_from(*size) {
-                Ok(n) => n,
+    // Pre-allocate RAM slot vectors so the cursor below can split them.
+    for spec in &any_specs {
+        match spec {
+            AnySpec::Disk(DiskSpec::Ram(size)) => match usize::try_from(*size) {
+                Ok(n) => ram_disks.push(vec![0u8; n]),
                 Err(_) => {
                     eprintln!("snowdrive: RAM size {size} too large for this platform");
                     return Err(());
                 }
-            };
-            ram_disks.push(vec![0u8; bytes]);
-        }
-    }
-    #[cfg(feature = "udf_void")]
-    for spec in &cdrom_specs {
-        if let CdromSpec::UdfRw {
-            path: None,
-            size: Some(size),
-            ..
-        } = spec
-        {
-            let bytes = match usize::try_from(*size) {
-                Ok(n) => n,
+            },
+            #[cfg(feature = "udf_void")]
+            AnySpec::Cdrom(CdromSpec::UdfRw {
+                path: None,
+                size: Some(size),
+                ..
+            }) => match usize::try_from(*size) {
+                Ok(n) => ram_disks.push(vec![0u8; n]),
                 Err(_) => {
-                    eprintln!("snowdrive: udfrw=ram: size {size} too large for this platform");
+                    eprintln!("snowdrive: udfrw=ram: size {size} too large");
                     return Err(());
                 }
-            };
-            ram_disks.push(vec![0u8; bytes]);
+            },
+            _ => {}
         }
     }
+    backends.clear();
+    lives.clear();
+    let mut ram_cursor: &'a mut [Vec<u8>] = ram_disks;
 
-    // LUN order: all --disk devices first, then all --cdrom devices (clap
-    // collects each flag separately, so the interleaved appearance order
-    // cannot be restored; the two planes do not interleave).
-    devices.clear();
-    let mut ram_rest: &mut [Vec<u8>] = ram_disks;
-    let mut lun = 0usize;
-    for spec in &disk_specs {
+    for spec in &any_specs {
         match spec {
-            DiskSpec::Ram(_) => {
-                let (slot, tail) = ram_rest.split_first_mut().unwrap();
-                ram_rest = tail;
-                let backend = BlockBackend::Ram(RamBackend::new(slot));
-                let mut dev =
-                    BlockDevice::new(backend, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-                log::debug!("LUN {lun}: {} bytes block device", dev.backend().capacity());
-                devices.push(Device::Block(dev));
+            AnySpec::Disk(DiskSpec::Ram(size)) => {
+                let bytes = usize::try_from(*size).map_err(|_| {
+                    eprintln!("snowdrive: RAM size {size} too large for this platform");
+                })?;
+                let (slot, tail) = ram_cursor.split_first_mut().unwrap();
+                ram_cursor = tail;
+                slot.resize(bytes, 0);
+                backends.push(BlockBackend::Ram(RamBackend::new(slot)));
             }
-            DiskSpec::Img { path, read_only } => {
-                // Existence was checked by parse; FileBackend would otherwise
-                // create a fresh file when opened writable.
-                match FileBackend::open(path, !*read_only) {
-                    Ok(b) => {
-                        let mut dev = BlockDevice::new(BlockBackend::File(b), SECTOR_SIZE)
-                            .expect("SECTOR_SIZE is nonzero");
-                        log::debug!(
-                            "LUN {lun}: {path} block device ({}{} bytes)",
-                            if *read_only { "read-only, " } else { "" },
-                            dev.backend().capacity()
-                        );
-                        devices.push(Device::Block(dev));
-                    }
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open file block device {path}: {e}");
-                        return Err(());
-                    }
+            AnySpec::Disk(DiskSpec::Img { path, .. }) => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowdrive: file not found: {path}");
+                    return Err(());
                 }
+                let b = FileBackend::open(path, true).map_err(|e| {
+                    eprintln!("snowdrive: failed to open file block device {path}: {e}")
+                })?;
+                backends.push(BlockBackend::File(b));
             }
-            DiskSpec::Cdrom { path } => {
-                let dev = match CDBlockDevice::new(path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
-                        return Err(());
-                    }
-                };
-                log::debug!("LUN {lun}: {path} CD-ROM image");
-                devices.push(Device::CdBlock(dev));
+            AnySpec::Disk(DiskSpec::Cdrom { path }) => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowdrive: file not found: {path}");
+                    return Err(());
+                }
+                let b = FileBackend::open(path, false)
+                    .map_err(|e| eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}"))?;
+                backends.push(BlockBackend::File(b));
             }
-        }
-        lun += 1;
-    }
-    for spec in &cdrom_specs {
-        match spec {
-            CdromSpec::Flat { path } => {
-                let backend = match FileBackend::open(path, false) {
-                    Ok(b) => BlockBackend::File(b),
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}");
-                        return Err(());
-                    }
-                };
-                let cap = backend.capacity();
-                let flat = FlatMedia::new(
-                    backend,
-                    snowdrive_scsi::cdrom::CurrentProfile::from_capacity(cap),
-                );
-                let mut drive = CdromDrive::new();
-                drive.load(CdMedia::Flat(flat));
-                log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)",);
-                devices.push(Device::Cdrom(drive));
+            AnySpec::Cdrom(CdromSpec::Flat { path }) => {
+                if !Path::new(path).is_file() {
+                    eprintln!("snowdrive: file not found: {path}");
+                    return Err(());
+                }
+                let b = FileBackend::open(path, false)
+                    .map_err(|e| eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}"))?;
+                backends.push(BlockBackend::File(b));
             }
-            CdromSpec::Live { dir } => {
+            AnySpec::Cdrom(CdromSpec::Live { dir }) => {
                 let fs = StdFsBackend::new(dir);
                 let label = Path::new(dir)
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("SNOWDRIVE");
-                match LiveData::new(fs, label) {
-                    Ok(live) => {
-                        let total = live.layout().total;
-                        let flat = FlatMedia::new(
-                            live,
-                            snowdrive_scsi::cdrom::CurrentProfile::from_capacity(
-                                u64::from(total) * 2048,
-                            ),
-                        );
-                        let mut drive = CdromDrive::new();
-                        drive.load(CdMedia::Live(Box::new(flat)));
-                        log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)",);
-                        devices.push(Device::Cdrom(drive));
-                    }
-                    Err(e) => {
-                        eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
-                        return Err(());
-                    }
-                }
+                let live = LiveData::new(fs, label).map_err(|e| {
+                    eprintln!("snowdrive: failed to scan live directory {dir}: {e}");
+                })?;
+                lives.push(live);
             }
             #[cfg(feature = "udf_void")]
-            CdromSpec::UdfRw { .. } => {
-                ram_rest = match build_udfrw(ram_rest, lun, spec, devices) {
-                    Ok(tail) => tail,
-                    Err(()) => return Err(()),
+            AnySpec::Cdrom(CdromSpec::UdfRw { path, size, .. }) => match path.as_deref() {
+                Some(path) => {
+                    let existed = Path::new(path).exists();
+                    if existed && size.is_some() {
+                        eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
+                        return Err(());
+                    }
+                    if !existed {
+                        let Some(sz) = size else {
+                            eprintln!(
+                                "snowdrive: udfrw: file not found, use size= to create it: {path}"
+                            );
+                            return Err(());
+                        };
+                        create_sparse(path, *sz).map_err(|e| {
+                            eprintln!("snowdrive: udfrw: failed to create {path}: {e}");
+                        })?;
+                    }
+                    let b = FileBackend::open(path, true).map_err(|e| {
+                        eprintln!("snowdrive: udfrw: failed to open {path}: {e}");
+                    })?;
+                    backends.push(BlockBackend::File(b));
+                }
+                None => {
+                    let bytes = size.ok_or_else(|| {
+                        eprintln!("snowdrive: udfrw=ram: requires size=");
+                    })?;
+                    let bytes = usize::try_from(bytes).map_err(|_| {
+                        eprintln!("snowdrive: udfrw=ram: size too large");
+                    })?;
+                    let (slot, tail) = ram_cursor.split_first_mut().unwrap();
+                    ram_cursor = tail;
+                    slot.resize(bytes, 0);
+                    backends.push(BlockBackend::Ram(RamBackend::new(slot)));
+                }
+            },
+        }
+    }
+
+    // ── Phase B: lend each backend exactly once, build LUNs ────────
+    disks.clear();
+    drives.clear();
+    let mut be_iter = backends.iter_mut();
+    let mut live_iter = lives.iter_mut();
+    for (lun, spec) in any_specs.iter().enumerate() {
+        match spec {
+            AnySpec::Disk(ds) => {
+                let be = be_iter.next().unwrap();
+                let cap = be.capacity();
+                let ro = matches!(
+                    ds,
+                    DiskSpec::Img {
+                        read_only: true,
+                        ..
+                    }
+                ) || matches!(ds, DiskSpec::Cdrom { .. });
+                let mut dev = match ds {
+                    // Optical image profile (PDT 0x05): writes rejected at
+                    // the profile level; the erased plane type stays uniform.
+                    DiskSpec::Cdrom { path } => {
+                        log::debug!("LUN {lun}: {path} CD-ROM image");
+                        BlockDevice::cdrom(RwRef::new(be)).expect("nonzero sectors")
+                    }
+                    _ => BlockDevice::disk(RwRef::new(be), SECTOR_SIZE)
+                        .expect("SECTOR_SIZE is nonzero"),
                 };
+                if ro {
+                    dev.set_writable(false);
+                }
+                log::debug!(
+                    "LUN {lun}: block device ({cap} bytes{})",
+                    if ro { ", read-only" } else { "" }
+                );
+                disks.push(dev);
+            }
+            AnySpec::Cdrom(CdromSpec::Flat { path }) => {
+                let be = be_iter.next().unwrap();
+                let cap = be.capacity();
+                let mut drive = CdromDrive::new();
+                drive.load(CdMedia::ro(be));
+                log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
+                drives.push(drive);
+            }
+            AnySpec::Cdrom(CdromSpec::Live { dir }) => {
+                let live = live_iter.next().unwrap();
+                let total = live.layout().total;
+                let mut drive = CdromDrive::new();
+                drive.load(CdMedia::ro(live));
+                log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
+                drives.push(drive);
+            }
+            #[cfg(feature = "udf_void")]
+            AnySpec::Cdrom(CdromSpec::UdfRw { path, mkfs, .. }) => {
+                let be = be_iter.next().unwrap();
+                let label = path
+                    .as_deref()
+                    .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+                    .unwrap_or("SNOWDRIVE")
+                    .to_string();
+                let mut scratch = [0u8; 256];
+                let opts = UdfRwOptions {
+                    mode: if *mkfs {
+                        OpenMode::Materialize
+                    } else {
+                        OpenMode::AsIs
+                    },
+                    scratch: &mut scratch,
+                };
+                let media = UdfRwMedia::open_or_materialize(RwRef::new(be), &label, opts)
+                    .map_err(|e| eprintln!("snowdrive: udfrw: {e}"))?;
+                log::debug!("LUN {lun}: UdfRw DVD+RW ({} bytes)", media.capacity());
+                let mut drive = CdromDrive::builder()
+                    .capabilities(snowdrive_scsi::cdrom::HYPER_MULTI_CAPS)
+                    .build();
+                drive.load(CdMedia::Rw(media));
+                drives.push(drive);
             }
         }
-        lun += 1;
     }
     Ok(())
 }
 
-/// Build a `--cdrom udfrw=` device (file or RAM).
-/// `mkfs=true` forces a fresh UDF volume (destructive). Without `mkfs=true`,
-/// the backend is opened as-is (no UDF detection).
-#[cfg(feature = "udf_void")]
-fn build_udfrw<'a>(
-    mut ram_rest: &'a mut [Vec<u8>],
-    lun: usize,
-    spec: &CdromSpec,
-    devices: &mut Vec<Device<'a>>,
-) -> Result<&'a mut [Vec<u8>], ()> {
-    let (path, size, mkfs) = match spec {
-        CdromSpec::UdfRw { path, size, mkfs } => (path.as_deref(), *size, *mkfs),
-        _ => unreachable!("build_udfrw called with a non-udfrw spec"),
-    };
-    let mut scratch = [0u8; 256];
-
-    let media = if let Some(path) = path {
-        let existed = Path::new(path).exists();
-        if existed && size.is_some() {
-            eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
-            return Err(());
-        }
-        if !existed {
-            let Some(size) = size else {
-                eprintln!("snowdrive: udfrw: file not found, use size= to create it: {path}");
-                return Err(());
-            };
-            if let Err(e) = create_sparse(path, size) {
-                eprintln!("snowdrive: udfrw: failed to create {path}: {e}");
-                return Err(());
-            }
-        }
-        let label = Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("SNOWDRIVE");
-        let backend = match FileBackend::open(path, true) {
-            Ok(b) => BlockBackend::File(b),
-            Err(e) => {
-                eprintln!("snowdrive: udfrw: failed to open {path}: {e}");
-                return Err(());
-            }
-        };
-        let m = match udfrw_open(backend, label, mkfs, existed, &mut scratch) {
-            Ok(d) => d,
-            Err(msg) => {
-                eprintln!("snowdrive: {msg}");
-                return Err(());
-            }
-        };
-        log::debug!("LUN {lun}: {path} UdfRw DVD+RW ({} bytes)", m.capacity());
-        CdMedia::UdfRw(m)
-    } else {
-        let (slot, tail) = ram_rest.split_first_mut().unwrap();
-        ram_rest = tail;
-        let backend = BlockBackend::Ram(RamBackend::new(slot));
-        let m = match udfrw_open(backend, "SNOWDRIVE", false, false, &mut scratch) {
-            Ok(d) => d,
-            Err(msg) => {
-                eprintln!("snowdrive: {msg}");
-                return Err(());
-            }
-        };
-        log::debug!("LUN {lun}: UdfRw DVD+RW in RAM ({} bytes)", m.capacity());
-        CdMedia::UdfRw(m)
-    };
-    let mut drive = CdromDrive::builder()
-        .capabilities(snowdrive_scsi::cdrom::HYPER_MULTI_CAPS)
-        .build();
-    drive.load(media);
-    devices.push(Device::Cdrom(drive));
-    Ok(ram_rest)
-}
-
-/// Open (or materialize) a UdfRw volume, applying the CLI policy:
-/// `mkfs=true` forces a fresh UDF volume (destructive); `mkfs=false`
-/// opens the backend as-is (no UDF detection — the layout is computed
-/// from capacity).
-#[cfg(feature = "udf_void")]
-fn udfrw_open<B: BlockStorage>(
-    backend: B,
-    label: &str,
-    mkfs: bool,
-    _existed: bool,
-    scratch: &mut [u8],
-) -> Result<UdfRwMedia<B>, String> {
-    UdfRwMedia::open_or_materialize(backend, label, mkfs, scratch)
-        .map_err(|e| format!("udfrw: {e}"))
-}
-
-/// Create (or truncate) `path` as a sparse file of `size` bytes. `size` is
-/// floored to a whole 2048-byte sector by the media layer.
-#[cfg(feature = "udf_void")]
 fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
     let f = File::create(path)?;
     f.set_len(size)?;
@@ -994,7 +952,7 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
 /// UDC and run the BOT poll loop (§6).
 fn run_serve_usb(
     args: &ServeArgs,
-    devices: &mut [Device<'_>],
+    luns: &mut [&mut dyn ScsiDevice],
     work_size: usize,
     selector: &str,
 ) -> ExitCode {
@@ -1046,18 +1004,18 @@ fn run_serve_usb(
 
     let mut ffs_bot = FfsBot::new(ep_out, ep_in);
     let mut ffs_gadget = FfsGadget { custom };
-    let mut session = BotSession::with_luns(devices.len());
+    let mut session = BotSession::with_luns(luns.len());
     let mut work = vec![0u8; work_size];
     let mut recv = vec![0u8; round_up_mps(work_size)];
 
-    log::info!("serving {} LUN(s) over USB", devices.len());
+    log::info!("serving {} LUN(s) over USB", luns.len());
     if let Err(e) = serve_bot(
         &mut ffs_bot,
         &mut ffs_gadget,
         &mut session,
         &mut recv,
         &mut work,
-        devices,
+        luns,
         &stop,
     ) {
         eprintln!("snowdrive: usb serve error: {e}");
@@ -1066,7 +1024,7 @@ fn run_serve_usb(
 
     // Graceful exit: flush backends, unregister the gadget (RAII), then
     // unmount configfs again if the `dummy` auto-config mounted it.
-    sync_devices(devices);
+    sync_devices(luns);
     drop(reg);
     release_configfs(owns_configfs);
     log::info!("shutting down");
@@ -1429,7 +1387,7 @@ fn serve_bot(
     session: &mut BotSession,
     recv: &mut [u8],
     work: &mut [u8],
-    devs: &mut [Device<'_>],
+    devs: &mut [&mut dyn ScsiDevice],
     stop: &AtomicBool,
 ) -> Result<(), String> {
     if work.len() < MIN_DATA_LEN {
@@ -1595,12 +1553,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
         }
     };
     let total_sectors = live.layout().total;
-    let mut flat = FlatMedia::new(
-        live,
-        snowdrive_scsi::cdrom::CurrentProfile::from_capacity(
-            u64::from(total_sectors) * u64::from(ISO_SECTOR_SIZE),
-        ),
-    );
+    let mut flat = FlatMedia::new(live);
 
     let file = match File::create(&args.out) {
         Ok(f) => f,

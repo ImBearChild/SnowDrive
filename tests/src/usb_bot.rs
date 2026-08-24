@@ -8,9 +8,9 @@
 //! non-blocking `BotSession` poll core the PC driver uses.
 
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
-use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
+use snowdrive_scsi::scsi::backend::RamBackend;
 use snowdrive_scsi::scsi::block::BlockDevice;
-use snowdrive_scsi::scsi::device::Device;
+use snowdrive_scsi::scsi::device::ScsiDevice;
 use snowdrive_scsi::usb::{
     BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
     SessionNeed, SessionStep, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
@@ -18,21 +18,16 @@ use snowdrive_scsi::usb::{
 use std::sync::atomic::Ordering;
 
 /// A 64 KiB block device over stack-owned RAM.
-fn block_device(ram: &mut [u8]) -> Device<'_> {
-    Device::Block(BlockDevice::new(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap())
+fn block_device<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
+    BlockDevice::disk(RamBackend::new(ram), 512).unwrap()
 }
 
-fn device_read(dev: &mut Device<'_>, offset: u64, buf: &mut [u8]) {
-    match dev {
-        Device::Block(b) => {
-            use embedded_io::{Read, Seek};
-            b.backend()
-                .seek(embedded_io::SeekFrom::Start(offset))
-                .unwrap();
-            b.backend().read_exact(buf).unwrap();
-        }
-        _ => panic!("device_read on non-block device"),
-    }
+fn device_read(dev: &mut BlockDevice<RamBackend<'_>>, offset: u64, buf: &mut [u8]) {
+    use embedded_io::{Read, Seek};
+    dev.backend()
+        .seek(embedded_io::SeekFrom::Start(offset))
+        .unwrap();
+    dev.backend().read_exact(buf).unwrap();
 }
 
 /// Build a raw 31-byte CBW from its logical fields (little endian).
@@ -95,7 +90,7 @@ fn serve_once(
     io: &mut MockBotIo,
     work: &mut [u8],
     recv: &mut [u8],
-    devs: &mut [Device<'_>],
+    devs: &mut [&mut dyn ScsiDevice],
     stalled: &mut bool,
 ) -> Option<BotStepResult> {
     match session.need() {
@@ -144,7 +139,7 @@ fn drive_until_done(
     io: &mut MockBotIo,
     work: &mut [u8],
     recv: &mut [u8],
-    devs: &mut [Device<'_>],
+    devs: &mut [&mut dyn ScsiDevice],
     stalled: &mut bool,
 ) -> BotStepResult {
     loop {
@@ -178,7 +173,7 @@ fn run_command(
     io: &mut MockBotIo,
     work: &mut [u8],
     recv: &mut [u8],
-    devs: &mut [Device<'_>],
+    devs: &mut [&mut dyn ScsiDevice],
     stalled: &mut bool,
     cbw: &[u8; CBW_LEN],
 ) -> BotStepResult {
@@ -191,8 +186,14 @@ fn run_command(
 #[test]
 fn command_sequence_inquiry_read_capacity_tur() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -205,7 +206,7 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 36, 0x80, 0, &cdb),
     );
@@ -222,7 +223,7 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 8, 0x80, 0, &cdb),
     );
@@ -241,7 +242,7 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(3, 0, 0, 0, &cdb),
     );
@@ -257,8 +258,14 @@ fn command_sequence_read_and_write_verify_backend() {
     for (i, b) in ram.iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -271,7 +278,7 @@ fn command_sequence_read_and_write_verify_backend() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(4, 4096, 0x80, 0, &cdb),
     );
@@ -279,7 +286,7 @@ fn command_sequence_read_and_write_verify_backend() {
     let sent = io.take_sent();
     assert_eq!(sent.len(), 4096 + CSW_LEN);
     let mut check = [0u8; 4096];
-    device_read(&mut devs[0], 0, &mut check);
+    device_read(&mut dev, 0, &mut check);
     assert_eq!(&sent[..4096], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 
@@ -294,7 +301,7 @@ fn command_sequence_read_and_write_verify_backend() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Processed);
@@ -302,7 +309,7 @@ fn command_sequence_read_and_write_verify_backend() {
     assert_eq!(sent.len(), CSW_LEN);
     assert_eq!(csw_fields(&sent), (5, 0, 0x00));
     let mut check = [0u8; 512];
-    device_read(&mut devs[0], 512, &mut check);
+    device_read(&mut dev, 512, &mut check);
     assert_eq!(&check[..], payload.as_slice());
 
     // READ(10) back LBA 1 → the written payload.
@@ -312,7 +319,7 @@ fn command_sequence_read_and_write_verify_backend() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(6, 512, 0x80, 0, &cdb),
     );
@@ -324,8 +331,14 @@ fn command_sequence_read_and_write_verify_backend() {
 #[test]
 fn command_sequence_mode_sense_and_request_sense_clear() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -338,7 +351,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(7, 192, 0x80, 0, &cdb),
     );
@@ -355,7 +368,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(8, 512, 0x80, 0, &cdb),
     );
@@ -370,7 +383,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(9, 18, 0x80, 0, &cdb),
     );
@@ -389,7 +402,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(10, 18, 0x80, 0, &cdb),
     );
@@ -403,8 +416,14 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
 #[test]
 fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -417,7 +436,7 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 192, 0x80, 0, &cdb),
     );
@@ -433,8 +452,14 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
 #[test]
 fn phase_error_on_direction_mismatch() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -451,7 +476,7 @@ fn phase_error_on_direction_mismatch() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Processed);
@@ -462,8 +487,14 @@ fn phase_error_on_direction_mismatch() {
 #[test]
 fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -476,7 +507,7 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 0, 0, 3, &cdb),
     );
@@ -491,7 +522,7 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 18, 0x80, 3, &cdb),
     );
@@ -506,8 +537,14 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
 #[test]
 fn invalid_cbw_with_stall_available_freezes_until_reset() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -522,7 +559,7 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Stalled);
@@ -535,7 +572,7 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Stalled);
@@ -551,7 +588,7 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
@@ -563,8 +600,14 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
 #[test]
 fn invalid_cbw_without_stall_falls_back_to_command() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -583,7 +626,7 @@ fn invalid_cbw_without_stall_falls_back_to_command() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Processed);
@@ -600,8 +643,14 @@ fn host_probe_script_drives_serve_bot() {
     for (i, b) in ram.iter_mut().enumerate() {
         *b = (i * 13 % 256) as u8;
     }
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -623,7 +672,7 @@ fn host_probe_script_drives_serve_bot() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 0, 0, 0, &cdb),
     );
@@ -637,7 +686,7 @@ fn host_probe_script_drives_serve_bot() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
@@ -652,7 +701,7 @@ fn host_probe_script_drives_serve_bot() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(3, 8, 0x80, 0, &cdb),
     );
@@ -667,14 +716,14 @@ fn host_probe_script_drives_serve_bot() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(4, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
     let mut check = [0u8; 512];
-    device_read(&mut devs[0], 5 * 512, &mut check);
+    device_read(&mut dev, 5 * 512, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 }
@@ -684,8 +733,14 @@ fn host_probe_script_drives_serve_bot() {
 #[test]
 fn reset_injects_unit_attention() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -700,7 +755,7 @@ fn reset_injects_unit_attention() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 0, 0, 0, &cdb),
     );
@@ -715,7 +770,7 @@ fn reset_injects_unit_attention() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 18, 0x80, 0, &cdb),
     );
@@ -732,7 +787,7 @@ fn reset_injects_unit_attention() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(3, 0, 0, 0, &cdb),
     );
@@ -793,8 +848,14 @@ fn control_requests_get_max_lun_and_bot_reset() {
 #[test]
 fn bot_reset_interrupts_data_phase() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -809,7 +870,7 @@ fn bot_reset_interrupts_data_phase() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled
     )
     .is_none());
@@ -828,7 +889,7 @@ fn bot_reset_interrupts_data_phase() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled
     )
     .is_none());
@@ -861,7 +922,7 @@ fn bot_reset_interrupts_data_phase() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
@@ -875,8 +936,14 @@ fn bot_reset_interrupts_data_phase() {
 #[test]
 fn mode_sense_10_and_prevent_allow() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -889,7 +956,7 @@ fn mode_sense_10_and_prevent_allow() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 192, 0x80, 0, &cdb),
     );
@@ -906,7 +973,7 @@ fn mode_sense_10_and_prevent_allow() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 0, 0, 0, &cdb),
     );
@@ -919,8 +986,14 @@ fn mode_sense_10_and_prevent_allow() {
 #[test]
 fn request_sense_with_large_allocation_is_short_packet() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -933,7 +1006,7 @@ fn request_sense_with_large_allocation_is_short_packet() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 512, 0x80, 0, &cdb),
     );
@@ -947,7 +1020,7 @@ fn request_sense_with_large_allocation_is_short_packet() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(2, 64, 0x80, 0, &cdb),
     );
@@ -964,8 +1037,14 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
     for (i, b) in ram.iter_mut().enumerate() {
         *b = (i % 97) as u8;
     }
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -979,7 +1058,7 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 512, 0x80, 0, &cdb),
     );
@@ -987,7 +1066,7 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
     let sent = io.take_sent();
     assert_eq!(sent.len(), 512 + CSW_LEN);
     let mut check = [0u8; 512];
-    device_read(&mut devs[0], 0, &mut check);
+    device_read(&mut dev, 0, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));
     // Back in Command, ready for the next CBW.
@@ -1003,8 +1082,14 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
 #[test]
 fn data_out_host_overrun_is_drained() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -1020,17 +1105,17 @@ fn data_out_host_overrun_is_drained() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
     );
     assert_eq!(r, BotStepResult::Processed);
 
     // Only the declared 512 bytes were written; the excess was discarded.
     let mut check = [0u8; 512];
-    device_read(&mut devs[0], 0, &mut check);
+    device_read(&mut dev, 0, &mut check);
     assert!(check.iter().all(|&b| b == 0x5A));
     let mut tail = [0u8; 128];
-    device_read(&mut devs[0], 512, &mut tail);
+    device_read(&mut dev, 512, &mut tail);
     assert!(tail.iter().all(|&b| b == 0));
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));
@@ -1039,8 +1124,14 @@ fn data_out_host_overrun_is_drained() {
 #[test]
 fn opcode_report_luns_synthesized() {
     let mut ram = vec![0u8; 64 * 1024];
-    let mut devs = [block_device(&mut ram)];
+    let mut dev = block_device(&mut ram);
     let mut s = BotSession::new();
+    macro_rules! luns {
+        () => {{
+            let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
+            d
+        }};
+    }
     let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
@@ -1052,7 +1143,7 @@ fn opcode_report_luns_synthesized() {
         &mut io,
         &mut work,
         &mut recv,
-        &mut devs,
+        &mut luns!(),
         &mut stalled,
         &raw_cbw(1, 16, 0x80, 0, &cdb),
     );

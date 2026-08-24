@@ -1,12 +1,7 @@
-//! Device abstraction: result outcomes, device types, the SCSI device
-//! seam, and the borrowed type-erased container that targets drive.
+//! Device abstraction: result outcome types, the SCSI device seam, and
+//! the forwarding impls that let transports drive any LUN type.
 
-#[cfg(feature = "cdrom")]
-use crate::cdrom::drive::CdromDrive;
-use crate::scsi::backend::{BlockBackend, BlockStorageError};
-use crate::scsi::block::BlockDevice;
-#[cfg(feature = "std")]
-use crate::scsi::cdblock::CDBlockDevice;
+use crate::scsi::backend::BlockStorageError;
 use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
@@ -58,7 +53,7 @@ pub enum CommandOutcome {
 pub enum Error {
     /// Caller's data buffer is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
-    /// Sector size must be non-zero (`BlockDevice::new`).
+    /// Sector size must be non-zero (`BlockDevice::disk`).
     InvalidSectorSize,
 }
 
@@ -146,10 +141,93 @@ pub fn data_capacity(work_len: usize) -> usize {
     work_len & !3
 }
 
-/// The SCSI device seam: the minimal command set the iSCSI target needs from
-/// any device. The target is generic over `D: ScsiDevice`, so it can serve a
-/// homogeneous `&mut [BlockDevice<B>]` or a heterogeneous `&mut [Device<'_>]`
-/// equally.
+/// The SCSI device seam: the minimal command set the iSCSI/USB transports
+/// need from any LUN.
+///
+/// Transports are generic over `D: ScsiDevice`, so the caller picks the
+/// element type of `devs: &mut [D]`:
+///
+/// - homogeneous fast path — `&mut [BlockDevice<B>]` (zero dispatch);
+/// - heterogeneous mixing — `&mut [&mut dyn ScsiDevice]` via the `&mut T`
+///   forwarding impl below (protocol-mandated LUN spaces).
+///
+/// # Writing your own LUN
+///
+/// Implement this trait directly (pure-compute or exotic devices), or wrap
+/// a built-in to add vendor opcodes — check first, delegate everything
+/// else:
+///
+/// ```
+/// use snowdrive_scsi::common::block_storage::{FlatData, RwRef};
+/// use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
+/// use snowdrive_scsi::scsi::block::BlockDevice;
+/// use snowdrive_scsi::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice, XferOutcome};
+/// use snowdrive_scsi::scsi::scsi::{Sense, SenseKey};
+///
+/// struct VendorLun<'a> {
+///     inner: BlockDevice<RwRef<'a>>,
+/// }
+///
+/// impl ScsiDevice for VendorLun<'_> {
+///     fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
+///         // Claim vendor opcode 0xC0; everything else falls through to
+///         // built-in SBC/SPC.
+///         if cdb.first() == Some(&0xC0) {
+///             let be = self.inner.backend();
+///             if be.read_at(0, &mut data[..16]).is_err() {
+///                 self.inner.set_sense(SenseKey::MediumError, 0x11, 0);
+///                 return Ok(CommandOutcome::CheckCondition);
+///             }
+///             return Ok(CommandOutcome::OutInline { len: 16 });
+///         }
+///         self.inner.do_cmd(cdb, data)
+///     }
+///     fn xfer_out(&mut self, off: u64, buf: &mut [u8]) -> XferOutcome {
+///         self.inner.xfer_out(off, buf)
+///     }
+///     fn xfer_in(&mut self, off: u64, buf: &[u8]) -> XferOutcome {
+///         self.inner.xfer_in(off, buf)
+///     }
+///     fn peek_sense(&self) -> Option<&Sense> {
+///         self.inner.peek_sense()
+///     }
+///     fn take_sense(&mut self) -> Option<Sense> {
+///         self.inner.take_sense()
+///     }
+///     fn device_type(&self) -> DeviceType {
+///         self.inner.device_type()
+///     }
+///     fn sync(&mut self) -> Result<(), snowdrive_scsi::common::block_storage::BlockStorageError> {
+///         self.inner.sync()
+///     }
+/// }
+///
+/// // Construction: any writable plane, erased or not.
+/// let mut img = vec![0u8; 64 * 1024];
+/// let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+/// let mut lun = VendorLun { inner: BlockDevice::disk(RwRef::new(&mut bb), 512).unwrap() };
+/// # let _ = lun.do_cmd(&[0x12, 0, 0, 0, 36, 0], &mut vec![0u8; 8192][..]);
+/// ```
+///
+/// # Canonical transport loop
+///
+/// ```text
+/// let outcome = dev.do_cmd(&cdb, &mut work)?;
+/// match outcome {
+///     CommandOutcome::OutInline { len } => send(&work[..len as usize]),
+///     CommandOutcome::OutXfer { len } => {
+///         for off in (0..len).step_by(CHUNK) {
+///             match dev.xfer_out(off, &mut chunk[..]) {
+///                 XferOutcome::Ok => send(&chunk),
+///                 XferOutcome::Error(_) => break, // sense is in the device
+///             }
+///         }
+///     }
+///     CommandOutcome::InXfer { len } => { /* recv chunks into dev.xfer_in */ }
+///     CommandOutcome::CheckCondition => { /* peek/take_sense */ }
+///     ...
+/// }
+/// ```
 pub trait ScsiDevice {
     /// Process one SCSI command. `data` must be at least
     /// [`crate::MIN_DATA_LEN`] bytes. For `OutInline` the device writes the
@@ -182,98 +260,51 @@ pub trait ScsiDevice {
         let _ = (cdb, data);
         CommandOutcome::CheckCondition
     }
+
+    /// Flush pending backend writes (graceful shutdown).
+    ///
+    /// Default no-op for compute-only LUNs; storage-backed devices forward
+    /// to their backend/media. Errors use the device-level storage error
+    /// domain ([`BlockStorageError`]).
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        Ok(())
+    }
 }
 
-/// Borrowed, type-erased device container.
-///
-/// The `'a` lifetime unifies the RAM disk-image borrow across variants
-/// (`Block` wraps `BlockBackend<'a>`), so mock stack RAM and CLI owned
-/// `Vec<u8>` images enter the enum without `'static` or `Box::leak`.
-///
-/// The variants differ in size (`CdLiveFsDevice` embeds a live layout plus
-/// open handles). This is deliberate: the plan mandates a zero-alloc,
-/// no-boxing container whose arms monomorphize per device (§3.4) — the enum
-/// is a borrowed convenience type for desktop/CLI setups, never moved
-/// around by the target hot path.
-#[allow(clippy::large_enum_variant)]
-pub enum Device<'a> {
-    Block(BlockDevice<BlockBackend<'a>>),
-    #[cfg(feature = "std")]
-    CdBlock(CDBlockDevice),
-    /// Unified CD-ROM device with swappable media.
-    #[cfg(feature = "cdrom")]
-    Cdrom(CdromDrive<'a>),
-}
-
-impl ScsiDevice for Device<'_> {
+/// Heterogeneous LUN arrays: `[&mut dyn ScsiDevice]` elements satisfy
+/// `D: ScsiDevice` through this forwarding impl (callers never deref
+/// manually). Same-type arrays keep the monomorphized fast path.
+impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
     fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
-        match self {
-            Self::Block(dev) => dev.do_cmd(cdb, data),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.do_cmd(cdb, data),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.do_cmd(cdb, data),
-        }
+        (**self).do_cmd(cdb, data)
     }
 
     fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
-        match self {
-            Self::Block(dev) => dev.xfer_out(transfer_offset, buf),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.xfer_out(transfer_offset, buf),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.xfer_out(transfer_offset, buf),
-        }
+        (**self).xfer_out(transfer_offset, buf)
     }
 
     fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
-        match self {
-            Self::Block(dev) => dev.xfer_in(transfer_offset, buf),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.xfer_in(transfer_offset, buf),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.xfer_in(transfer_offset, buf),
-        }
+        (**self).xfer_in(transfer_offset, buf)
     }
 
     fn peek_sense(&self) -> Option<&Sense> {
-        match self {
-            Self::Block(dev) => dev.peek_sense(),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.peek_sense(),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.peek_sense(),
-        }
+        (**self).peek_sense()
     }
 
     fn take_sense(&mut self) -> Option<Sense> {
-        match self {
-            Self::Block(dev) => dev.take_sense(),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.take_sense(),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.take_sense(),
-        }
+        (**self).take_sense()
     }
 
     fn device_type(&self) -> DeviceType {
-        match self {
-            Self::Block(dev) => dev.device_type(),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => <CDBlockDevice as ScsiDevice>::device_type(dev),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => <CdromDrive<'_> as ScsiDevice>::device_type(dev),
-        }
+        (**self).device_type()
     }
 
     fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
-        match self {
-            Self::Block(dev) => dev.complete_param(cdb, data),
-            #[cfg(feature = "std")]
-            Self::CdBlock(dev) => dev.complete_param(cdb, data),
-            #[cfg(feature = "cdrom")]
-            Self::Cdrom(dev) => dev.complete_param(cdb, data),
-        }
+        (**self).complete_param(cdb, data)
+    }
+
+    fn sync(&mut self) -> Result<(), BlockStorageError> {
+        (**self).sync()
     }
 }
 
@@ -281,6 +312,7 @@ impl ScsiDevice for Device<'_> {
 mod tests {
     use super::*;
     use crate::scsi::backend::RamBackend;
+    use crate::scsi::block::BlockDevice;
     use crate::scsi::scsi::op;
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
@@ -295,7 +327,7 @@ mod tests {
         assert_eq!(data_capacity(0), 0);
     }
 
-    fn inquiry_pdt(dev: &mut Device<'_>, w: &mut [u8]) -> u8 {
+    fn inquiry_pdt(dev: &mut dyn ScsiDevice, w: &mut [u8]) -> u8 {
         let mut cdb = [0u8; 6];
         cdb[0] = op::INQUIRY;
         cdb[4] = 96;
@@ -309,182 +341,58 @@ mod tests {
     }
 
     #[test]
-    fn device_enum_block_dispatch() {
-        let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let mut dev = Device::Block(
-            BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
-        );
+    fn block_disk_roundtrip_via_dyn_forwarding() {
+        // Heterogeneous mixed LUN array: elements are `&mut dyn ScsiDevice`,
+        // driven generically through the `&mut T` forwarding impl.
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut img = vec![0xAAu8; 2048 * 16];
+        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut optical = BlockDevice::cdrom(RamBackend::new(&mut img)).unwrap();
+        let luns: [&mut dyn ScsiDevice; 2] = [&mut disk, &mut optical];
+
+        assert_eq!(inquiry_pdt(luns[0], &mut work()), 0x00);
+        assert_eq!(inquiry_pdt(luns[1], &mut work()), 0x05);
+        assert_eq!(luns[0].device_type(), DeviceType::Block);
+        assert_eq!(luns[1].device_type(), DeviceType::Cdrom);
+
+        // WRITE(10) LBA 0 len 1 on LUN 0, then READ it back.
         let mut w = work();
-        assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x00);
-        assert_eq!(dev.device_type(), DeviceType::Block);
-        // xfer path: do_cmd WRITE then xfer_in
         let mut cdb = [0u8; 10];
         cdb[0] = op::WRITE_10;
-        cdb[5] = 0;
-        cdb[7] = 0;
         cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 512);
-                let r = dev.xfer_in(0, &w[0..512]);
-                assert_eq!(r, XferOutcome::Ok);
-            }
-            _ => panic!("expected InXfer"),
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn device_enum_cdblock_dispatch() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "snowscsi_device_cdblock_{}.iso",
-            std::process::id()
+        assert!(matches!(
+            luns[0].do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::InXfer { len: 512 }
         ));
-        std::fs::write(&path, vec![0u8; 2048 * 100]).unwrap();
-        let dev = CDBlockDevice::new(path.to_str().unwrap()).unwrap();
-        let mut dev = Device::CdBlock(dev);
-        let mut w = work();
-        assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
-        assert_eq!(dev.device_type(), DeviceType::Cdrom);
-        // write must fail (CheckCondition immediate for read-only)
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::WRITE_10;
-        cdb[5] = 0;
-        cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 512);
-                let r = dev.xfer_in(0, &w[0..512]);
-                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
-            }
-            CommandOutcome::CheckCondition => {
-                assert!(dev.peek_sense().is_some());
-            }
-            _ => panic!("expected InXfer or CheckCondition"),
-        }
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[cfg(feature = "cdrom")]
-    #[test]
-    fn device_enum_cdrom_dispatch() {
-        use crate::cdrom::drive::CdromDrive;
-        use crate::cdrom::media::{CdMedia, FlatMedia};
-        use crate::scsi::backend::RamBackend;
-        let mut img = vec![0xAAu8; 2048 * 100];
-        let backend = BlockBackend::Ram(RamBackend::new(&mut img));
-        let flat = FlatMedia::new(backend, crate::cdrom::common::CurrentProfile::CdRom);
-        let mut drive = CdromDrive::new();
-        drive.load_quiet(CdMedia::Flat(flat));
-        let mut dev = Device::Cdrom(drive);
-        let mut w = work();
-        assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
-        assert_eq!(dev.device_type(), DeviceType::Cdrom);
-        // Data path via xfer_out: first do_cmd READ then xfer_out
-        let mut cdb = [0u8; 10];
+        assert_eq!(luns[0].xfer_in(0, &w[..512]), XferOutcome::Ok);
         cdb[0] = op::READ_10;
-        cdb[5] = 0;
-        cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::OutXfer { len } => {
-                assert_eq!(len, 2048);
-                let mut buf = [0u8; 4];
-                let r = dev.xfer_out(0, &mut buf);
-                assert_eq!(r, XferOutcome::Ok);
-                assert_eq!(buf, [0xAA; 4]);
-            }
-            other => panic!("expected OutXfer, got {other:?}"),
-        }
-        // write must fail
-        let mut cdb = [0u8; 10];
+        assert!(matches!(
+            luns[0].do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::OutXfer { len: 512 }
+        ));
+        let mut buf = [0u8; 512];
+        assert_eq!(luns[0].xfer_out(0, &mut buf), XferOutcome::Ok);
+        assert_eq!(&buf[..4], &w[..4]);
+
+        // Optical profile refuses writes with DATA PROTECT.
         cdb[0] = op::WRITE_10;
-        cdb[5] = 0;
-        cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len: _ } => {
-                let r = dev.xfer_in(0, &w[0..512]);
-                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
+        match luns[1].do_cmd(&cdb, &mut w).unwrap() {
+            CommandOutcome::CheckCondition => assert!(luns[1].peek_sense().is_some()),
+            CommandOutcome::InXfer { .. } => {
+                assert!(matches!(
+                    luns[1].xfer_in(0, &w[..512]),
+                    XferOutcome::Error(XferError::WriteProtected)
+                ));
             }
-            CommandOutcome::CheckCondition => {
-                // also acceptable for CD-ROM non-writable
-            }
-            _ => panic!("unexpected outcome"),
+            other => panic!("unexpected outcome {other:?}"),
         }
     }
 
-    #[cfg(all(feature = "livefs", feature = "std"))]
     #[test]
-    fn device_enum_cdlivefs_dispatch() {
-        use crate::cdrom::drive::CdromDrive;
-        use crate::cdrom::media::{CdMedia, FlatMedia, LiveData};
-        use crate::scsi::fs_backend::StdFsBackend;
-        let dir =
-            std::env::temp_dir().join(format!("snowscsi_device_livefs_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("DATA.BIN"), vec![0x42u8; 2048]).unwrap();
-        let fs = StdFsBackend::new(&dir.to_str().unwrap());
-        let live = LiveData::new(fs, "TEST").unwrap();
-        let flat = FlatMedia::new(live, crate::cdrom::common::CurrentProfile::CdRom);
-        let mut drive = CdromDrive::new();
-        drive.load_quiet(CdMedia::Live(Box::new(flat)));
-        let mut dev = Device::Cdrom(drive);
-        let mut w = work();
-        assert_eq!(inquiry_pdt(&mut dev, &mut w), 0x05);
-        assert_eq!(dev.device_type(), DeviceType::Cdrom);
-        // File data is reachable through the virtual disc (first file extent).
-        let first = match &mut dev {
-            Device::Cdrom(inner) => {
-                if let Some(crate::cdrom::media::CdMedia::Live(ref mut m)) = inner.media {
-                    m.data()
-                        .layout()
-                        .extents
-                        .first()
-                        .expect("DATA.BIN extent")
-                        .lba
-                } else {
-                    unreachable!("expected Live variant")
-                }
-            }
-            _ => unreachable!("Cdrom variant"),
-        };
-        // Do READ for that LBA then xfer_out
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::READ_10;
-        cdb[2] = (first >> 24) as u8;
-        cdb[3] = (first >> 16) as u8;
-        cdb[4] = (first >> 8) as u8;
-        cdb[5] = first as u8;
-        cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::OutXfer { len } => {
-                assert_eq!(len, 2048);
-                let mut buf = [0u8; 2048];
-                let r = dev.xfer_out(0, &mut buf);
-                assert_eq!(r, XferOutcome::Ok);
-                assert_eq!(&buf[..4], &[0x42; 4]);
-            }
-            other => panic!("expected OutXfer, got {other:?}"),
-        }
-        // write must fail
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::WRITE_10;
-        cdb[8] = 1;
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len: _ } => {
-                let r = dev.xfer_in(0, &w[0..512]);
-                assert!(matches!(r, XferOutcome::Error(XferError::WriteProtected)));
-            }
-            CommandOutcome::CheckCondition => {}
-            _ => panic!("unexpected"),
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn scsi_device_sync_defaults_and_forwards() {
+        let mut ram = vec![0u8; 4096];
+        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        // RAM backend sync is a no-op Ok; trait default covers compute LUNs.
+        assert!(ScsiDevice::sync(&mut disk).is_ok());
     }
 }

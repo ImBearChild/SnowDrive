@@ -129,7 +129,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -166,7 +166,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         for k in [
@@ -187,7 +187,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         assert_eq!(
@@ -206,7 +206,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
         assert_eq!(resp_value(&data, "InitialR2T"), Some(b"Yes".as_slice()));
@@ -256,7 +256,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         // Stage 1: CSG=0 (Security), T=1, NSG=3 → target forces NSG=1.
@@ -309,7 +309,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -361,7 +361,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -420,7 +420,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -478,7 +478,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -507,7 +507,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -540,7 +540,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -571,7 +571,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -603,7 +603,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         // Login carrying a non-zero CmdSN, as a real initiator would.
@@ -646,7 +646,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -676,7 +676,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -701,7 +701,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -727,7 +727,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -754,7 +754,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -784,7 +784,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -825,7 +825,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         let text = REQ_TEXT.as_bytes();
@@ -874,7 +874,7 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -924,9 +924,9 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
+        let d0 = BlockDevice::disk(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = BlockDevice::disk(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = BlockDevice::disk(RamBackend::new(&mut r2), 512).unwrap();
         let mut devs = [d0, d1, d2];
 
         let mut conn = MockConn::new();
@@ -966,9 +966,9 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::new(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = BlockDevice::new(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = BlockDevice::new(RamBackend::new(&mut r2), 512).unwrap();
+        let d0 = BlockDevice::disk(RamBackend::new(&mut r0), 512).unwrap();
+        let d1 = BlockDevice::disk(RamBackend::new(&mut r1), 512).unwrap();
+        let d2 = BlockDevice::disk(RamBackend::new(&mut r2), 512).unwrap();
         let mut devs = [d0, d1, d2];
 
         let mut conn = MockConn::new();
@@ -995,7 +995,7 @@ mod tests {
         // SCSI error — CHECK CONDITION / LOGICAL UNIT NOT SUPPORTED
         // (SPC-3 §6.21) — not an iSCSI Reject.
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
 
         let mut conn = MockConn::new();
@@ -1036,20 +1036,20 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_and_cdblock_dispatch() {
-        use snowdrive_scsi::scsi::backend::BlockBackend;
-        use snowdrive_scsi::scsi::cdblock::CDBlockDevice;
-        use snowdrive_scsi::scsi::device::Device;
+        use snowdrive_scsi::common::block_storage::FlatRef;
+        use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
 
         let dir = std::env::temp_dir();
         let iso = dir.join(format!("snowscsi_mock_cdblock_{}.iso", std::process::id()));
         std::fs::write(&iso, vec![0xCDu8; 2048 * 32]).unwrap();
 
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let d0 = Device::Block(
-            BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
-        );
-        let d1 = Device::CdBlock(CDBlockDevice::new(iso.to_str().unwrap()).unwrap());
-        let mut devs = [d0, d1];
+        let mut d0 = BlockDevice::disk(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap();
+        // Former `CDBlockDevice`: read-only optical profile over the ISO file.
+        let mut bb_iso =
+            BlockBackend::File(FileBackend::open(iso.to_str().unwrap(), false).unwrap());
+        let mut d1 = BlockDevice::cdrom(FlatRef::new(&mut bb_iso)).unwrap();
+        let mut devs: [&mut dyn ScsiDevice; 2] = [&mut d0, &mut d1];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
@@ -1117,14 +1117,13 @@ mod tests {
         let _ = std::fs::remove_file(&iso);
     }
 
-    // ── Mixed heterogeneous LUNs: Device enum (Block + Cdrom with Flat + Live) ──
+    // ── Mixed heterogeneous LUNs (Block + CdromDrive Flat + Live) ──
 
     #[test]
     fn mixed_lun_block_cdrom_flat_and_live_dispatch() {
         use snowdrive_scsi::cdrom::drive::CdromDrive;
-        use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
+        use snowdrive_scsi::cdrom::media::{CdMedia, LiveData};
         use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
-        use snowdrive_scsi::scsi::device::Device;
         use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 
         // LUN 1 source: a flat ISO file (0xCD sectors).
@@ -1138,31 +1137,24 @@ mod tests {
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("DATA.BIN"), vec![0x42u8; 4096]).unwrap();
 
-        // Extract the live file's LBA before moving into the device (the
-        // layout is accessible from LiveData before wrapping in FlatMedia).
-        let live_for_lba =
-            LiveData::new(StdFsBackend::new(&tree.to_string_lossy()), "TEST").unwrap();
-        let live_lba = live_for_lba.layout().extents[0].lba;
-        let flat_live = FlatMedia::new(live_for_lba, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
+        // Extract the live file's LBA before lending the scanner to the drive.
+        let mut live = LiveData::new(StdFsBackend::new(&tree.to_string_lossy()), "TEST").unwrap();
+        let live_lba = live.layout().extents[0].lba;
 
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let mut devs: Vec<Device<'_>> = Vec::new();
+        let mut d0 = BlockDevice::disk(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap();
 
-        devs.push(Device::Block(
-            BlockDevice::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap(),
-        ));
-
-        // LUN 1: flat CD-ROM via CdromDrive + CdMedia::Flat
-        let backend = BlockBackend::File(FileBackend::open(iso.to_str().unwrap(), false).unwrap());
-        let flat = FlatMedia::new(backend, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
+        // LUN 1: flat CD-ROM via CdromDrive over the ISO file plane
+        let mut bb_flat =
+            BlockBackend::File(FileBackend::open(iso.to_str().unwrap(), false).unwrap());
         let mut drive1 = CdromDrive::new();
-        drive1.load_quiet(CdMedia::Flat(flat));
-        devs.push(Device::Cdrom(drive1));
+        drive1.load_quiet(CdMedia::ro(&mut bb_flat));
 
-        // LUN 2: live CD-ROM via CdromDrive + CdMedia::Live
+        // LUN 2: live CD-ROM via CdromDrive over the generated ISO9660 plane
         let mut drive2 = CdromDrive::new();
-        drive2.load_quiet(CdMedia::Live(Box::new(flat_live)));
-        devs.push(Device::Cdrom(drive2));
+        drive2.load_quiet(CdMedia::ro(&mut live));
+
+        let mut devs: [&mut dyn ScsiDevice; 3] = [&mut d0, &mut drive1, &mut drive2];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
@@ -1412,8 +1404,8 @@ mod tests {
         let mut work = vec![0u8; WORK_LEN];
         let mut ram0 = vec![0u8; 16 * 1024];
         let mut ram1 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::new(RamBackend::new(&mut ram0), 512).unwrap();
-        let d1 = BlockDevice::new(RamBackend::new(&mut ram1), 512).unwrap();
+        let d0 = BlockDevice::disk(RamBackend::new(&mut ram0), 512).unwrap();
+        let d1 = BlockDevice::disk(RamBackend::new(&mut ram1), 512).unwrap();
         let mut devs = [d0, d1];
         login(&mut conn, &mut session, &mut work, &mut devs);
 
@@ -1472,7 +1464,7 @@ mod tests {
             *b = (i % 251) as u8;
         }
         let expected = ram[0..600 * 512].to_vec();
-        let dev = BlockDevice::new(RamBackend::new(&mut ram), 512).unwrap();
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
         login(&mut conn, &mut session, &mut work, &mut devs);
 

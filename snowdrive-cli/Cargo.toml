@@ -11,11 +11,10 @@ path = "src/main.rs"
 
 [features]
 default = ["full"]
-full = ["std", "scsi", "iscsi", "iso9660", "udf_void", "cdrom", "livefs", "usb", "log",
+full = ["std", "scsi", "iscsi", "udf_void", "cdrom", "livefs", "usb", "log",
         "dep:clap", "dep:ctrlc", "dep:env_logger"]
 std = ["snowdrive-scsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 scsi = ["snowdrive-scsi/scsi"]
-iso9660 = ["snowdrive-scsi/iso9660"]
 udf_void = ["snowdrive-scsi/udf_void"]
 iscsi = ["snowdrive-scsi/iscsi"]
 cdrom = ["snowdrive-scsi/cdrom"]

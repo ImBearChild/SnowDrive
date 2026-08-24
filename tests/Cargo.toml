@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Integration tests for SnowDrive (mock + libiscsi whitebox)"
 
 [dependencies]
-snowdrive-scsi = { path = "../snowdrive-scsi", default-features = false, features = ["std", "scsi", "iscsi", "iso9660", "cdrom", "livefs", "usb"] }
+snowdrive-scsi = { path = "../snowdrive-scsi", default-features = false, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb"] }
 snowdrive-disc = { path = "../snowdrive-disc", default-features = false, features = ["std"] }
 snowdrive-common = { path = "../snowdrive-common", default-features = false, features = ["std"] }
 embedded-io = "0.7"

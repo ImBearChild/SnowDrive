@@ -81,7 +81,7 @@ fn build_image(dir: &Path) -> Vec<u8> {
     let fs = StdFsBackend::new(&dir.to_string_lossy());
     let live = LiveData::new(fs, "CROSS").expect("scan tree");
     let total = live.layout().total as usize;
-    let mut flat = FlatMedia::new(live, snowdrive_scsi::cdrom::CurrentProfile::CdRom);
+    let mut flat = FlatMedia::new(live);
     let mut img = vec![0u8; total * SECTOR_SIZE as usize];
     for lba in 0..total as u32 {
         let start = lba as usize * SECTOR_SIZE as usize;

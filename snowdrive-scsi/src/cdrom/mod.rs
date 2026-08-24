@@ -16,8 +16,7 @@ pub use common::{
     UDFRW_CAPS,
 };
 pub use drive::CdromDrive;
-pub use media::{
-    CdLiveFsError, CdMedia, FlatData, FlatMedia, LiveData, LiveDataBuilder, MediaError,
-};
+pub use media::{CdLiveFsError, CdMedia, FlatMedia, LiveData, LiveDataBuilder, MediaError, Tray};
+pub use snowdrive_common::block_storage::FlatData;
 #[cfg(feature = "udf_void")]
 pub use udfrw::{UdfRwError, UdfRwMedia};

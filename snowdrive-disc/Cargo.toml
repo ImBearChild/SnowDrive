@@ -8,7 +8,6 @@ description = "SnowDrive disc: ISO9660/Joliet live-generation algorithms"
 [features]
 default = ["std"]
 std = ["embedded-io/std", "snowdrive-common/std"]
-iso9660 = []
 
 [dependencies]
 embedded-io = "0.7"

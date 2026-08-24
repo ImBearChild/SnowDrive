@@ -1753,8 +1753,11 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs =
             [
-                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
-                    .unwrap(),
+                BlockDevice::<BlockBackend>::disk(
+                    BlockBackend::Ram(RamBackend::new(&mut ram)),
+                    512,
+                )
+                .unwrap(),
             ];
         let mut session = IscsiSession::new();
         let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
@@ -1824,8 +1827,11 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs =
             [
-                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
-                    .unwrap(),
+                BlockDevice::<BlockBackend>::disk(
+                    BlockBackend::Ram(RamBackend::new(&mut ram)),
+                    512,
+                )
+                .unwrap(),
             ];
         let mut session = IscsiSession::new();
         let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
@@ -1874,8 +1880,11 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs =
             [
-                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
-                    .unwrap(),
+                BlockDevice::<BlockBackend>::disk(
+                    BlockBackend::Ram(RamBackend::new(&mut ram)),
+                    512,
+                )
+                .unwrap(),
             ];
         let mut session = IscsiSession::new();
         let mut work = vec![0u8; 8192 + BHS_SIZE];
@@ -1952,8 +1961,11 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs =
             [
-                BlockDevice::<BlockBackend>::new(BlockBackend::Ram(RamBackend::new(&mut ram)), 512)
-                    .unwrap(),
+                BlockDevice::<BlockBackend>::disk(
+                    BlockBackend::Ram(RamBackend::new(&mut ram)),
+                    512,
+                )
+                .unwrap(),
             ];
         let mut session = IscsiSession::new();
 

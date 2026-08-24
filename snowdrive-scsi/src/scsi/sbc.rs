@@ -5,7 +5,7 @@
 //! wraps the SPC fall-through as [`SbcCommand::Spc`] so a device's
 //! `do_cmd` is a single `parse_sbc` + two-arm dispatch.
 
-use crate::scsi::backend::BlockStorage;
+use crate::common::block_storage::FlatData;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{
@@ -133,8 +133,8 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
 
 /// Execute one parsed SBC command against `dev` (SPC commands never reach
 /// here — `do_cmd` dispatches `SbcCommand::Spc` to `execute_spc`).
-pub(crate) fn execute_sbc<B: BlockStorage>(
-    dev: &mut BlockDevice<B>,
+pub(crate) fn execute_sbc<D: FlatData>(
+    dev: &mut BlockDevice<D>,
     cmd: SbcCommand,
     data: &mut [u8],
 ) -> CommandOutcome {
@@ -162,7 +162,7 @@ pub(crate) fn execute_sbc<B: BlockStorage>(
         SbcCommand::ReadCapacity10 { pmi, lba } => dev.read_capacity_10_cmd(pmi, lba, data),
         SbcCommand::ReadCapacity16 { sa, alloc } => dev.read_capacity_16_cmd(sa, alloc, data),
         SbcCommand::SynchronizeCache => {
-            let _ = dev.backend().sync();
+            let _ = dev.sync_backend();
             CommandOutcome::Status
         }
         SbcCommand::Spc(_) => unreachable!("SPC commands are dispatched by do_cmd"),

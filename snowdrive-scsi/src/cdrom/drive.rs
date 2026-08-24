@@ -13,7 +13,7 @@ use crate::cdrom::common::{
     cdrom_mode_page_for_caps, default_write_params_page, CdromCapabilities, DiscInfo, MediaState,
     CDROM_IDENTITY, SECTOR_SIZE,
 };
-use crate::cdrom::media::CdMedia;
+use crate::cdrom::media::{CdMedia, MediaError, Tray};
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
 use crate::scsi::device::{
@@ -44,8 +44,8 @@ pub struct CdromDrive<'a> {
     pub(crate) drive_id: u64,
     /// INQUIRY identity.
     pub(crate) identity: DeviceIdentity,
-    /// Media slot: `None` = empty tray.
-    pub(crate) media: Option<CdMedia<'a>>,
+    /// Tray: at most one disc, loaded or parked after a SCSI eject.
+    pub(crate) tray: Tray<'a>,
     /// Tray state: `true` = open (plan  ASCQ).
     pub(crate) tray_open: bool,
     /// Page 0x05 write parameter cache (plan /).
@@ -72,45 +72,113 @@ impl<'a> CdromDrive<'a> {
     }
 
     /// Start building a new drive.
-    pub fn builder() -> CdromDriveBuilder {
+    pub fn builder() -> CdromDriveBuilder<'a> {
         CdromDriveBuilder {
             identity: CDROM_IDENTITY,
             caps: CdromCapabilities::hyper_multi(),
             drive_id: 0,
+            _phantom: core::marker::PhantomData,
         }
     }
 
     // ── Media slot ─────────────────────────────────────
 
-    /// Load media into the drive (sets UNIT ATTENTION).
-    pub fn load(&mut self, media: CdMedia<'a>) {
-        self.media = Some(media);
+    /// Disc-pool usage (runtime media swap across ANY backend kinds):
+    ///
+    /// ```text
+    /// use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
+    /// use snowdrive_scsi::cdrom::drive::CdromDrive;
+    /// # fn demo(
+    /// #     img_file: &mut [u8],
+    /// #     my_fs: impl snowdrive_common::fs_storage::FsStorage,
+    /// #     sd_card: impl snowdrive_common::block_storage::WritableFlatData,
+    /// # ) -> Result<(), Box<dyn core::error::Error>> {
+    /// let mut drive = CdromDrive::new();
+    ///
+    /// let mut live_data = LiveData::new(my_fs, "LABEL")?;      // bind first:
+    /// let mut disc_a = CdMedia::ro(&mut live_data);            // no temporaries
+    /// let mut iso = FlatMedia::new(FlatRef::new(img_file));
+    /// let mut disc_b = CdMedia::Ro(iso);
+    /// let mut dvdam = UdfRwMedia::open_or_materialize_placeholder()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Borrow rule: every disc's backing data must outlive the drive;
+    /// `load`/`eject` round-trip ownership so a small "disc pool" can be
+    /// swapped at runtime (requirement: cross-backend media switching).
+    ///
+    /// Load media into the drive, returning whatever occupied the tray
+    /// (a loaded disc or one parked by a SCSI eject). Sets UNIT ATTENTION.
+    pub fn load(&mut self, media: CdMedia<'a>) -> Option<CdMedia<'a>> {
+        let old = core::mem::replace(&mut self.tray, Tray::Loaded(media)).disc();
+        if old.is_some() {
+            self.tray_open = false;
+        }
         self.sense = Some(Sense::new(
             SenseKey::UnitAttention,
             asc::MEDIUM_MAY_HAVE_CHANGED,
             0,
         ));
+        old
     }
 
     /// Load media without setting UNIT ATTENTION (for test setup / initial load).
-    pub fn load_quiet(&mut self, media: CdMedia<'a>) {
-        self.media = Some(media);
+    pub fn load_quiet(&mut self, media: CdMedia<'a>) -> Option<CdMedia<'a>> {
+        let old = core::mem::replace(&mut self.tray, Tray::Loaded(media)).disc();
+        if old.is_some() {
+            self.tray_open = false;
+        }
+        old
     }
 
-    /// Eject the media.
-    pub fn eject(&mut self) {
-        self.media = None;
+    /// Eject the media, handing it back to the caller. Idempotent on an
+    /// empty tray; queues UNIT ATTENTION whenever a disc comes out.
+    pub fn eject(&mut self) -> Option<CdMedia<'a>> {
+        let taken = core::mem::replace(&mut self.tray, Tray::Empty).disc();
         self.tray_open = true;
-        self.sense = Some(Sense::new(
-            SenseKey::UnitAttention,
-            asc::MEDIUM_MAY_HAVE_CHANGED,
-            0,
-        ));
+        if taken.is_some() {
+            self.sense = Some(Sense::new(
+                SenseKey::UnitAttention,
+                asc::MEDIUM_MAY_HAVE_CHANGED,
+                0,
+            ));
+        }
+        taken
+    }
+
+    /// Reclaim a disc parked by a SCSI-initiated eject (`START STOP loej=1`).
+    pub fn take_media(&mut self) -> Option<CdMedia<'a>> {
+        if matches!(self.tray, Tray::Parked(_)) {
+            core::mem::replace(&mut self.tray, Tray::Empty).disc()
+        } else {
+            None
+        }
+    }
+
+    /// The loaded medium, if any. A parked disc is SCSI-ejected: logically
+    /// NOT PRESENT until reclaimed or reloaded.
+    pub(crate) fn loaded_mut(&mut self) -> Option<&mut CdMedia<'a>> {
+        match &mut self.tray {
+            Tray::Loaded(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    fn loaded_ref(&self) -> Option<&CdMedia<'a>> {
+        match &self.tray {
+            Tray::Loaded(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    fn loaded(&self) -> bool {
+        matches!(self.tray, Tray::Loaded(_))
     }
 
     /// Whether media is present.
     pub fn is_media_present(&self) -> bool {
-        self.media.is_some()
+        self.loaded()
     }
 
     /// Whether `load()` was requested by START STOP Load=1 on empty tray.
@@ -154,14 +222,14 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn lead_out_lba(&self) -> u32 {
-        if let Some(ref m) = self.media {
+        if let Some(m) = self.loaded_ref() {
             return m.lead_out_lba();
         }
         0
     }
 
     fn max_lba(&self) -> u64 {
-        if let Some(ref m) = self.media {
+        if let Some(m) = self.loaded_ref() {
             return m.max_lba();
         }
         0
@@ -173,8 +241,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn media_state(&self) -> MediaState {
-        self.media
-            .as_ref()
+        self.loaded_ref()
             .map(CdMedia::state)
             .unwrap_or_else(MediaState::empty)
     }
@@ -217,7 +284,7 @@ impl<'a> CdromDrive<'a> {
             return XferOutcome::Error(XferError::Overrun);
         }
         let actual = base_byte + transfer_offset;
-        let res = if let Some(ref mut m) = self.media {
+        let res = if let Some(m) = self.loaded_mut() {
             m.read_data(actual, buf)
         } else {
             Err(crate::scsi::backend::BlockStorageError::OutOfBounds)
@@ -267,7 +334,7 @@ impl<'a> CdromDrive<'a> {
             return XferOutcome::Error(XferError::WriteProtected);
         }
         let actual = base_byte + transfer_offset;
-        let res = if let Some(ref mut m) = self.media {
+        let res = if let Some(m) = self.loaded_mut() {
             m.write_data(actual, buf)
         } else {
             Err(crate::cdrom::media::MediaError::WriteProtected)
@@ -287,8 +354,10 @@ impl<'a> CdromDrive<'a> {
                 }
                 crate::cdrom::media::MediaError::IllegalField => {
                     self.set_sense(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+                    // Payload is transport-diagnostic only; the sense above
+                    // carries INVALID_FIELD (B9).
                     XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::BlockStorageError::OutOfBounds,
+                        crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other),
                     ))
                 }
                 crate::cdrom::media::MediaError::Io => {
@@ -342,7 +411,7 @@ impl<'a> CdromDrive<'a> {
 
         // ── Intercept TUR before execute_spc ──────────
         if let Some(SpcCommand::TestUnitReady) = spc {
-            if self.media.is_some() {
+            if matches!(self.tray, Tray::Loaded(_)) {
                 // GOOD; sense already None or will be cleared by not having UA.
                 // Ensure sense is cleared for GOOD? With owning Option, GOOD leaves sense None.
                 // If there was a UA that was bypass? TUR is not bypass, so we wouldn't be here with UA.
@@ -433,7 +502,7 @@ impl<'a> CdromDrive<'a> {
 
                 // ── READ TOC (0x43) ─────────────────────────────
                 op::READ_TOC => {
-                    if self.media.is_none() {
+                    if !self.loaded() {
                         return Ok(self.not_ready());
                     }
                     self.read_toc_cmd(cdb, data)
@@ -444,7 +513,7 @@ impl<'a> CdromDrive<'a> {
 
                 // ── READ DISC INFORMATION (0x51) ─────────────────
                 op::READ_DISC_INFORMATION => {
-                    if self.media.is_none() {
+                    if !self.loaded() {
                         return Ok(self.not_ready());
                     }
                     self.read_disc_info_cmd(cdb, data)
@@ -458,7 +527,7 @@ impl<'a> CdromDrive<'a> {
 
                 // ── READ DVD STRUCTURE (0xAD) ────────────────────
                 op::READ_DVD_STRUCTURE => {
-                    if self.media.is_none() {
+                    if !self.loaded() {
                         return Ok(self.not_ready());
                     }
                     self.read_dvd_structure_cmd(cdb, data)
@@ -466,7 +535,7 @@ impl<'a> CdromDrive<'a> {
 
                 // ── READ TRACK INFORMATION (0x52) ────────────────
                 op::READ_TRACK_INFORMATION => {
-                    if self.media.is_none() {
+                    if !self.loaded() {
                         return Ok(self.not_ready());
                     }
                     self.read_track_information_cmd(cdb, data)
@@ -501,7 +570,7 @@ impl<'a> CdromDrive<'a> {
                     if self.is_random_writable() {
                         #[cfg(feature = "udf_void")]
                         {
-                            if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
+                            if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
                                 match media.format_unit() {
                                     Ok(()) => {
                                         self.sense = Some(Sense::new(
@@ -602,7 +671,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn format_unit_cmd(&mut self, cdb: &[u8]) -> CommandOutcome {
-        if self.media.is_none() {
+        if !self.loaded() {
             return self.not_ready();
         }
         if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
@@ -614,7 +683,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn complete_format_unit(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
-        if self.media.is_none() {
+        if !self.loaded() {
             return self.not_ready();
         }
         if data.len() != 12 {
@@ -638,7 +707,7 @@ impl<'a> CdromDrive<'a> {
             return CommandOutcome::Status;
         }
         #[cfg(feature = "udf_void")]
-        if let Some(CdMedia::UdfRw(ref mut media)) = self.media {
+        if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
             return match media.format_unit() {
                 Ok(()) => {
                     // Signal media change so host re-reads DiscInfo/TOC/Capacity.
@@ -688,7 +757,7 @@ impl<'a> CdromDrive<'a> {
     // ── READ CAPACITY ───────────────────────────────────────────────
 
     fn read_capacity_10_cmd(&mut self, pmi: bool, req_lba: u32, data: &mut [u8]) -> CommandOutcome {
-        if self.media.is_none() {
+        if !self.loaded() {
             return self.not_ready();
         }
         if !pmi && req_lba != 0 {
@@ -701,7 +770,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn read_capacity_16_cmd(&mut self, sa: u8, alloc: u32, data: &mut [u8]) -> CommandOutcome {
-        if self.media.is_none() {
+        if !self.loaded() {
             return self.not_ready();
         }
         if sa != 0x10 {
@@ -795,9 +864,9 @@ impl<'a> CdromDrive<'a> {
         // otherwise complete. This makes Windows not prompt “needs format” when
         // a valid mkudffs image is already present, and makes post-WRITE
         // verification see a change after the host creates a new filesystem.
-        let has_udf = match self.media {
+        let has_udf = match self.loaded_mut() {
             #[cfg(feature = "udf_void")]
-            Some(CdMedia::UdfRw(ref mut m)) => UdfRwMedia::has_udf(m.backend()),
+            Some(CdMedia::Rw(ref mut m)) => UdfRwMedia::has_udf(m.backend()),
             _ => false,
         };
         let (disc_status, state_of_last_session, erasable) = if self.is_random_writable() {
@@ -867,7 +936,7 @@ impl<'a> CdromDrive<'a> {
         match format {
             0 => {
                 #[cfg(feature = "udf_void")]
-                if let Some(ref m) = self.media {
+                if let Some(m) = self.loaded_ref() {
                     if let Some(pf) = m.dvd_physical_format() {
                         let mut buf = [0u8; 28];
                         buf[0..2].copy_from_slice(&0x0018u16.to_be_bytes());
@@ -886,7 +955,7 @@ impl<'a> CdromDrive<'a> {
             0x08 => {
                 // DVD-RAM DDS — synthetic 2048-byte DDS info (MMC-6 Table 414)
                 #[cfg(feature = "udf_void")]
-                if let Some(ref m) = self.media {
+                if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 2052];
                         buf[0..2].copy_from_slice(&0x0802u16.to_be_bytes());
@@ -900,7 +969,7 @@ impl<'a> CdromDrive<'a> {
             0x09 => {
                 // DVD-RAM Medium Status — 4-byte payload (Table 415)
                 #[cfg(feature = "udf_void")]
-                if let Some(ref m) = self.media {
+                if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 8];
                         buf[0..2].copy_from_slice(&0x0006u16.to_be_bytes());
@@ -916,7 +985,7 @@ impl<'a> CdromDrive<'a> {
                 // DVD-RAM Spare Area Information — 12-byte payload (Table 417)
                 // SSA=0 logical model: zero spare counts, no allocation.
                 #[cfg(feature = "udf_void")]
-                if let Some(ref m) = self.media {
+                if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 16];
                         buf[0..2].copy_from_slice(&0x000Eu16.to_be_bytes());
@@ -931,7 +1000,7 @@ impl<'a> CdromDrive<'a> {
             0x0B => {
                 // DVD-RAM Recording Type — 4-byte payload, Recording Type 0 = general data
                 #[cfg(feature = "udf_void")]
-                if let Some(ref m) = self.media {
+                if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 8];
                         buf[0..2].copy_from_slice(&0x0006u16.to_be_bytes());
@@ -1019,16 +1088,15 @@ impl<'a> CdromDrive<'a> {
     // ── SYNCHRONIZE CACHE ────────────────────────────────────────────
 
     /// Flush the media (SYNCHRONIZE CACHE equivalent).
-    pub fn sync_media(&mut self) -> bool {
-        if let Some(ref mut m) = self.media {
-            m.sync().is_err()
-        } else {
-            false
+    pub fn sync_media(&mut self) -> Result<(), MediaError> {
+        match self.loaded_mut() {
+            Some(m) => m.sync(),
+            None => Ok(()),
         }
     }
 
     pub fn sync_cache_cmd(&mut self) -> CommandOutcome {
-        if let Some(ref mut m) = self.media {
+        if let Some(m) = self.loaded_mut() {
             if m.sync().is_err() {
                 return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
             }
@@ -1085,7 +1153,7 @@ impl SpcDevice for CdromDrive<'_> {
             SpcEffect::Good
         } else if loej && load {
             // Load on empty tray → media_requested.
-            if self.media.is_none() {
+            if !self.loaded() {
                 self.tray_open = false;
                 self.media_requested = true;
             }
@@ -1103,6 +1171,16 @@ impl SpcDevice for CdromDrive<'_> {
 // ── ScsiDevice impl ─────────────────────────────────────────────────
 
 impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
+    fn sync(&mut self) -> Result<(), crate::scsi::backend::BlockStorageError> {
+        // MediaError → device-level storage error domain.
+        use crate::scsi::backend::BlockStorageError;
+        self.sync_media().map_err(|e| match e {
+            MediaError::OutOfBounds => BlockStorageError::OutOfBounds,
+            MediaError::WriteProtected | MediaError::IllegalField => BlockStorageError::NotWritable,
+            MediaError::Io => BlockStorageError::Io(embedded_io::ErrorKind::Other),
+        })
+    }
+
     fn do_cmd(
         &mut self,
         cdb: &[u8],
@@ -1153,13 +1231,15 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
 ///
 /// Constructs the drive identity; media is injected at runtime via
 /// `load()`.
-pub struct CdromDriveBuilder {
+pub struct CdromDriveBuilder<'a> {
     identity: DeviceIdentity,
     caps: CdromCapabilities,
     drive_id: u64,
+    /// Media borrow anchor: the built drive borrows disc data for `'a`.
+    _phantom: core::marker::PhantomData<&'a ()>,
 }
 
-impl CdromDriveBuilder {
+impl<'a> CdromDriveBuilder<'a> {
     /// Set INQUIRY identity (vendor, product, revision).
     pub fn identity(mut self, vendor: &[u8; 8], product: &[u8; 16], rev: &[u8; 4]) -> Self {
         self.identity = DeviceIdentity {
@@ -1191,8 +1271,9 @@ impl CdromDriveBuilder {
         self
     }
 
-    /// Build the drive (empty tray).
-    pub fn build(self) -> CdromDrive<'static> {
+    /// Build the drive (empty tray). The drive borrows disc data for `'a`;
+    /// discs must outlive it.
+    pub fn build(self) -> CdromDrive<'a> {
         CdromDrive {
             sense: None,
             pending: None,
@@ -1200,7 +1281,7 @@ impl CdromDriveBuilder {
             caps: self.caps,
             drive_id: self.drive_id,
             identity: self.identity,
-            media: None,
+            tray: Tray::Empty,
             tray_open: false,
             mode_page_05: [0u8; 52],
             mode_page_05_valid: false,
@@ -1213,8 +1294,7 @@ impl CdromDriveBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdrom::common::CurrentProfile;
-    use crate::cdrom::media::FlatMedia;
+    use crate::common::block_storage::RwRef;
     use crate::scsi::backend::{BlockBackend, RamBackend};
     use crate::scsi::device::{ScsiDevice, XferOutcome};
 
@@ -1230,16 +1310,6 @@ mod tests {
                 n
             }
             _ => panic!("expected OutInline"),
-        }
-    }
-
-    fn check_condition(outcome: CommandOutcome, dev: &CdromDrive<'_>) -> (SenseKey, u8) {
-        match outcome {
-            CommandOutcome::CheckCondition => {
-                let s = dev.peek_sense().expect("sense should be set");
-                (s.key, s.asc)
-            }
-            _ => panic!("expected CheckCondition"),
         }
     }
 
@@ -1266,7 +1336,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn drive_new_defaults() {
         let dev = CdromDrive::new();
@@ -1400,11 +1469,8 @@ mod tests {
     fn drive_format_unit_rejects_read_only_media() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 2048];
-        let flat = FlatMedia::new(
-            BlockBackend::Ram(RamBackend::new(&mut img)),
-            CurrentProfile::CdRom,
-        );
-        dev.load_quiet(CdMedia::Flat(flat));
+        let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+        dev.load_quiet(CdMedia::ro(&mut bb));
         let mut cdb = [0u8; 6];
         cdb[0] = op::FORMAT_UNIT;
         cdb[1] = 0x11; // FmtData + format code 1
@@ -1528,11 +1594,8 @@ mod tests {
 
         // Simulate integrator loading media.
         let mut img = vec![0u8; 2048];
-        let flat = FlatMedia::new(
-            BlockBackend::Ram(RamBackend::new(&mut img)),
-            CurrentProfile::CdRom,
-        );
-        dev.load(CdMedia::Flat(flat));
+        let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+        dev.load(CdMedia::ro(&mut bb));
         assert!(dev.is_media_present());
 
         // TUR → CC(UA 28h/00h).
@@ -1622,13 +1685,9 @@ mod tests {
         {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
             cdb[1] = 0x11;
@@ -1661,13 +1720,9 @@ mod tests {
         {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
             cdb[1] = 0x11;
@@ -1701,13 +1756,9 @@ mod tests {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             // Write pattern via xfer_in path
             let mut w = work();
             let mut cdb = [0u8; 10];
@@ -1767,13 +1818,9 @@ mod tests {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             // Write some data via xfer_in
             {
                 let mut w = work();
@@ -1837,13 +1884,9 @@ mod tests {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             let mut w = work();
             for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
                 let mut cdb = [0u8; 12];
@@ -1865,12 +1908,9 @@ mod tests {
             }
             // Same formats must fail for CD-ROM flat media
             let mut img2 = vec![0u8; 2048];
-            let flat = FlatMedia::new(
-                BlockBackend::Ram(RamBackend::new(&mut img2)),
-                CurrentProfile::CdRom,
-            );
+            let mut bb2 = BlockBackend::Ram(RamBackend::new(&mut img2));
             let mut dev2 = CdromDrive::new();
-            dev2.load_quiet(CdMedia::Flat(flat));
+            dev2.load_quiet(CdMedia::ro(&mut bb2));
             for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
                 let mut cdb = [0u8; 12];
                 cdb[0] = op::READ_DVD_STRUCTURE;
@@ -1893,13 +1933,9 @@ mod tests {
             use crate::cdrom::udfrw::UdfRwMedia;
             let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
             // Immediately after load, TUR is GOOD (no format needed)
             let mut w = work();
             let mut cdb = [0u8; 6];
@@ -1978,13 +2014,9 @@ mod tests {
 
             let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
-            let media = UdfRwMedia::materialize(
-                BlockBackend::Ram(RamBackend::new(&mut img)),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
-            dev.load_quiet(CdMedia::UdfRw(media));
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
 
             // 1) Materialized UDF → disc_status 2 (complete)
             assert_eq!(disc_status(&mut dev), 2, "with UDF: complete");

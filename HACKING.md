@@ -12,7 +12,7 @@ the `snowdrive` binary lives in `snowdrive-cli`.
 | **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
 | **SCSI core** | `snowdrive-scsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, UDF volume skeleton |
 | — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `BlockStorage`/`FsStorage` + logging macros |
-| — SCSI | `snowdrive-scsi::scsi` | Block/CD-Block devices, SPC/SBC command layers, file/fs backends, `Device` enum |
+| — SCSI | `snowdrive-scsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
 | — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `UdfRwMedia`), full MMC |
 | — iSCSI | `snowdrive-scsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — USB MSC | `snowdrive-scsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
@@ -34,7 +34,7 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                 # #![deny(unsafe_code)]; re-exports common + logging macros
-│       ├── scsi/                  # feature "scsi": backend, block, cdblock, device,
+│       ├── scsi/                  # feature "scsi": backend, block, device,
 │       │                         #            fs_backend, sbc, spc, scsi
 │       ├── cdrom/                 # feature "cdrom": common, drive, media,
 │       │                         #            udfrw (gated by "udf_void")
@@ -42,7 +42,7 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 │       ├── usb/                   # feature "usb": bot, gadget, io, target
 │       └── udf_void.rs            # feature "udf_void": UDF 2.01 volume skeleton
 ├── snowdrive-cli/                 # crate: `snowdrive` binary (src/main.rs)
-│   ├── Cargo.toml                # features: full/std/scsi/iso9660/udf_void/iscsi/cdrom/livefs/usb/log/defmt
+│   ├── Cargo.toml                # features: full/std/scsi/udf_void/iscsi/cdrom/livefs/usb/log/defmt
 │   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
 ├── tests/                         # crate: snowdrive-tests (integration tests)
 │   ├── Cargo.toml
@@ -69,21 +69,21 @@ Feature maps:
 
 - **`snowdrive-common`** — `std` (default), `log`, `defmt`. No feature gate on
   the crate itself; the seams are always compiled.
-- **`snowdrive-disc`** — `std` (default), `iso9660` (declared, currently empty).
-- **`snowdrive-scsi`** — `std` (default), `scsi`, `iso9660`, `udf_void`,
+- **`snowdrive-disc`** — `std` (default).
+- **`snowdrive-scsi`** — `std` (default), `scsi`, `udf_void`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
-  `livefs` (→`cdrom`+`iso9660`+`snowdrive-disc/iso9660`), `usb` (→`scsi`),
+  `livefs` (→`cdrom`), `usb` (→`scsi`),
   `log`, `defmt`. Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowdrive-cli`** — `full` (default) pulls `std` +
-  `scsi`/`iso9660`/`udf_void`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
+  `scsi`/`udf_void`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
   std-only deps (clap/ctrlc/env_logger). Builds against `snowdrive-scsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
   targets.
 - **`tests`** (`snowdrive-tests`) — depends on `snowdrive-scsi` with
-  `std, scsi, iscsi, iso9660, cdrom, livefs, usb`; enables `has_libiscsi`
+  `std, scsi, iscsi, cdrom, livefs, usb`; enables `has_libiscsi`
   only when the `libiscsi` system library is present (probed in `build.rs`).
 
 `snowdrive-scsi`'s `no_std` surface is feature-gated; without `std` it stays
