@@ -20,8 +20,14 @@ macro_rules! trace {
         ::log::trace!($s $(, $x)*);
         #[cfg(feature = "defmt")]
         ::defmt::trace!($s $(, $x)*);
+        // `if false` keeps the branch type-checked (so implicit format-string
+        // captures like `info!("{peer}")` still count as *uses* of the
+        // variables — a plain `let _ = (&$x,)*` would leave them unused) at
+        // zero runtime cost.
         #[cfg(not(any(feature = "log", feature = "defmt")))]
-        let _ = ($( & $x ),*);
+        if false {
+            ::core::panic!($s $(, $x)*);
+        }
     }};
 }
 
@@ -33,7 +39,9 @@ macro_rules! debug {
         #[cfg(feature = "defmt")]
         ::defmt::debug!($s $(, $x)*);
         #[cfg(not(any(feature = "log", feature = "defmt")))]
-        let _ = ($( & $x ),*);
+        if false {
+            ::core::panic!($s $(, $x)*);
+        }
     }};
 }
 
@@ -45,7 +53,9 @@ macro_rules! info {
         #[cfg(feature = "defmt")]
         ::defmt::info!($s $(, $x)*);
         #[cfg(not(any(feature = "log", feature = "defmt")))]
-        let _ = ($( & $x ),*);
+        if false {
+            ::core::panic!($s $(, $x)*);
+        }
     }};
 }
 
@@ -57,7 +67,9 @@ macro_rules! warn {
         #[cfg(feature = "defmt")]
         ::defmt::warn!($s $(, $x)*);
         #[cfg(not(any(feature = "log", feature = "defmt")))]
-        let _ = ($( & $x ),*);
+        if false {
+            ::core::panic!($s $(, $x)*);
+        }
     }};
 }
 
@@ -69,7 +81,9 @@ macro_rules! error {
         #[cfg(feature = "defmt")]
         ::defmt::error!($s $(, $x)*);
         #[cfg(not(any(feature = "log", feature = "defmt")))]
-        let _ = ($( & $x ),*);
+        if false {
+            ::core::panic!($s $(, $x)*);
+        }
     }};
 }
 
