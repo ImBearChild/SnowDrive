@@ -1432,7 +1432,10 @@ impl<F: FsStorage> FlatData for LiveData<F> {
                 lba as u64 * u64::from(crate::SECTOR_SIZE),
             ))
             .map_err(|_| BlockStorageError::OutOfBounds)?;
-            Read::read(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
+            // read_exact, not read: a short read at the EOF tail would
+            // otherwise silently zero-fill the rest of the sector and
+            // corrupt the generated image (plan §14 D4).
+            Read::read_exact(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
             dst[..n].copy_from_slice(&tmp[within..within + n]);
             off += n as u64;
             dst = &mut dst[n..];
@@ -2003,10 +2006,10 @@ mod tests {
         // Type M table holds the same records with big-endian fields.
         assert_eq!(m[0], 1);
         assert_eq!(
-            u32::from_be_bytes(m[0 + 2..0 + 6].try_into().unwrap()),
+            u32::from_be_bytes(m[2..6].try_into().unwrap()),
             layout.pvd.root_dir_lba
         );
-        assert_eq!(u16::from_be_bytes(m[0 + 6..0 + 8].try_into().unwrap()), 1);
+        assert_eq!(u16::from_be_bytes(m[6..8].try_into().unwrap()), 1);
         let o1 = 10usize;
         assert_eq!(
             u32::from_be_bytes(m[o1 + 2..o1 + 6].try_into().unwrap()),

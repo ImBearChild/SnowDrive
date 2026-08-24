@@ -133,8 +133,13 @@ impl<'a> CdromDrive<'a> {
     }
 
     /// Eject the media, handing it back to the caller. Idempotent on an
-    /// empty tray; queues UNIT ATTENTION whenever a disc comes out.
+    /// empty tray *and* on a parked disc (a disc parked by a SCSI eject
+    /// belongs to the drive until [`Self::take_media`] reclaims it);
+    /// queues UNIT ATTENTION whenever a disc comes out.
     pub fn eject(&mut self) -> Option<CdMedia<'a>> {
+        if matches!(self.tray, Tray::Parked(_)) {
+            return None;
+        }
         let taken = core::mem::replace(&mut self.tray, Tray::Empty).disc();
         self.tray_open = true;
         if taken.is_some() {
@@ -145,6 +150,25 @@ impl<'a> CdromDrive<'a> {
             ));
         }
         taken
+    }
+
+    /// SCSI-initiated eject (`START STOP loej=1`): Loaded → Parked plus
+    /// UNIT ATTENTION. The disc stays owned by the drive — physically it
+    /// sticks out of the slot until [`Self::take_media`] reclaims it or
+    /// a new [`Self::load`] swaps it (plan §4.2 truth table). On an
+    /// empty or already-parked tray it merely presents the tray; an
+    /// empty tray presenting itself is not a medium-change event
+    /// (§14.3 次-1), so no UNIT ATTENTION is queued.
+    pub(crate) fn park(&mut self) {
+        if let Some(m) = core::mem::replace(&mut self.tray, Tray::Empty).disc() {
+            self.tray = Tray::Parked(m);
+            self.sense = Some(Sense::new(
+                SenseKey::UnitAttention,
+                asc::MEDIUM_MAY_HAVE_CHANGED,
+                0,
+            ));
+        }
+        self.tray_open = true;
     }
 
     /// Reclaim a disc parked by a SCSI-initiated eject (`START STOP loej=1`).
@@ -1088,21 +1112,30 @@ impl<'a> CdromDrive<'a> {
     // ── SYNCHRONIZE CACHE ────────────────────────────────────────────
 
     /// Flush the media (SYNCHRONIZE CACHE equivalent).
+    ///
+    /// Parked media is flushed too: the disc physically sits on the tray
+    /// until `take_media()` reclaims it, and host-written data must not
+    /// be lost in that window (plan §14 D2). Empty ⇒ nothing to flush.
     pub fn sync_media(&mut self) -> Result<(), MediaError> {
-        match self.loaded_mut() {
-            Some(m) => m.sync(),
-            None => Ok(()),
+        match &mut self.tray {
+            Tray::Loaded(m) | Tray::Parked(m) => m.sync(),
+            Tray::Empty => Ok(()),
         }
     }
 
     pub fn sync_cache_cmd(&mut self) -> CommandOutcome {
-        if let Some(m) = self.loaded_mut() {
-            if m.sync().is_err() {
-                return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
+        // Same Loaded|Parked contract as `sync_media`: a Parked disc is
+        // still addressable storage; data safety wins over protocol
+        // purity (NOT READY after eject).
+        match &mut self.tray {
+            Tray::Loaded(m) | Tray::Parked(m) => {
+                if m.sync().is_err() {
+                    return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
+                }
+                CommandOutcome::Status
             }
-            return CommandOutcome::Status;
+            Tray::Empty => CommandOutcome::Status,
         }
-        CommandOutcome::Status
     }
 }
 
@@ -1145,11 +1178,12 @@ impl SpcDevice for CdromDrive<'_> {
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
         if loej && !load {
-            // Eject.
+            // Eject: the disc parks on the tray (take_media() reclaims
+            // it); only a prevent-locked drive refuses.
             if self.prevent_removal {
                 return SpcEffect::RemovalPrevented;
             }
-            self.eject();
+            self.park();
             SpcEffect::Good
         } else if loej && load {
             // Load on empty tray → media_requested.
@@ -1295,6 +1329,8 @@ impl<'a> CdromDriveBuilder<'a> {
 mod tests {
     use super::*;
     use crate::common::block_storage::RwRef;
+    #[cfg(feature = "udf_void")]
+    use crate::common::block_storage::{BlockStorageError, FlatData, WritableFlatData};
     use crate::scsi::backend::{BlockBackend, RamBackend};
     use crate::scsi::device::{ScsiDevice, XferOutcome};
 
@@ -1673,6 +1709,114 @@ mod tests {
         dev.set_prevent(true);
         let effect = dev.start_stop(true, false); // loej=true, load=false
         assert_eq!(effect, SpcEffect::RemovalPrevented);
+    }
+
+    /// Backend whose `sync` counts invocations through an outer handle,
+    /// so the counter stays reachable while the backend itself is owned
+    /// by the media stack.
+    #[cfg(feature = "udf_void")]
+    struct CountingSyncBackend {
+        data: Vec<u8>,
+        syncs: std::rc::Rc<core::cell::Cell<u32>>,
+    }
+
+    #[cfg(feature = "udf_void")]
+    impl FlatData for CountingSyncBackend {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+            let off = off as usize;
+            buf.copy_from_slice(&self.data[off..off + buf.len()]);
+            Ok(())
+        }
+
+        fn capacity(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    #[cfg(feature = "udf_void")]
+    impl WritableFlatData for CountingSyncBackend {
+        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+            let off = off as usize;
+            self.data[off..off + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<(), BlockStorageError> {
+            self.syncs.set(self.syncs.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "udf_void")]
+    #[test]
+    fn sync_reaches_parked_media() {
+        // Plan §14 D2: after a SCSI eject the disc sits Parked on the
+        // tray until take_media(); shutdown (`ScsiDevice::sync`) and
+        // SYNCHRONIZE CACHE must both reach it — the former behavior
+        // returned Ok/Status without flushing ⇒ data-loss window.
+        use crate::cdrom::udfrw::UdfRwMedia;
+
+        let syncs = std::rc::Rc::new(core::cell::Cell::new(0));
+        let mut be = CountingSyncBackend {
+            data: vec![0u8; 4096 * 2048],
+            syncs: std::rc::Rc::clone(&syncs),
+        };
+        let mut scratch = [0u8; 256];
+        let media = UdfRwMedia::materialize(RwRef::new(&mut be), "TEST", &mut scratch).unwrap();
+
+        let mut dev = CdromDrive::new();
+        let swapped_out = dev.load(CdMedia::Rw(media));
+        assert!(swapped_out.is_none());
+
+        // Host-initiated eject: Loaded → Parked.
+        use crate::scsi::spc::SpcDevice;
+        assert_eq!(dev.start_stop(true, false), SpcEffect::Good);
+
+        // Shutdown-path flush reaches the parked disc.
+        ScsiDevice::sync(&mut dev).unwrap();
+        assert_eq!(syncs.get(), 1);
+
+        // …and so does the SYNCHRONIZE CACHE command path. Consume the
+        // eject's UNIT ATTENTION first (correct SCSI behavior: the first
+        // command after a medium change reports CC/UA).
+        assert_eq!(
+            dev.take_sense().map(|s| s.key),
+            Some(SenseKey::UnitAttention)
+        );
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SYNCHRONIZE_CACHE_10;
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+        assert_eq!(syncs.get(), 2);
+
+        // Reclaim: the disc leaves with its data flushed.
+        assert!(dev.take_media().is_some());
+    }
+
+    #[test]
+    fn tray_parked_rows_of_truth_table() {
+        // Plan §4.2 truth table: app-side eject() on a parked tray is a
+        // no-op (Parked → Parked); load() over a parked disc hands the
+        // parked media back to the caller.
+        use crate::scsi::spc::SpcDevice;
+
+        let mut dev = CdromDrive::new();
+        let mut img1 = vec![0u8; 2048];
+        let mut bb1 = BlockBackend::Ram(RamBackend::new(&mut img1));
+        dev.load_quiet(CdMedia::ro(&mut bb1));
+
+        // SCSI eject parks; the parked disc is logically NOT PRESENT and
+        // app-side eject cannot steal it from the tray.
+        assert_eq!(dev.start_stop(true, false), SpcEffect::Good);
+        assert!(!dev.is_media_present());
+        assert!(dev.eject().is_none());
+
+        // A fresh load swaps the parked disc out to the caller.
+        let mut img2 = vec![0u8; 2048];
+        let mut bb2 = BlockBackend::Ram(RamBackend::new(&mut img2));
+        let swapped = dev.load(CdMedia::ro(&mut bb2));
+        assert!(swapped.is_some());
+        assert!(dev.is_media_present());
     }
 
     #[test]

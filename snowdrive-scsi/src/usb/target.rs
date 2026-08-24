@@ -1054,7 +1054,7 @@ mod tests {
 
     fn read_via_xfer(dev: &mut BlockDevice<BlockBackend<'_>>, lba: u64, buf: &mut [u8]) {
         let mut work = [0u8; crate::MIN_DATA_LEN];
-        let blocks = ((buf.len() as u64 + 511) / 512) as u32;
+        let blocks = (buf.len() as u64).div_ceil(512) as u32;
         let nblocks = blocks.max(1) as u16; // at least 1 for small reads like 64B tail
         let mut cdb = [0u8; 10];
         cdb[0] = scsi_op::READ_10;

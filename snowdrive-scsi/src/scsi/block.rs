@@ -36,11 +36,56 @@ pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
 /// Plain `fn` pointers parameterized by the backend type — no trait bound
 /// on the struct itself, so a read-only backend (`FlatData` only) can
 /// never reach the write path.
-#[derive(Clone, Copy)]
 pub(crate) struct WriteOps<D> {
     write_at: fn(&mut D, u64, &[u8]) -> Result<(), BlockStorageError>,
     sync: fn(&mut D) -> Result<(), BlockStorageError>,
 }
+
+// Hand-written (NOT derived): `derive(Copy)` would add a `D: Copy` bound,
+// and `D` is only used behind `fn(&mut D, …)` pointers — the ops value is
+// `Copy` regardless of `D`. Without the unbounded impl, `WritePath<D>`
+// below could not be `Copy` for non-`Copy` backends (e.g. `RwRef<'_>`).
+impl<D> Clone for WriteOps<D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D> Copy for WriteOps<D> {}
+
+/// Device-instance write-path state — all legal states, exhaustively.
+///
+/// "Not writable" comes in two kinds that a single device type must
+/// express at runtime (the constructor-chosen difference necessarily
+/// degrades to runtime state; see plan §14 D1):
+///
+/// - [`WritePath::Absent`] — capability missing (`cdrom()` profile /
+///   read-only plane). Writes are DATA PROTECT, forever.
+/// - [`WritePath::Locked`] — backend *can* write but policy says no
+///   (read-only disk image). Re-openable via [`BlockDevice::set_writable`].
+/// - [`WritePath::Open`] — normal writable disk.
+///
+/// The illegal combination `(writable == true, write_ops == None)` of the
+/// former two-field design is no longer representable.
+pub(crate) enum WritePath<D> {
+    /// No write path (`cdrom()` profile / read-only source). Always DATA
+    /// PROTECT; nothing to flush.
+    Absent,
+    /// Backend has write capability, policy closed (read-only *disk*
+    /// image). Re-openable; still flushed on sync (dirty pages written
+    /// during an Open window must stay reachable).
+    Locked(WriteOps<D>),
+    /// Normal writable.
+    Open(WriteOps<D>),
+}
+
+// Same reasoning as [`WriteOps`]: variant payloads are `Copy` regardless
+// of `D`, so the impls must be unbounded.
+impl<D> Clone for WritePath<D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D> Copy for WritePath<D> {}
 
 /// SCSI LUN over an offset-addressed byte plane.
 ///
@@ -56,13 +101,11 @@ pub(crate) struct WriteOps<D> {
 pub struct BlockDevice<D: FlatData> {
     backend: D,
     sector_size: u32,
-    /// Policy writability (second kind of "not writable"): a disk opened
-    /// from a read-only image reports DATA PROTECT even though its
-    /// backend could write.
-    writable: bool,
-    /// Capability capture (first kind): `None` ⇒ the plane cannot write,
-    /// ever. Set iff constructed via `disk()`.
-    write_ops: Option<WriteOps<D>>,
+    /// Write-path state (capability × policy, exhaustively enumerated —
+    /// see [`WritePath`]). Replaces the former `writable: bool` +
+    /// `write_ops: Option<_>` pair whose `(true, None)` combination was
+    /// representable and panicked at first WRITE.
+    write_path: WritePath<D>,
     identity: DeviceIdentity,
     pdt: DeviceType,
     sense: Option<Sense>,
@@ -74,12 +117,25 @@ impl<D: FlatData> BlockDevice<D> {
     /// Read-only optical profile (the former `CDBlockDevice`): sector size
     /// fixed at 2048, every write rejected with DATA PROTECT, MODE SELECT
     /// accepted as a no-op, START STOP ignored.
+    ///
+    /// # `BlockDevice::cdrom` vs `crate::cdrom::CdromDrive`
+    ///
+    /// Both serve read-only ISO images, but they are different layers:
+    ///
+    /// - **`BlockDevice::cdrom(backend)`** — a *simple* read-only LUN
+    ///   (PDT 0x05) that answers SBC/SPC over any [`FlatData`] plane.
+    ///   Use it when you just want to hand the host an image without
+    ///   dragging in the full MMC machinery (embedded targets, quick
+    ///   `--disk cd=` mounts).
+    /// - **`crate::cdrom::CdromDrive`** (feature `cdrom`) — a *complete*
+    ///   MMC optical drive (READ TOC, GET CONFIGURATION, tray/medium
+    ///   events, runtime media exchange via `load`/`eject`). Use it when
+    ///   the guest expects a real optical drive or needs disc swapping.
     pub fn cdrom(backend: D) -> Result<Self, Error> {
         Ok(Self {
             backend,
             sector_size: CD_SECTOR_SIZE,
-            writable: false,
-            write_ops: None,
+            write_path: WritePath::Absent,
             identity: CDBLOCK_IDENTITY,
             pdt: DeviceType::Cdrom,
             sense: None,
@@ -119,6 +175,17 @@ impl<D: FlatData> BlockDevice<D> {
         nblocks.saturating_sub(1)
     }
 
+    /// Set sense data directly — the single source of truth for wrapper
+    /// authors: a vendor-command handler reports errors by writing the
+    /// inner device's sense here (never a private shadow field).
+    ///
+    /// # Contract
+    ///
+    /// Call only within command processing that produces the returned
+    /// outcome — i.e., between [`BlockDevice::do_cmd`] and the outcome
+    /// handed back to the transport. Sense written outside that window
+    /// races the host's REQUEST SENSE and may be consumed by the wrong
+    /// command.
     pub fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
         self.sense = Some(Sense::new(key, asc, ascq));
     }
@@ -139,11 +206,15 @@ impl<D: FlatData> BlockDevice<D> {
     }
 
     /// Flush via the captured sync op (`SYNCHRONIZE CACHE`, shutdown).
-    /// Read-only profiles are always clean.
+    ///
+    /// `Absent` ⇒ nothing was ever writable, always clean. `Locked` still
+    /// flushes: the lock is *policy*, not capability — dirty pages written
+    /// during an Open window must stay reachable after `set_writable(false)`
+    /// (plan §14 D1-②).
     pub(crate) fn sync_backend(&mut self) -> Result<(), BlockStorageError> {
-        match self.write_ops.as_ref() {
-            Some(ops) => (ops.sync)(&mut self.backend),
-            None => Ok(()),
+        match self.write_path {
+            WritePath::Absent => Ok(()),
+            WritePath::Locked(ops) | WritePath::Open(ops) => (ops.sync)(&mut self.backend),
         }
     }
 
@@ -186,10 +257,12 @@ impl<D: FlatData> BlockDevice<D> {
 
     /// Write `buf` for the current WRITE transfer (host → device).
     ///
-    /// Rejection order: transfer bookkeeping first, then the two kinds of
-    /// "not writable" — capability (`write_ops: None`) and policy
-    /// (`writable: false`) — both DATA PROTECT, then bounds, then the
-    /// actual plane write.
+    /// Rejection order: transfer bookkeeping first, then the write path
+    /// gate ([`WritePath::Open`] only; `Absent | Locked` are both DATA
+    /// PROTECT), then bounds, then the actual plane write. A backend that
+    /// reports [`BlockStorageError::NotWritable`] at write time (policy
+    /// bit bypassed by a direct `disk()` over a read-only plane) is
+    /// mapped to DATA PROTECT too.
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
@@ -213,17 +286,27 @@ impl<D: FlatData> BlockDevice<D> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return XferOutcome::Error(XferError::Overrun);
         }
-        if !self.writable {
-            self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-            return XferOutcome::Error(XferError::WriteProtected);
-        }
+        let ops = match self.write_path {
+            WritePath::Open(ops) => ops,
+            // Capability missing or policy closed: same SCSI verdict.
+            WritePath::Absent | WritePath::Locked(_) => {
+                self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+                return XferOutcome::Error(XferError::WriteProtected);
+            }
+        };
         let actual = base_byte + transfer_offset;
         if let Err(e) = self.check_bounds(actual, buf.len()) {
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
             return XferOutcome::Error(XferError::Storage(e));
         }
-        let ops = self.write_ops.as_ref().expect("writable ⇒ write_ops");
         if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
+            // Read-only plane masquerading as writable through the
+            // blanket impl (plan §14 D5): the backend's policy rejection
+            // surfaces as NotWritable, not a medium fault.
+            if e == BlockStorageError::NotWritable {
+                self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+                return XferOutcome::Error(XferError::WriteProtected);
+            }
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
             return XferOutcome::Error(XferError::Storage(e));
         }
@@ -288,9 +371,10 @@ impl<D: FlatData> BlockDevice<D> {
         count: u32,
         _data: &mut [u8],
     ) -> CommandOutcome {
-        if !self.writable {
-            // Read-only profile/image: immediate DATA PROTECT (the former
-            // CDBlockDevice behavior).
+        if !matches!(self.write_path, WritePath::Open(_)) {
+            // Read-only profile (Absent) or locked read-only *image*
+            // (Locked): immediate DATA PROTECT — the former CDBlockDevice
+            // behavior plus the policy bit.
             return self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED);
         }
         if count == 0 {
@@ -374,8 +458,7 @@ impl<D: WritableFlatData> BlockDevice<D> {
         Ok(Self {
             backend,
             sector_size,
-            writable: true,
-            write_ops: Some(WriteOps {
+            write_path: WritePath::Open(WriteOps {
                 write_at: D::write_at,
                 sync: D::sync,
             }),
@@ -389,9 +472,30 @@ impl<D: WritableFlatData> BlockDevice<D> {
 
     /// Policy switch for read-only *disk* images (PDT 0x00 but RO): the
     /// backend stays writable-capable, the device refuses writes. serve 前
-    /// 设置；对 `cdrom()` profile 无意义（恒只读）。
+    /// 设置。
+    ///
+    /// Total function over the write path ([`WritePath`]): `Absent`
+    /// (the `cdrom()` profile) stays absent regardless of `writable` — a
+    /// read-only plane can never be talked into writing; `Locked` and
+    /// `Open` swap according to `writable`.
     pub fn set_writable(&mut self, writable: bool) {
-        self.writable = writable;
+        self.write_path = match self.write_path {
+            WritePath::Absent => WritePath::Absent,
+            WritePath::Locked(ops) => {
+                if writable {
+                    WritePath::Open(ops)
+                } else {
+                    WritePath::Locked(ops)
+                }
+            }
+            WritePath::Open(ops) => {
+                if writable {
+                    WritePath::Open(ops)
+                } else {
+                    WritePath::Locked(ops)
+                }
+            }
+        };
     }
 }
 
@@ -930,6 +1034,9 @@ mod tests {
         let path = dir.join(format!("snowscsi_block_ro_{}.img", std::process::id()));
         std::fs::write(&path, [0u8; 512]).unwrap();
 
+        // A read-only FileBackend handed *directly* to `disk()` bypasses
+        // the policy bit (plan §14 D5): the backend's PermissionDenied
+        // must surface as DATA PROTECT, not WRITE FAULT.
         let backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), false).unwrap();
         let mut dev = BlockDevice::disk(backend, 512).unwrap();
@@ -941,8 +1048,8 @@ mod tests {
             CommandOutcome::InXfer { len: _ } => {
                 let r = dev.xfer_in(0, &w[0..512]);
                 assert!(matches!(r, XferOutcome::Error(_)));
-                assert_eq!(dev.peek_sense().unwrap().key, SenseKey::MediumError);
-                assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_FAULT);
+                assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
+                assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_PROTECTED);
             }
             _ => panic!("expected InXfer"),
         }
@@ -1006,5 +1113,136 @@ mod tests {
             }
             _ => panic!("expected InXfer"),
         }
+    }
+
+    /// Backend whose `sync` counts invocations — makes flush behavior of
+    /// every [`WritePath`] state observable. Deliberately NOT `Copy`/
+    /// `Clone`: proves the hand-written `WritePath<D>: Copy` impl holds
+    /// for non-`Copy` `D` (a derived one would have demanded `D: Copy`).
+    struct CountingBackend {
+        data: Vec<u8>,
+        syncs: core::cell::Cell<u32>,
+    }
+
+    impl FlatData for CountingBackend {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+            let off = off as usize;
+            buf.copy_from_slice(&self.data[off..off + buf.len()]);
+            Ok(())
+        }
+
+        fn capacity(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    impl WritableFlatData for CountingBackend {
+        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+            let off = off as usize;
+            self.data[off..off + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<(), BlockStorageError> {
+            self.syncs.set(self.syncs.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cdrom_profile_set_writable_cannot_unlock() {
+        // Plan §14 D1 landmine: `set_writable(true)` on a `cdrom()`
+        // device used to flip the policy bit while the captured write ops
+        // stayed None ⇒ panic at the first WRITE. With `WritePath`, the
+        // Absent state is sticky and the rejection happens at the command
+        // phase.
+        let mut ram = [0u8; 8192];
+        let mut dev = BlockDevice::cdrom(RamBackend::new(&mut ram)).unwrap();
+        assert_eq!(dev.device_type(), DeviceType::Cdrom);
+        dev.set_writable(true); // must be a no-op
+        let mut w = work();
+        let cdb = make_cdb10(op::WRITE_10, 0, 1);
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::CheckCondition
+        );
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_PROTECTED);
+    }
+
+    #[test]
+    fn disk_policy_lock_unlock_roundtrip() {
+        let mut ram = vec![0u8; 4096];
+        let mut dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut w = work();
+
+        // Lock: WRITE rejected at the command phase with DATA PROTECT.
+        dev.set_writable(false);
+        let cdb = make_cdb10(op::WRITE_10, 1, 1);
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::CheckCondition
+        );
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
+
+        // Re-open: writes flow again and read back intact.
+        dev.set_writable(true);
+        let pattern: Vec<u8> = (0..512).map(|i| ((i * 13) & 0xFF) as u8).collect();
+        w[0..512].copy_from_slice(&pattern);
+        let cdb = make_cdb10(op::WRITE_10, 1, 1);
+        match dev.do_cmd(&cdb, &mut w).unwrap() {
+            CommandOutcome::InXfer { len } => {
+                assert_eq!(len, 512);
+                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+            }
+            _ => panic!("expected InXfer"),
+        }
+        let cdb = make_cdb10(op::READ_10, 1, 1);
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        let mut buf = [0u8; 512];
+        data_in(&mut dev, outcome, &w, &mut buf);
+        assert_eq!(buf, pattern.as_slice());
+    }
+
+    #[test]
+    fn sync_flushes_open_and_locked_but_not_absent() {
+        // Plan §14 D1-②: Locked is policy, not capability — dirty pages
+        // from an Open window must stay reachable, so sync flushes.
+        let mut dev = BlockDevice::disk(
+            CountingBackend {
+                data: vec![0u8; 1024],
+                syncs: core::cell::Cell::new(0),
+            },
+            512,
+        )
+        .unwrap();
+
+        // Open: flushes.
+        dev.sync().unwrap();
+        assert_eq!(dev.backend.syncs.get(), 1);
+
+        // Locked: still flushes.
+        dev.set_writable(false);
+        dev.sync().unwrap();
+        assert_eq!(dev.backend.syncs.get(), 2);
+        // …also via the SYNCHRONIZE CACHE command path.
+        let mut w = work();
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SYNCHRONIZE_CACHE_10;
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+        assert_eq!(dev.backend.syncs.get(), 3);
+
+        // Absent (`cdrom()` profile): nothing was ever writable, no op,
+        // and `set_writable` cannot conjure a write path.
+        let mut cd = BlockDevice::cdrom(CountingBackend {
+            data: vec![0u8; 2048],
+            syncs: core::cell::Cell::new(0),
+        })
+        .unwrap();
+        cd.sync().unwrap();
+        assert_eq!(cd.backend.syncs.get(), 0);
+        cd.set_writable(true);
+        cd.sync().unwrap();
+        assert_eq!(cd.backend.syncs.get(), 0);
     }
 }

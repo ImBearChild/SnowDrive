@@ -53,8 +53,8 @@ impl embedded_io::Seek for CursorReader<'_> {
 fn build_tree() -> (PathBuf, Vec<(String, Vec<u8>)>) {
     let dir = std::env::temp_dir().join(format!("snowdrive_iso_cross_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir.join("docs/deep")).unwrap();
-    std::fs::create_dir_all(&dir.join("images")).unwrap();
+    std::fs::create_dir_all(dir.join("docs/deep")).unwrap();
+    std::fs::create_dir_all(dir.join("images")).unwrap();
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut add = |path: &str, content: Vec<u8>| {

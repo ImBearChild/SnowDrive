@@ -1977,7 +1977,7 @@ mod tests {
         // Via handle_login path: work buffer just enough for BHS + minimal
         // data, but login response needs TargetAlias+TargetPortalGroupTag
         // (~40 bytes) plus echo; tiny work forces overflow → Error.
-        let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
+        let work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
         // Shrink work to force dst overflow: use work.len() - BHS_SIZE = MIN_DATA_LEN,
         // but craft a huge initiator text that will require many Reject echoes.
         let big_text = {
@@ -1993,7 +1993,7 @@ mod tests {
         // coverage of the new error path; here verify handle_login propagates.
         let mut session2 = IscsiSession::new();
         // Use a work buffer where dst (tail) is tiny after head split.
-        let mut work2 = vec![0u8; BHS_SIZE + 64];
+        let work2 = vec![0u8; BHS_SIZE + 64];
         // Fake login PDU with dsl 0, but negotiate will still try to emit
         // always keys (TargetAlias etc) into dst of 64 bytes → will overflow
         // if we request many always? Actually always keys are ~50 bytes, so 64

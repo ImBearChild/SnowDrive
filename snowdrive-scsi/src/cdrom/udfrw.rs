@@ -83,7 +83,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
             OpenMode::AsIs => {
                 let capacity = <D as FlatData>::capacity(&backend);
                 let layout =
-                    compute_layout(sectors_of(Ok(capacity))?, label).map_err(UdfRwError::Layout)?;
+                    compute_layout(sectors_of(capacity)?, label).map_err(UdfRwError::Layout)?;
                 Ok(Self { backend, layout })
             }
         }
@@ -97,7 +97,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
         label: &str,
         scratch: &mut [u8],
     ) -> Result<Self, UdfRwError> {
-        let layout = compute_layout(sectors_of(Ok(<D as FlatData>::capacity(&backend)))?, label)
+        let layout = compute_layout(sectors_of(<D as FlatData>::capacity(&backend))?, label)
             .map_err(UdfRwError::Layout)?;
 
         let mut sector = [0u8; SECTOR_SIZE as usize];
@@ -202,10 +202,10 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
 }
 
 /// Floor `capacity` to whole 2048-byte sectors, rejecting volumes that do
-/// not fit in the UDF void address space.
-fn sectors_of(capacity: Result<u64, BlockStorageError>) -> Result<u32, UdfRwError> {
-    let capacity = capacity?;
-
+/// not fit in the UDF void address space. Takes the plain byte capacity —
+/// callers read it from the backend themselves (the former `Result`
+/// parameter had no failing caller; plan §14 D3).
+fn sectors_of(capacity: u64) -> Result<u32, UdfRwError> {
     u32::try_from(capacity / u64::from(SECTOR_SIZE)).map_err(|_| UdfRwError::CapacityTooLarge)
 }
 

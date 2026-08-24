@@ -104,6 +104,10 @@ pub trait FlatData {
 pub trait WritableFlatData: FlatData {
     /// Write `buf.len()` bytes at `off`. Same bounds contract as
     /// [`FlatData::read_at`].
+    ///
+    /// Convention: reject *policy* read-only states with
+    /// [`BlockStorageError::NotWritable`] — never a bare I/O error — so
+    /// devices can surface DATA PROTECT instead of WRITE FAULT.
     fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError>;
 
     /// Persist pending writes beyond page cache (`fsync` semantics).
@@ -147,12 +151,26 @@ impl<B: BlockStorage + ?Sized> WritableFlatData for B {
         }
         self.seek(embedded_io::SeekFrom::Start(off))
             .map_err(|e| BlockStorageError::Io(e.kind()))?;
-        self.write_all(buf)
-            .map_err(|e| BlockStorageError::Io(e.kind()))
+        self.write_all(buf).map_err(map_policy_err)
     }
 
     fn sync(&mut self) -> Result<(), BlockStorageError> {
-        BlockStorage::sync(self).map_err(|e| BlockStorageError::Io(e.kind()))
+        BlockStorage::sync(self).map_err(map_policy_err)
+    }
+}
+
+/// Error mapping for the write path of the [`BlockStorage`] blanket.
+///
+/// Convention (plan §14 D5): a backend that refuses writes as *policy*
+/// reports `ErrorKind::PermissionDenied`, which lands here as
+/// [`BlockStorageError::NotWritable`] (→ SCSI DATA PROTECT). Any other
+/// kind is a plain I/O failure. Third-party backends should follow the
+/// same convention for their read-only states.
+fn map_policy_err<E: embedded_io::Error>(err: E) -> BlockStorageError {
+    if err.kind() == IoErrorKind::PermissionDenied {
+        BlockStorageError::NotWritable
+    } else {
+        BlockStorageError::Io(err.kind())
     }
 }
 

@@ -866,7 +866,9 @@ fn build_devices<'a>(
     for (lun, spec) in any_specs.iter().enumerate() {
         match spec {
             AnySpec::Disk(ds) => {
-                let be = be_iter.next().unwrap();
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 let ro = matches!(
                     ds,
@@ -895,7 +897,9 @@ fn build_devices<'a>(
                 disks.push(dev);
             }
             AnySpec::Cdrom(CdromSpec::Flat { path }) => {
-                let be = be_iter.next().unwrap();
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 let mut drive = CdromDrive::new();
                 drive.load(CdMedia::ro(be));
@@ -903,7 +907,9 @@ fn build_devices<'a>(
                 drives.push(drive);
             }
             AnySpec::Cdrom(CdromSpec::Live { dir }) => {
-                let live = live_iter.next().unwrap();
+                let live = live_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: live pool exhausted"))?;
                 let total = live.layout().total;
                 let mut drive = CdromDrive::new();
                 drive.load(CdMedia::ro(live));
@@ -912,7 +918,9 @@ fn build_devices<'a>(
             }
             #[cfg(feature = "udf_void")]
             AnySpec::Cdrom(CdromSpec::UdfRw { path, mkfs, .. }) => {
-                let be = be_iter.next().unwrap();
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
                 let label = path
                     .as_deref()
                     .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))

@@ -1255,10 +1255,10 @@ mod tests {
     }
 
     impl snowdrive_scsi::scsi::device::ScsiDevice for TrackingParamDevice {
-        fn do_cmd<'a>(
+        fn do_cmd(
             &mut self,
             cdb: &[u8],
-            data: &'a mut [u8],
+            data: &mut [u8],
         ) -> Result<snowdrive_scsi::scsi::device::CommandOutcome, snowdrive_scsi::scsi::device::Error>
         {
             if data.len() < snowdrive_scsi::MIN_DATA_LEN {
