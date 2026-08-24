@@ -203,6 +203,26 @@ Design notes:
   (`iso9660-no-std`) prefers the Joliet SVD, so only external tools exercise
   the PVD tree.
 
+## Browsing Documentation
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --open
+```
+
+rustdoc names output directories after the **crate target**, not the
+package. Entry points under `target/doc/`:
+
+| Path | Content |
+|------|---------|
+| `index.html` | workspace overview (all crates) |
+| `snowdrive_scsi/index.html` | **main API** — SCSI core, iSCSI, USB MSC, CD-ROM |
+| `snowdrive_common/index.html` | storage seams (`FlatData`/`FsStorage`) + logging macros |
+| `snowdrive_disc/index.html` | ISO9660/Joliet live generation |
+
+The `snowdrive-cli` package's binary target carries `doc = false`: its
+docs would be an empty shell named `target/doc/snowdrive/` (after the
+*bin* target), which only caused confusion.
+
 ## Code Coverage
 
 Coverage is measured with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)

@@ -8,6 +8,11 @@ description = "SnowDrive CLI: serve + mkisofs"
 [[bin]]
 name = "snowdrive"
 path = "src/main.rs"
+# The bin target's rustdoc output lands in target/doc/<bin-name>/ — i.e.
+# target/doc/snowdrive/ — an empty shell (the real API lives in the
+# libraries) whose name shadows nothing but confuses everyone browsing
+# target/doc/. Skip documenting it entirely.
+doc = false
 
 [features]
 default = ["full"]
