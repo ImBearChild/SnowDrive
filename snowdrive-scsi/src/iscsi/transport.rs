@@ -266,9 +266,15 @@ mod tests {
 
             drop(client);
             // Wake the blocked accept() so serve() can observe `stop`.
+            // If teardown won the race — serve() finished serve_conn,
+            // saw `stop` at the top of its loop and exited without ever
+            // parking in accept() — the listener is already dropped and
+            // connecting fails with ConnectionRefused. That is fine: it
+            // proves serve() observed stop on its own.
             stop.store(true, Ordering::SeqCst);
-            let poke = TcpStream::connect(addr).unwrap();
-            drop(poke);
+            if let Ok(poke) = TcpStream::connect(addr) {
+                drop(poke);
+            }
             handle.join().unwrap();
         });
     }
