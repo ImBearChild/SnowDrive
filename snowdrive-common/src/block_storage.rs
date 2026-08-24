@@ -50,8 +50,8 @@ impl From<super::fs_storage::FsError> for BlockStorageError {
 ///
 /// Supertraits: [`embedded_io::Read`] + [`embedded_io::Write`] +
 /// [`embedded_io::Seek`] — random-access byte storage using standard
-/// embedded-io cursor semantics. Extension methods: [`capacity()`] and
-/// [`sync()`] (SYNCHRONIZE CACHE needs persistence beyond `flush`).
+/// embedded-io cursor semantics. Extension methods: [`Self::capacity`]
+/// and [`Self::sync`] (SYNCHRONIZE CACHE needs persistence beyond `flush`).
 ///
 /// Not suited to sequential/append-only media (tape, CD-R) — those need
 /// separate storage abstractions. No `Send` supertrait — single-threaded
@@ -182,6 +182,15 @@ fn map_policy_err<E: embedded_io::Error>(err: E) -> BlockStorageError {
 /// blanket.
 pub struct FlatRef<'a>(pub(crate) &'a mut dyn FlatData);
 
+impl core::fmt::Debug for FlatRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The erased inner type is not nameable; summarize by geometry.
+        f.debug_struct("FlatRef")
+            .field("capacity", &self.0.capacity())
+            .finish()
+    }
+}
+
 impl<'a> FlatRef<'a> {
     /// Erase any read-only source into a slot-usable plane reference.
     pub fn new<D: FlatData>(data: &'a mut D) -> Self {
@@ -201,6 +210,15 @@ impl FlatData for FlatRef<'_> {
 
 /// Erased writable plane (media slot side).
 pub struct RwRef<'a>(pub(crate) &'a mut dyn WritableFlatData);
+
+impl core::fmt::Debug for RwRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The erased inner type is not nameable; summarize by geometry.
+        f.debug_struct("RwRef")
+            .field("capacity", &self.0.capacity())
+            .finish()
+    }
+}
 
 impl<'a> RwRef<'a> {
     /// Erase any writable backend into a slot-usable plane reference.
@@ -234,6 +252,7 @@ impl WritableFlatData for RwRef<'_> {
 ///
 /// `embedded_io` does not provide a combined `Read+Write+Seek` impl for
 /// bare `&mut [u8]`, so this struct adds cursor state.
+#[derive(Debug)]
 pub struct RamBackend<'a> {
     data: &'a mut [u8],
     pos: u64,

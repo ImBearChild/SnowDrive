@@ -33,6 +33,7 @@ const CLEAR_SENSE: Sense = Sense::clear();
 ///
 /// The drive identity (INQUIRY, caps, drive_id) is constant; the media
 /// slot is mutable.  `SpcDevice` is implemented directly here.
+#[derive(Debug)]
 pub struct CdromDrive<'a> {
     pub(crate) sense: Option<Sense>,
     pub(crate) pending: Option<PendingXfer>,
@@ -86,6 +87,7 @@ impl<'a> CdromDrive<'a> {
     /// Disc-pool usage (runtime media swap across ANY backend kinds):
     ///
     /// ```text
+    /// use snowdrive_scsi::common::block_storage::{FlatRef, RwRef};
     /// use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
     /// use snowdrive_scsi::cdrom::drive::CdromDrive;
     /// # fn demo(
@@ -99,7 +101,10 @@ impl<'a> CdromDrive<'a> {
     /// let mut disc_a = CdMedia::ro(&mut live_data);            // no temporaries
     /// let mut iso = FlatMedia::new(FlatRef::new(img_file));
     /// let mut disc_b = CdMedia::Ro(iso);
-    /// let mut dvdam = UdfRwMedia::open_or_materialize_placeholder()?;
+    /// // DVD-RAM over a writable plane (feature `udf_void`):
+    /// // let mut udf = UdfRwMedia::open_or_materialize(
+    /// //     RwRef::new(&mut sd_card), "LABEL", opts)?;
+    /// // let mut disc_c = CdMedia::Rw(udf);
     /// # Ok(())
     /// # }
     /// ```
@@ -210,17 +215,15 @@ impl<'a> CdromDrive<'a> {
         self.media_requested
     }
 
+    /// Borrow the pending sense, if any (single source of truth: `Some`
+    /// ⇔ a sense is pending).
     pub fn peek_sense(&self) -> Option<&Sense> {
-        self.sense.as_ref().filter(|s| s.key != SenseKey::None)
+        self.sense.as_ref()
     }
 
+    /// Take the pending sense, clearing the device.
     pub fn take_sense(&mut self) -> Option<Sense> {
-        let s = self.sense.take()?;
-        if s.key == SenseKey::None {
-            None
-        } else {
-            Some(s)
-        }
+        self.sense.take()
     }
 
     // ── Helper ─────────────────────────────────────────────────────
@@ -384,10 +387,10 @@ impl<'a> CdromDrive<'a> {
                         crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other),
                     ))
                 }
-                crate::cdrom::media::MediaError::Io => {
+                crate::cdrom::media::MediaError::Io(kind) => {
                     self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
                     XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other),
+                        crate::scsi::backend::BlockStorageError::Io(kind),
                     ))
                 }
             },
@@ -647,7 +650,7 @@ impl<'a> CdromDrive<'a> {
         buf[header_len..total].copy_from_slice(page);
         let n = total.min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     fn mode_select_cmd(&mut self, alloc: u16) -> CommandOutcome {
@@ -806,7 +809,7 @@ impl<'a> CdromDrive<'a> {
         buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         let n = 32.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     // ── READ TOC ────────────────────────────────────────────────────
@@ -860,7 +863,7 @@ impl<'a> CdromDrive<'a> {
         };
         let n = n.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     // ── GET CONFIGURATION ───────────────────────────────────────────
@@ -944,7 +947,7 @@ impl<'a> CdromDrive<'a> {
         buf[5] = 0x02;
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     // ── READ DVD STRUCTURE ──────────────────────────────────────────
@@ -971,7 +974,7 @@ impl<'a> CdromDrive<'a> {
                         buf[17..21].copy_from_slice(&pf.next_writable.to_be_bytes());
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
-                        return CommandOutcome::OutInline { len: n as u64 };
+                        return CommandOutcome::OutInline { len: n };
                     }
                 }
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -985,7 +988,7 @@ impl<'a> CdromDrive<'a> {
                         buf[0..2].copy_from_slice(&0x0802u16.to_be_bytes());
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
-                        return CommandOutcome::OutInline { len: n as u64 };
+                        return CommandOutcome::OutInline { len: n };
                     }
                 }
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -1000,7 +1003,7 @@ impl<'a> CdromDrive<'a> {
                         // bytes 4..8: Cartridge=0, MSWI=0, no write protect
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
-                        return CommandOutcome::OutInline { len: n as u64 };
+                        return CommandOutcome::OutInline { len: n };
                     }
                 }
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -1016,7 +1019,7 @@ impl<'a> CdromDrive<'a> {
                         // bytes 4..7 primary unused, 8..11 supplementary unused, 12..15 allocated
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
-                        return CommandOutcome::OutInline { len: n as u64 };
+                        return CommandOutcome::OutInline { len: n };
                     }
                 }
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -1031,7 +1034,7 @@ impl<'a> CdromDrive<'a> {
                         // payload Recording Type bit 0
                         let n = buf.len().min(alloc as usize).min(data.len());
                         data[..n].copy_from_slice(&buf[..n]);
-                        return CommandOutcome::OutInline { len: n as u64 };
+                        return CommandOutcome::OutInline { len: n };
                     }
                 }
                 self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -1043,7 +1046,7 @@ impl<'a> CdromDrive<'a> {
                 buf[4..8].copy_from_slice(&0x5744_4300u32.to_be_bytes());
                 let n = buf.len().min(alloc as usize).min(data.len());
                 data[..n].copy_from_slice(&buf[..n]);
-                CommandOutcome::OutInline { len: n as u64 }
+                CommandOutcome::OutInline { len: n }
             }
             0xC0 => {
                 // Write protect status — all clear
@@ -1051,7 +1054,7 @@ impl<'a> CdromDrive<'a> {
                 buf[0..2].copy_from_slice(&4u16.to_be_bytes());
                 let n = buf.len().min(alloc as usize).min(data.len());
                 data[..n].copy_from_slice(&buf[..n]);
-                CommandOutcome::OutInline { len: n as u64 }
+                CommandOutcome::OutInline { len: n }
             }
             _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
         }
@@ -1080,7 +1083,7 @@ impl<'a> CdromDrive<'a> {
         buf[28..32].copy_from_slice(&0u32.to_be_bytes());
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     // ── READ FORMAT CAPACITIES ───────────────────────────────────────
@@ -1106,7 +1109,7 @@ impl<'a> CdromDrive<'a> {
         };
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 
     // ── SYNCHRONIZE CACHE ────────────────────────────────────────────
@@ -1163,17 +1166,13 @@ impl SpcDevice for CdromDrive<'_> {
     }
 
     fn sense(&self) -> &Sense {
-        self.sense
-            .as_ref()
-            .filter(|s| s.key != SenseKey::None)
-            .unwrap_or(&CLEAR_SENSE)
+        self.sense.as_ref().unwrap_or(&CLEAR_SENSE)
     }
 
-    fn sense_mut(&mut self) -> &mut Sense {
-        if self.sense.is_none() {
-            self.sense = Some(Sense::clear());
-        }
-        self.sense.as_mut().unwrap()
+    fn set_sense(&mut self, sense: Sense) {
+        // Normalized storage: a cleared sense (key == None) is "no pending
+        // sense" — never stored as `Some`.
+        self.sense = (sense.key != SenseKey::None).then_some(sense);
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {
@@ -1206,12 +1205,13 @@ impl SpcDevice for CdromDrive<'_> {
 
 impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
     fn sync(&mut self) -> Result<(), crate::scsi::backend::BlockStorageError> {
-        // MediaError → device-level storage error domain.
+        // MediaError → device-level storage error domain (`Io` keeps the
+        // plane's error kind — no `Other` fabrication).
         use crate::scsi::backend::BlockStorageError;
         self.sync_media().map_err(|e| match e {
             MediaError::OutOfBounds => BlockStorageError::OutOfBounds,
             MediaError::WriteProtected | MediaError::IllegalField => BlockStorageError::NotWritable,
-            MediaError::Io => BlockStorageError::Io(embedded_io::ErrorKind::Other),
+            MediaError::Io(kind) => BlockStorageError::Io(kind),
         })
     }
 
@@ -1265,6 +1265,7 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
 ///
 /// Constructs the drive identity; media is injected at runtime via
 /// `load()`.
+#[derive(Debug)]
 pub struct CdromDriveBuilder<'a> {
     identity: DeviceIdentity,
     caps: CdromCapabilities,

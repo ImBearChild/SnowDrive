@@ -36,7 +36,12 @@ pub enum CommandOutcome {
     /// REQUEST SENSE). Transport leaves sense in device.
     StatusWithSense,
     /// Device → host, synthesized response already at `data[0..len]`.
-    OutInline { len: u64 },
+    ///
+    /// `len` is a work-buffer-relative byte count (`usize`): the response
+    /// lives inside the caller's `data` scratch, so it can never exceed
+    /// `data.len()` (unlike [`CommandOutcome::OutXfer`], whose backend
+    /// transfer length stays `u64`).
+    OutInline { len: usize },
     /// Device → host, backend source; fetch `len` bytes via `xfer_out`.
     OutXfer { len: u64 },
     /// Host → device; receive `len` bytes via `xfer_in`.
@@ -151,6 +156,19 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// - heterogeneous mixing — `&mut [&mut dyn ScsiDevice]` via the `&mut T`
 ///   forwarding impl below (protocol-mandated LUN spaces).
 ///
+/// # Memory budget (embedded targets)
+///
+/// The device never allocates; the transport caller owns all buffers:
+///
+/// - `data` — the command/data scratch handed to [`ScsiDevice::do_cmd`]
+///   (and to `poll`/`step`): **≥ [`crate::MIN_DATA_LEN`] bytes**, checked
+///   at runtime (`WorkBufTooSmall`). This is the dominant allocation.
+/// - iSCSI additionally prefixes a 48-byte BHS in the same work buffer;
+///   USB BOT needs a separate receive scratch of at least `data.len()`.
+/// - Session state machines (`IscsiSession`, `BotSession`) are a few
+///   hundred bytes each; sense and pending-transfer state live inside
+///   the device.
+///
 /// # Writing your own LUN
 ///
 /// Implement this trait directly (pure-compute or exotic devices), or wrap
@@ -255,10 +273,15 @@ pub trait ScsiDevice {
     ///
     /// `cdb` is the original CDB, `data` the full parameter list
     /// (`expected_len` bytes) already collected in the transport's
-    /// work buffer. Returns `Status` on success or `CheckCondition`.
-    fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
-        let _ = (cdb, data);
-        CommandOutcome::CheckCondition
+    /// work buffer.
+    ///
+    /// Default: accept as a no-op (`Status`), matching the built-in
+    /// devices' MODE SELECT behavior. Override to validate the parameter
+    /// list; a rejecting override must set sense first and return
+    /// [`CommandOutcome::CheckCondition`] (the "sense is held in the
+    /// device" contract).
+    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome {
+        CommandOutcome::Status
     }
 
     /// Flush pending backend writes (graceful shutdown).

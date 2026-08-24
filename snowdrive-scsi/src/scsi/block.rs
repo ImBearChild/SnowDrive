@@ -10,11 +10,9 @@ use crate::scsi::backend::BlockStorageError;
 use crate::scsi::device::{
     CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
 };
-use crate::scsi::sbc::{execute_sbc, parse_sbc, SbcCommand};
+use crate::scsi::sbc::{execute_sbc, parse_sbc};
 use crate::scsi::scsi::{asc, Sense, SenseKey};
-use crate::scsi::spc::{
-    block_mode_page, execute_spc, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY,
-};
+use crate::scsi::spc::{block_mode_page, DeviceIdentity, SpcDevice, SpcEffect, BLOCK_IDENTITY};
 
 const CLEAR_SENSE: Sense = Sense::clear();
 
@@ -36,6 +34,7 @@ pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
 /// Plain `fn` pointers parameterized by the backend type — no trait bound
 /// on the struct itself, so a read-only backend (`FlatData` only) can
 /// never reach the write path.
+#[derive(Debug)]
 pub(crate) struct WriteOps<D> {
     write_at: fn(&mut D, u64, &[u8]) -> Result<(), BlockStorageError>,
     sync: fn(&mut D) -> Result<(), BlockStorageError>,
@@ -66,6 +65,7 @@ impl<D> Copy for WriteOps<D> {}
 ///
 /// The illegal combination `(writable == true, write_ops == None)` of the
 /// former two-field design is no longer representable.
+#[derive(Debug)]
 pub(crate) enum WritePath<D> {
     /// No write path (`cdrom()` profile / read-only source). Always DATA
     /// PROTECT; nothing to flush.
@@ -98,6 +98,7 @@ impl<D> Copy for WritePath<D> {}
 ///   PROTECT). Accepts any `D: FlatData`, including generated sources
 ///   such as live ISO9660. This is the former `CDBlockDevice`, now over
 ///   any backend instead of only files.
+#[derive(Debug)]
 pub struct BlockDevice<D: FlatData> {
     backend: D,
     sector_size: u32,
@@ -157,17 +158,18 @@ impl<D: FlatData> BlockDevice<D> {
         self.pdt
     }
 
+    /// Borrow the pending sense, if any.
+    ///
+    /// Single source of truth: `Some` ⇔ a sense is pending. A cleared
+    /// sense is stored as `None`, never as `Sense { key: None, .. }`.
     pub fn peek_sense(&self) -> Option<&Sense> {
-        self.sense.as_ref().filter(|s| s.key != SenseKey::None)
+        self.sense.as_ref()
     }
 
+    /// Take the pending sense, clearing the device (Status autosense or
+    /// REQUEST SENSE).
     pub fn take_sense(&mut self) -> Option<Sense> {
-        let s = self.sense.take()?;
-        if s.key == SenseKey::None {
-            None
-        } else {
-            Some(s)
-        }
+        self.sense.take()
     }
 
     pub(crate) fn max_lba(&self) -> u64 {
@@ -187,7 +189,13 @@ impl<D: FlatData> BlockDevice<D> {
     /// races the host's REQUEST SENSE and may be consumed by the wrong
     /// command.
     pub fn set_sense(&mut self, key: SenseKey, asc: u8, ascq: u8) {
-        self.sense = Some(Sense::new(key, asc, ascq));
+        self.store_sense(Sense::new(key, asc, ascq));
+    }
+
+    /// Normalized sense storage: `key == None` means "no pending sense"
+    /// and is stored as `None` (see [`SpcDevice::set_sense`]).
+    fn store_sense(&mut self, s: Sense) {
+        self.sense = (s.key != SenseKey::None).then_some(s);
     }
 
     pub(crate) fn cc(&mut self, key: SenseKey, asc: u8) -> CommandOutcome {
@@ -258,7 +266,7 @@ impl<D: FlatData> BlockDevice<D> {
     /// Write `buf` for the current WRITE transfer (host → device).
     ///
     /// Rejection order: transfer bookkeeping first, then the write path
-    /// gate ([`WritePath::Open`] only; `Absent | Locked` are both DATA
+    /// gate (`WritePath::Open` only; `Absent | Locked` are both DATA
     /// PROTECT), then bounds, then the actual plane write. A backend that
     /// reports [`BlockStorageError::NotWritable`] at write time (policy
     /// bit bypassed by a direct `disk()` over a read-only plane) is
@@ -317,8 +325,8 @@ impl<D: FlatData> BlockDevice<D> {
     /// least [`crate::MIN_DATA_LEN`] bytes.
     ///
     /// The CDB is parsed by [`parse_sbc`]: SPC commands are dispatched to
-    /// [`execute_spc`] (via the `SbcCommand::Spc` fall-through), SBC commands
-    /// to [`execute_sbc`]; unknown opcodes yield INVALID COMMAND.
+    /// `execute_spc` (via the `SbcCommand::Spc` fall-through), SBC commands
+    /// to `execute_sbc`; unknown opcodes yield INVALID COMMAND.
     pub fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
@@ -327,11 +335,9 @@ impl<D: FlatData> BlockDevice<D> {
         let Some(cmd) = parse_sbc(cdb) else {
             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
         };
-        let outcome = match cmd {
-            SbcCommand::Spc(cmd) => execute_spc(self, cmd, data),
-            cmd => execute_sbc(self, cmd, data),
-        };
-        Ok(outcome)
+        // execute_sbc is total over SbcCommand: SPC variants delegate to
+        // execute_spc internally.
+        Ok(execute_sbc(self, cmd, data))
     }
 
     /// Shared READ(6/10/12/16) handler.
@@ -443,7 +449,7 @@ impl<D: FlatData> BlockDevice<D> {
         buf[8..12].copy_from_slice(&self.sector_size.to_be_bytes());
         let n = 32.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 }
 
@@ -474,7 +480,7 @@ impl<D: WritableFlatData> BlockDevice<D> {
     /// backend stays writable-capable, the device refuses writes. serve 前
     /// 设置。
     ///
-    /// Total function over the write path ([`WritePath`]): `Absent`
+    /// Total function over the write path (`WritePath`): `Absent`
     /// (the `cdrom()` profile) stays absent regardless of `writable` — a
     /// read-only plane can never be talked into writing; `Locked` and
     /// `Open` swap according to `writable`.
@@ -517,17 +523,11 @@ impl<D: FlatData> SpcDevice for BlockDevice<D> {
     }
 
     fn sense(&self) -> &Sense {
-        self.sense
-            .as_ref()
-            .filter(|s| s.key != SenseKey::None)
-            .unwrap_or(&CLEAR_SENSE)
+        self.sense.as_ref().unwrap_or(&CLEAR_SENSE)
     }
 
-    fn sense_mut(&mut self) -> &mut Sense {
-        if self.sense.is_none() {
-            self.sense = Some(Sense::clear());
-        }
-        self.sense.as_mut().unwrap()
+    fn set_sense(&mut self, sense: Sense) {
+        self.store_sense(sense);
     }
 
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect {

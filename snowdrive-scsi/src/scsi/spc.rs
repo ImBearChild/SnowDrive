@@ -22,6 +22,7 @@ const SENSE_LEN: usize = 18;
 
 /// Static INQUIRY identity: vendor / product / revision identifiers and the
 /// four version descriptors (SPC-4 §6.4.1, table 97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceIdentity {
     pub vendor: [u8; 8],
     pub product: [u8; 16],
@@ -177,7 +178,13 @@ pub trait SpcDevice {
     /// `None` for unsupported pages.
     fn mode_page(&self, page: u8) -> Option<&[u8]>;
     fn sense(&self) -> &Sense;
-    fn sense_mut(&mut self) -> &mut Sense;
+    /// Replace the pending sense.
+    ///
+    /// Single source of truth for "is a sense pending": implementations
+    /// storing `Option<Sense>` must map a `key == SenseKey::None` value to
+    /// "no pending sense" (`None`) — a cleared sense is never observable
+    /// through [`Self::sense`] or the transport's `peek_sense`/`take_sense`.
+    fn set_sense(&mut self, sense: Sense);
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect;
     fn set_prevent(&mut self, prevent: bool);
 }
@@ -194,8 +201,8 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             let n = s.write_fixed(&mut buf);
             let n = n.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
-            *dev.sense_mut() = Sense::clear();
-            CommandOutcome::OutInline { len: n as u64 }
+            dev.set_sense(Sense::clear());
+            CommandOutcome::OutInline { len: n }
         }
 
         SpcCommand::Inquiry { evpd, page, alloc } => inquiry(dev, evpd, page, alloc, data),
@@ -224,7 +231,7 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             buf[header_len..total].copy_from_slice(page_bytes);
             let n = total.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
-            CommandOutcome::OutInline { len: n as u64 }
+            CommandOutcome::OutInline { len: n }
         }
 
         SpcCommand::ModeSelect { long: _, alloc } => {
@@ -271,7 +278,7 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
         SpcCommand::ReceiveDiagnosticResults { alloc } => {
             let n = 4.min(alloc as usize);
             data[0..n].fill(0);
-            CommandOutcome::OutInline { len: n as u64 }
+            CommandOutcome::OutInline { len: n }
         }
     }
 }
@@ -321,7 +328,7 @@ fn inquiry<D: SpcDevice>(
             _ => return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD),
         };
         let n = data_out.len().min(alloc as usize);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     } else {
         if page != 0 {
             return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD);
@@ -346,7 +353,7 @@ fn inquiry<D: SpcDevice>(
         }
         let n = INQUIRY_STD_LEN.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
-        CommandOutcome::OutInline { len: n as u64 }
+        CommandOutcome::OutInline { len: n }
     }
 }
 
@@ -357,8 +364,7 @@ fn cc<D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8) -> CommandOutcome {
 
 /// Set sense with an explicit ASCQ and return CHECK CONDITION.
 fn cc_q<D: SpcDevice>(dev: &mut D, key: SenseKey, asc: u8, ascq: u8) -> CommandOutcome {
-    let s = Sense::new(key, asc, ascq);
-    *dev.sense_mut() = s;
+    dev.set_sense(Sense::new(key, asc, ascq));
     CommandOutcome::CheckCondition
 }
 
@@ -415,8 +421,8 @@ mod tests {
         fn sense(&self) -> &Sense {
             &self.sense
         }
-        fn sense_mut(&mut self) -> &mut Sense {
-            &mut self.sense
+        fn set_sense(&mut self, sense: Sense) {
+            self.sense = sense;
         }
         fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
             self.start_stop_effect

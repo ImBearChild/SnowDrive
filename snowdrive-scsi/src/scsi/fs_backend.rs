@@ -33,6 +33,7 @@ fn map_io_err(kind: std::io::ErrorKind) -> embedded_io::ErrorKind {
 ///
 /// Wraps a directory root; all paths are relative to that root.
 #[cfg(feature = "std")]
+#[derive(Debug)]
 pub struct StdFsBackend {
     root: std::path::PathBuf,
 }
@@ -128,6 +129,7 @@ impl FsStorage for StdFsBackend {
 /// StdFile adapter — wraps `std::fs::File` as an `embedded_io::Read +
 /// Write + Seek` stream for use as `FsStorage::File`.
 #[cfg(feature = "std")]
+#[derive(Debug)]
 pub struct StdFile {
     file: std::fs::File,
 }

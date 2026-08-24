@@ -5,10 +5,11 @@
 //!
 //! - **Materialize** an empty UDF 2.01 volume into the backend (only when
 //!   `mkfs=true` is specified at CLI open time) by streaming the structured
-//!   sectors from [`udf_void::gen_sector`] and patching the multi-sector SBD
+//!   sectors from `udf_void::gen_sector` and patching the multi-sector SBD
 //!   CRC.
 //! - **Detect** an existing UDF volume (valid AVDP at sector 256) via
-//!   [`Self::has_udf`] — used only by CLI `mkfs` policy, not by FORMAT UNIT.
+//!   [`UdfRwMedia::has_udf`](crate::cdrom::udfrw::UdfRwMedia::has_udf)
+//!   — used only by CLI `mkfs` policy, not by FORMAT UNIT.
 //! - **Data plane**: random byte-plane reads/writes through the backend.
 //! - **Geometry**: capacity / last LBA / lead-out for the device layer.
 //!
@@ -26,6 +27,7 @@ use crate::udf_void::{
 };
 
 /// A random-writable DVD-RAM (UDF 2.01 plain build) over a byte plane.
+#[derive(Debug)]
 pub struct UdfRwMedia<D: WritableFlatData> {
     backend: D,
     layout: Layout,

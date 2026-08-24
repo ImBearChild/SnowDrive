@@ -173,7 +173,8 @@ pub struct SessionInfo {
 /// - `IllegalField` → 24h/00h (INVALID FIELD IN CDB)
 /// - `WriteProtected` → 07h/00h (DATA PROTECT) / 27h/00h (WRITE PROTECTED)
 /// - `OutOfBounds` → 21h/00h (LOGICAL BLOCK ADDRESS OUT OF RANGE)
-/// - `Io` → sense passthrough
+/// - `Io(kind)` → sense passthrough (`kind` preserved from the plane's
+///   [`BlockStorageError`], never collapsed to `Other`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaError {
     /// Invalid field in CDB (NWA mismatch, reservation size < 300, etc.).
@@ -182,8 +183,8 @@ pub enum MediaError {
     WriteProtected,
     /// Logical block address out of range.
     OutOfBounds,
-    /// Underlying storage I/O failure.
-    Io,
+    /// Underlying storage I/O failure, with the plane's error kind.
+    Io(embedded_io::ErrorKind),
 }
 
 impl core::fmt::Display for MediaError {
@@ -192,12 +193,22 @@ impl core::fmt::Display for MediaError {
             Self::IllegalField => write!(f, "invalid field"),
             Self::WriteProtected => write!(f, "write protected"),
             Self::OutOfBounds => write!(f, "out of bounds"),
-            Self::Io => write!(f, "I/O error"),
+            Self::Io(kind) => write!(f, "I/O error: {kind:?}"),
         }
     }
 }
 
 impl core::error::Error for MediaError {}
+
+impl From<BlockStorageError> for MediaError {
+    fn from(e: BlockStorageError) -> Self {
+        match e {
+            BlockStorageError::OutOfBounds => Self::OutOfBounds,
+            BlockStorageError::NotWritable => Self::WriteProtected,
+            BlockStorageError::Io(kind) => Self::Io(kind),
+        }
+    }
+}
 
 // ── GESN media event status (plan MC-6 ) ─────────────
 
@@ -223,6 +234,7 @@ pub enum MediaEventStatus {
 /// - * `UdfRw(…)` (migrated from standalone `UdfRwDevice`)
 /// - * `Flat(…)` and `Live(…)`
 /// - * `Bundle(…)`
+#[derive(Debug)]
 pub enum CdMedia<'a> {
     /// Read-only disc: flat ISO/RAM image or live-generated ISO9660 —
     /// anything that speaks [`FlatData`]. Geometry derives from the
@@ -237,8 +249,10 @@ pub enum CdMedia<'a> {
 
 /// Physical tray state: at most one disc, either loaded or parked by a
 /// SCSI-initiated eject (`START STOP loej=1`). A parked disc is logically
-/// NOT PRESENT but its borrow is held until [`CdromDrive::take_media`]
+/// NOT PRESENT but its borrow is held until
+/// [`CdromDrive::take_media`](crate::cdrom::drive::CdromDrive::take_media)
 /// returns it to the application.
+#[derive(Debug)]
 pub enum Tray<'a> {
     /// No disc.
     Empty,
@@ -359,11 +373,7 @@ impl<'a> CdMedia<'a> {
         match self {
             Self::Ro(_) => Err(MediaError::WriteProtected),
             #[cfg(feature = "udf_void")]
-            Self::Rw(m) => m.write_data(offset, buf).map_err(|e| match e {
-                BlockStorageError::OutOfBounds => MediaError::OutOfBounds,
-                BlockStorageError::NotWritable => MediaError::WriteProtected,
-                BlockStorageError::Io(_) => MediaError::Io,
-            }),
+            Self::Rw(m) => m.write_data(offset, buf).map_err(MediaError::from),
         }
     }
 
@@ -372,7 +382,7 @@ impl<'a> CdMedia<'a> {
         match self {
             Self::Ro(_) => Ok(()),
             #[cfg(feature = "udf_void")]
-            Self::Rw(m) => m.sync().map_err(|_| MediaError::Io),
+            Self::Rw(m) => m.sync().map_err(MediaError::from),
         }
     }
 
@@ -381,7 +391,7 @@ impl<'a> CdMedia<'a> {
         match self {
             Self::Ro(_) => Err(MediaError::WriteProtected),
             #[cfg(feature = "udf_void")]
-            Self::Rw(m) => m.format_unit().map_err(|_| MediaError::Io),
+            Self::Rw(m) => m.format_unit().map_err(MediaError::from),
         }
     }
 
@@ -446,6 +456,7 @@ pub struct DvdPhysicalFormat {
 ///
 /// Generic over any [`FlatData`] backend.  The geometry is derived
 /// from the backend capacity at construction time.
+#[derive(Debug)]
 pub struct FlatMedia<D: FlatData> {
     data: D,
     capacity_sectors: u32,

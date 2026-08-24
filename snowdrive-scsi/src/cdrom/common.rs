@@ -1,10 +1,10 @@
 //! CD-ROM common device layer (plan  / ).
 //!
-//! [`CdromDeviceCommon`] holds the shared SPC-level state (sense, prevent,
-//! profile) and implements [`SpcDevice`] so that all three CD-ROM device
-//! types (`CdromDevice`, `CdBundleDevice`, `CdLiveFsDevice`) delegate
-//! INQUIRY / MODE SENSE / REQUEST SENSE / GET CONFIGURATION common
-//! features to a single code path via field embedding (composition).
+//! Shared MMC response synthesis: GET CONFIGURATION feature pages,
+//! READ DISC INFORMATION, READ BUFFER CAPACITY and the MODE SENSE 0x2A
+//! page are built here from structured inputs
+//! ([`CdromCapabilities`], [`DiscInfo`]) so the drive layer only
+//! dispatches.
 //!
 //! Per, only the *synthesis* of MMC responses is shared here:
 //! [`build_get_config_response`] and [`build_read_disc_info`] lay out the
@@ -959,7 +959,7 @@ pub fn build_get_config_response(
     buf[0..4].copy_from_slice(&data_len.to_be_bytes());
     let n = off.min(alloc as usize);
     data[0..n].copy_from_slice(&buf[..n]);
-    CommandOutcome::OutInline { len: n as u64 }
+    CommandOutcome::OutInline { len: n }
 }
 
 /// Build GET CONFIGURATION from separate drive capabilities and medium state.
@@ -989,7 +989,7 @@ pub fn build_get_config_response_for_media(
     buf[0..4].copy_from_slice(&data_len.to_be_bytes());
     let n = off.min(alloc as usize);
     data[0..n].copy_from_slice(&buf[..n]);
-    CommandOutcome::OutInline { len: n as u64 }
+    CommandOutcome::OutInline { len: n }
 }
 /// Build the READ BUFFER CAPACITY response (MMC-6 , Table 342):
 /// 12-byte structure with Data Length = 10. `buffer_len` / `blank_len` are
@@ -1006,7 +1006,7 @@ pub fn build_read_buffer_capacity(
     buf[8..12].copy_from_slice(&blank_len.to_be_bytes());
     let n = buf.len().min(alloc as usize);
     data[..n].copy_from_slice(&buf[..n]);
-    CommandOutcome::OutInline { len: n as u64 }
+    CommandOutcome::OutInline { len: n }
 }
 /// Disc state parameters for the Standard Disc Information response
 /// (MMC-6 ). Each device feeds its own state — this struct only
@@ -1062,7 +1062,7 @@ pub fn build_read_disc_info(data: &mut [u8], alloc: u16, info: &DiscInfo) -> Com
     // Bytes 24-51: Disc Bar Code, Disc Application Code, OPC tables (0).
     let n = buf.len().min(alloc as usize).min(data.len());
     data[..n].copy_from_slice(&buf[..n]);
-    CommandOutcome::OutInline { len: n as u64 }
+    CommandOutcome::OutInline { len: n }
 }
 #[cfg(test)]
 mod tests {
@@ -1097,8 +1097,8 @@ mod tests {
         fn sense(&self) -> &Sense {
             &self.sense
         }
-        fn sense_mut(&mut self) -> &mut Sense {
-            &mut self.sense
+        fn set_sense(&mut self, sense: Sense) {
+            self.sense = sense;
         }
         fn start_stop(&mut self, _loej: bool, _load: bool) -> SpcEffect {
             SpcEffect::Good

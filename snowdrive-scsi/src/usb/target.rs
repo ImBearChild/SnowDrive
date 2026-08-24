@@ -172,6 +172,7 @@ enum BotState {
 
 /// BOT session: a non-blocking protocol state machine over one bulk pipe
 /// pair (plus the driver-mediated control pipe).
+#[derive(Debug)]
 pub struct BotSession {
     state: BotState,
     cbw: [u8; CBW_LEN],
@@ -423,7 +424,9 @@ impl BotSession {
                     return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
                 }
                 Some(&scsi_op::REQUEST_SENSE) => {
-                    let sense = self.pending_ua.take().expect("checked above");
+                    // Defensive: no UA (driver raced a reset) — report an
+                    // empty fixed-sense (NO SENSE) instead of panicking.
+                    let sense = self.pending_ua.take().unwrap_or_else(Sense::clear);
                     let n = sense.write_fixed(data);
                     return self.synthesize_data_in(cbw, data, n as u64);
                 }
@@ -456,7 +459,10 @@ impl BotSession {
                 if cbw.dir != BotDir::DataIn {
                     return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
                 }
-                let actual = len.min(declared);
+                // `len` is work-buffer-relative (`usize`); widen once at the
+                // BOT boundary (declared ≤ u32::MAX per the CBW spec, so the
+                // min below is exact on every target).
+                let actual = (len as u64).min(declared);
                 if actual == 0 {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
@@ -693,7 +699,7 @@ impl BotSession {
             chunk,
         } = st
         else {
-            unreachable!("poll_data_in entered outside DataIn state")
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
         };
         match ev {
             SessionEvent::InSent => {
@@ -742,7 +748,7 @@ impl BotSession {
             chunk,
         } = st
         else {
-            unreachable!("poll_data_out entered outside DataOut state")
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
         };
         match ev {
             SessionEvent::OutRecv { data: recv } => {
@@ -825,7 +831,7 @@ impl BotSession {
             chunk,
         } = st
         else {
-            unreachable!("poll_param_out entered outside ParamOut state")
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
         };
         match ev {
             SessionEvent::OutRecv { data: recv } => {
@@ -923,7 +929,7 @@ impl BotSession {
             chunk,
         } = st
         else {
-            unreachable!("poll_overrun entered outside DataOutOverrun state")
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
         };
         match ev {
             SessionEvent::OutRecv { data } => {

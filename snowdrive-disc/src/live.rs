@@ -579,10 +579,14 @@ pub fn compute_layout_opts(files: &[FileEntry], opts: &IsoOptions) -> Result<Lay
     for (idx, entry) in files.iter().enumerate() {
         let depth = path_depth(entry.path.as_str());
         let parent_depth = depth.saturating_sub(1) as u16;
-        while stack.len() > 1 && regs[*stack.last().unwrap() as usize].depth > parent_depth {
+        // `stack` starts with the root (pushed above) and is only ever
+        // popped while len > 1, so it always has a top entry.
+        while stack.len() > 1
+            && regs[*stack.last().expect("stack holds the root") as usize].depth > parent_depth
+        {
             stack.pop();
         }
-        let parent_reg = *stack.last().unwrap();
+        let parent_reg = *stack.last().expect("stack holds the root");
         let component = last_component(entry.path.as_str());
 
         if entry.is_dir {

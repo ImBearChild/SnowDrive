@@ -35,6 +35,7 @@ pub(crate) fn map_io_err(kind: std::io::ErrorKind) -> embedded_io::ErrorKind {
 /// Wraps [`RamBackend`] (borrowed memory, no_std) and [`FileBackend`]
 /// (std). Implements [`BlockStorage`] (`Read + Write + Seek + capacity +
 /// sync`).
+#[derive(Debug)]
 pub enum BlockBackend<'a> {
     Ram(RamBackend<'a>),
     #[cfg(feature = "std")]
@@ -106,6 +107,7 @@ impl BlockStorage for BlockBackend<'_> {
 /// Wraps `std::fs::File` with cursor-state random access. Implements
 /// [`BlockStorage`] (`Read + Write + Seek + capacity + sync`).
 #[cfg(feature = "std")]
+#[derive(Debug)]
 pub struct FileBackend {
     file: std::fs::File,
     size: u64,

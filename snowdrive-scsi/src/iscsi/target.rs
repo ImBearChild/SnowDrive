@@ -109,6 +109,7 @@ impl LoginStage {
 }
 
 /// Negotiated login parameters (RFC 3720 §10.12-.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegotiatedParams {
     pub immediate_data: bool,
     pub initial_r2t: bool,
@@ -262,6 +263,7 @@ const SKIP_KEYS: &[&str] = &[
 ///
 /// `cmd_sn` is the last consumed CmdSN; non-immediate commands are accepted
 /// only when `CmdSN == cmd_sn + 1` (queue depth 1, MaxCmdSN = ExpCmdSN).
+#[derive(Debug)]
 pub struct IscsiSession {
     cmd_sn: u32,
     stat_sn: Cell<u32>,
@@ -363,6 +365,11 @@ impl IscsiSession {
         work: &'a mut [u8],
         devs: &mut [D],
     ) -> SessionStep<'a> {
+        // Single entry guard: every handler below may slice
+        // `work[..BHS_SIZE]` and use `work[BHS_SIZE..]` as the data area.
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return SessionStep::Error(TargetError::WorkBufTooSmall);
+        }
         match self.state {
             IscsiState::RecvPdu => self.poll_recv(ev, work, devs),
             IscsiState::DataIn { .. } => self.poll_data_in(work, devs),
@@ -371,6 +378,19 @@ impl IscsiSession {
             IscsiState::ParamCollect { .. } => self.poll_param_collect(ev, work, devs),
             IscsiState::Closed => SessionStep::Closed,
         }
+    }
+
+    /// BHS prefix of `work`.
+    ///
+    /// Infallible by contract: [`Self::poll`] enforces
+    /// `work.len() >= crate::MIN_DATA_LEN + BHS_SIZE` before any handler
+    /// runs, so the slice-and-convert below cannot fail.
+    fn bhs_of(work: &[u8]) -> Bhs {
+        Bhs::from_bytes(
+            work[..BHS_SIZE]
+                .try_into()
+                .expect("poll enforces a BHS_SIZE prefix"),
+        )
     }
 
     /// Blocking convenience wrapper: drive `poll` in a loop over a `Conn`,
@@ -433,7 +453,9 @@ impl IscsiSession {
                         lun,
                     } = st
                     else {
-                        unreachable!()
+                        // Dispatch already selected the DataIn arm; a miss
+                        // is an internal invariant violation.
+                        return StepResult::Error(TargetError::Internal);
                     };
                     let mut data_sn: u32 = 1; // Phase 1 sent DataSN=0
                     let mut offset = sent; // continue from where Phase 1 left off
@@ -542,15 +564,11 @@ impl IscsiSession {
         work: &'a mut [u8],
         devs: &mut [D],
     ) -> SessionStep<'a> {
-        // Validate work buffer up front (same as the old step()).
-        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-            return SessionStep::Error(TargetError::WorkBufTooSmall);
-        }
-
+        // (work-buffer length is enforced once in `poll`.)
         match ev {
             SessionEvent::PduReceived { dsl } => {
                 let pdu = Pdu {
-                    bhs: Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap()),
+                    bhs: Self::bhs_of(work),
                     dsl: dsl as usize,
                 };
 
@@ -602,7 +620,7 @@ impl IscsiSession {
             lun,
         } = st
         else {
-            unreachable!()
+            return SessionStep::Error(TargetError::Internal);
         };
 
         if sent >= transfer_len {
@@ -648,7 +666,7 @@ impl IscsiSession {
             lun,
         } = st
         else {
-            unreachable!()
+            return SessionStep::Error(TargetError::Internal);
         };
 
         let burst = (u64::from(self.neg.max_burst_len)).min(transfer_len - received);
@@ -699,11 +717,11 @@ impl IscsiSession {
             lun,
         } = st
         else {
-            unreachable!()
+            return SessionStep::Error(TargetError::Internal);
         };
 
         let SessionEvent::PduReceived { dsl } = ev;
-        let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
+        let pdu_bhs = Self::bhs_of(work);
         let pdu_dsl = dsl as usize;
 
         if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
@@ -805,11 +823,11 @@ impl IscsiSession {
             lun,
         } = st
         else {
-            unreachable!()
+            return SessionStep::Error(TargetError::Internal);
         };
 
         let SessionEvent::PduReceived { dsl } = ev;
-        let pdu_bhs = Bhs::from_bytes(work[..BHS_SIZE].try_into().unwrap());
+        let pdu_bhs = Self::bhs_of(work);
         let pdu_dsl = dsl as usize;
 
         if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
@@ -919,7 +937,7 @@ impl IscsiSession {
             expected, received, ..
         } = st
         else {
-            unreachable!()
+            return SessionStep::Error(TargetError::Internal);
         };
         let burst = (u64::from(self.neg.max_burst_len)).min(expected - received);
         let mut bhs = Bhs::new();
@@ -1197,7 +1215,7 @@ impl IscsiSession {
             }
             CommandOutcome::OutInline { len } => {
                 crate::debug!("  -> OutInline (synthesized, {} bytes)", len);
-                let n = len as usize;
+                let n = len;
                 self.send_data_in_final(work, itt, n, 0, 0, status::GOOD)
             }
             CommandOutcome::OutXfer { len: transfer_len } => {

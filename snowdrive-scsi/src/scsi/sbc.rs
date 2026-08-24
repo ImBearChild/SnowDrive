@@ -12,7 +12,7 @@ use crate::scsi::scsi::{
     cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode, cdb_transfer_len10,
     cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
 };
-use crate::scsi::spc::{parse_spc, SpcCommand};
+use crate::scsi::spc::{execute_spc, parse_spc, SpcCommand};
 
 /// Parsed SBC command (SBC-3 §5). SPC commands are wrapped in
 /// [`SbcCommand::Spc`].
@@ -131,8 +131,9 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
     }
 }
 
-/// Execute one parsed SBC command against `dev` (SPC commands never reach
-/// here — `do_cmd` dispatches `SbcCommand::Spc` to `execute_spc`).
+/// Execute one parsed SBC command against `dev`. SPC commands
+/// ([`SbcCommand::Spc`]) are delegated to [`execute_spc`] — every
+/// `SbcCommand` variant is executable here, total over the enum.
 pub(crate) fn execute_sbc<D: FlatData>(
     dev: &mut BlockDevice<D>,
     cmd: SbcCommand,
@@ -165,7 +166,7 @@ pub(crate) fn execute_sbc<D: FlatData>(
             let _ = dev.sync_backend();
             CommandOutcome::Status
         }
-        SbcCommand::Spc(_) => unreachable!("SPC commands are dispatched by do_cmd"),
+        SbcCommand::Spc(spc) => execute_spc(dev, spc, data),
     }
 }
 
