@@ -20,8 +20,9 @@ pub trait CtrlReply {
 }
 
 /// Acknowledgment handle for Bulk-Only Reset. Call after
-/// [`BotSession::reset`] — the control status stage must not complete
-/// until the reset is done (BOT §6.4).
+/// [`BotSession::reset`](crate::usb::target::BotSession::reset) — the
+/// control status stage must not complete until the reset is done
+/// (BOT §6.4).
 pub trait CtrlAck {
     /// Consume the handle and complete the control status stage.
     fn ack(self);

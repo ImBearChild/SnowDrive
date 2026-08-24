@@ -1,11 +1,13 @@
 //! BSD TCP transport (`transport_bsd.c`) — `std` feature only.
 //!
 //! [`TcpConn`] wraps `std::net::TcpStream` as an embedded-io byte stream
-//! (thus a [`Conn`]). A read timeout is applied at
+//! (thus a
+//! [`Conn`](crate::iscsi::conn::Conn)). A read timeout is applied at
 //! construction so a stalled peer cannot hang the server forever — this
 //! covers the login phase, the command loop, and Data-Out (DoS fix).
 //! Read/write loops are exact (`read_exact` / `write_all`
-//! in [`crate::conn`], RFC 3720 §3.1 byte stream).
+//! in [`read_exact`](crate::iscsi::conn::read_exact) /
+//! [`write_all`](crate::iscsi::conn::write_all), RFC 3720 §3.1 byte stream).
 //!
 //! [`serve`] is the convenience entry: a serial accept
 //! loop (MaxConnections = 1) that serves one connection at a time with a

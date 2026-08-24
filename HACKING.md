@@ -73,7 +73,9 @@ Feature maps:
 - **`snowdrive-scsi`** — `std` (default), `scsi`, `udf_void`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
-  `log`, `defmt`. Linux-only `usb-gadget`/`bytes` deps under
+  `log`, `defmt`. No platform-specific dependencies: the Linux FunctionFS
+  USB bridge lives only in `snowdrive-cli`, which declares its own
+  Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowdrive-cli`** — `full` (default) pulls `std` +
   `scsi`/`udf_void`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
@@ -244,7 +246,14 @@ Notes:
 2. `cargo test --workspace`
 3. `cargo fmt --check`
 4. `cargo clippy --workspace -- -D warnings`
-5. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — rustdoc must stay
+   warning-free (broken intra-doc links, links to private items, stale
+   paths)
+6. `cargo clippy -p snowdrive-scsi --features 'scsi,cdrom,iscsi,usb,udf_void' --
+   -D warnings` — the feature-gated modules are not compiled by the
+   workspace-wide pass (dependencies of `snowdrive-tests` are only
+   *compiled*, never linted), so lint them explicitly
+7. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
    `no_std`-clean (feature-gated std surface only)
 
 ## Code Formatting
@@ -258,6 +267,23 @@ This project follows [Semantic Versioning](https://semver.org/).
 - **MAJOR** (`X.0.0`) — incompatible API changes
 - **MINOR** (`0.X.0`) — new functionality, backward compatible
 - **PATCH** (`0.0.X`) — backward compatible bug fixes
+
+### Pre-1.0 policy (current)
+
+While the crate is `0.x`, cargo treats every minor bump as potentially
+breaking; we still keep changes reviewable:
+
+- **Exhaustive-by-design enums stay exhaustive.** Protocol-core outcome and
+  session enums — `CommandOutcome`, `XferOutcome`, `SessionStep`,
+  `SessionNeed`, `BotStepResult`, `StepResult`, `TargetError`,
+  `BotTargetError` — deliberately carry **no** `#[non_exhaustive]`: driver
+  code matches them totally, and a new variant must be a conscious,
+  compiler-enforced migration for every downstream driver.
+- Error domains (`MediaError`, `BlockStorageError`, …) may gain variants in
+  a minor release; consider `#[non_exhaustive]` when stabilizing toward 1.0.
+- Trait additions (new required or default methods on `ScsiDevice`,
+  `SpcDevice`, `FlatData`, …) are breaking while `0.x`; batch them and
+  document them under a `BREAKING CHANGE:` footer.
 
 ## Legacy C Code
 

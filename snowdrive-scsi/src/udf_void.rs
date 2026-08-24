@@ -7,9 +7,10 @@
 //!
 //! "Void" = this module only produces the empty skeleton; it is **not** a
 //! UDF filesystem implementation (that name is reserved for the media layer,
-//! [`crate::cdrom::CdMedia::UdfRw`]). It generates the smallest structure
-//! that Windows Live File System ("U 盘模式") and Linux `udf` mount as an
-//! empty rewritable disc: a **UDF 2.01 plain-build** volume. There is no
+//! [`CdMedia::Rw`](crate::cdrom::media::CdMedia::Rw)). It generates the
+//! smallest structure that Windows Live File System ("U 盘模式") and Linux
+//! `udf` mount as an empty rewritable disc: a **UDF 2.01 plain-build**
+//! volume. There is no
 //! file/directory allocation machinery, no VAT / sparing / Metadata
 //! Partition, no extended attributes: the root directory holds only `.`
 //! and `..`.

@@ -163,7 +163,7 @@ pub fn cdb_opcode(cdb: &[u8]) -> Option<u8> {
     cdb.first().copied()
 }
 
-/// READ(6)/WRITE(6) logical block address: byte1[4:0], byte2, byte3.
+/// READ(6)/WRITE(6) logical block address: byte1 bits 4:0, byte2, byte3.
 ///
 /// LBA is 21 bits: `(cdb[1] & 0x1F) << 16 | cdb[2] << 8 | cdb[3]`
 /// (SBC-3 §5.10). Requires at least 4 bytes.
@@ -292,7 +292,9 @@ pub fn cdb_write_args(op: u8, cdb: &[u8]) -> Option<(u64, u32)> {
 /// Extract the SCSI command opcode (first byte) from a raw CDB.
 ///
 /// Convenience for protocol layers that need to inspect the opcode *before*
-/// passing the CDB to [`ScsiDevice::do_cmd`] (e.g. iSCSI REPORT LUNS
+/// passing the CDB to
+/// [`ScsiDevice::do_cmd`](crate::scsi::device::ScsiDevice::do_cmd)
+/// (e.g. iSCSI REPORT LUNS
 /// special-casing, USB BOT invalid-LUN interception).
 pub fn opcode_from_cdb(cdb: &[u8]) -> u8 {
     cdb.first().copied().unwrap_or(0)

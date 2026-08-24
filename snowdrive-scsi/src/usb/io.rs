@@ -4,7 +4,8 @@
 //! receive (non-blocking + timeout variants) and bulk IN send, plus the
 //! optional STALL capability used *only* for invalid CBWs (BOT §6.6.1).
 //! The protocol core (`crate::usb::target::BotSession`) never touches this
-//! trait directly — it is driven by [`BotEvent`]s. Drivers (PC FunctionFS
+//! trait directly — it is driven by
+//! [`SessionEvent`](crate::usb::target::SessionEvent)s. Drivers (PC FunctionFS
 //! endpoints, embedded MCU USB peripherals) and the blocking `step` wrapper
 //! consume it.
 //!

@@ -2,7 +2,8 @@
 //!
 //! [`FsStorage`] models a file/directory abstraction that embedded callers
 //! implement (littlefs, FatFs, etc.). The std implementation
-//! ([`StdFsBackend`]) lives in `snowdrive::scsi::fs_backend`.
+//! (`StdFsBackend`, not linked here: it lives in another crate,
+//! `snowdrive-scsi::scsi::fs_backend`).
 
 use embedded_io::ErrorKind as IoErrorKind;
 
@@ -103,6 +104,24 @@ pub trait FsStorage {
     fn close(&mut self, file: Self::File);
 
     /// Scan a directory, returning all entries (including sub-directories).
+    ///
+    /// # Truncation semantics
+    ///
+    /// At most `out.len()` entries are written. The return value is the
+    /// number written (`<= out.len()`); **`ret == out.len()` does NOT
+    /// imply the directory was exhausted** — there may be more entries.
+    /// Callers that must not lose entries MUST treat a full buffer as
+    /// "directory too large" and fail loudly (the in-tree live-FS
+    /// scanner returns `CdLiveFsError::DirTooLarge` in that case).
+    /// Silently continuing with a full buffer drops files.
+    ///
+    /// # Stack budget (embedded callers)
+    ///
+    /// Each [`DirEntry`] is ~280 bytes on a 32-bit target
+    /// (`String<256>` + `is_dir` + `u64 size`, aligned). Size the batch
+    /// to your stack: 16 ≈ 4.5 KB, 32 ≈ 9 KB, 128 ≈ 36 KB. Batch into a
+    /// per-directory loop if your FS seam allows re-scanning; do not
+    /// default to `[DirEntry; MAX_FILES]`.
     fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError>;
 
     /// Root directory absolute path (for ISO9660 path table).
