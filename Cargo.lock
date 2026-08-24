@@ -672,14 +672,12 @@ dependencies = [
 name = "snowdrive-scsi"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "defmt",
  "embedded-io",
  "heapless",
  "log",
  "snowdrive-common",
  "snowdrive-disc",
- "usb-gadget",
 ]
 
 [[package]]
