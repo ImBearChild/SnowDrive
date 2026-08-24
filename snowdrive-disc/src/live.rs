@@ -1,4 +1,4 @@
-//! Live ISO9660 generation algorithms (plan §11.2).
+//! Live ISO9660 generation algorithms.
 //!
 //! Pure algorithms: **no storage, no FS, no alloc**. The device layer
 //! (`CdLiveFsDevice`) scans the host directory with `FsStorage::read_dir`,
@@ -1438,7 +1438,7 @@ impl<F: FsStorage> FlatData for LiveData<F> {
             .map_err(|_| BlockStorageError::OutOfBounds)?;
             // read_exact, not read: a short read at the EOF tail would
             // otherwise silently zero-fill the rest of the sector and
-            // corrupt the generated image (plan §14 D4).
+            // corrupt the generated image.
             Read::read_exact(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
             dst[..n].copy_from_slice(&tmp[within..within + n]);
             off += n as u64;

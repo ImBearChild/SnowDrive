@@ -1,4 +1,4 @@
-//! CD-ROM common device layer (plan  / ).
+//! CD-ROM common device layer.
 //!
 //! Shared MMC response synthesis: GET CONFIGURATION feature pages,
 //! READ DISC INFORMATION, READ BUFFER CAPACITY and the MODE SENSE 0x2A

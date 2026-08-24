@@ -170,7 +170,7 @@ impl embedded_io::Read for FileBackend {
 impl embedded_io::Write for FileBackend {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         if !self.writable {
-            // Write-policy rejection convention (plan §14 D5): report
+            // Write-policy rejection convention: report
             // PermissionDenied, which the `WritableFlatData` blanket maps
             // to `BlockStorageError::NotWritable` → SCSI DATA PROTECT
             // instead of a bare I/O error.

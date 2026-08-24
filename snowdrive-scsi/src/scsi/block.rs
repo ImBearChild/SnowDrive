@@ -20,8 +20,8 @@ const CLEAR_SENSE: Sense = Sense::clear();
 pub const CD_SECTOR_SIZE: u32 = 2048;
 
 /// INQUIRY identity for the optical read-only profile (the former
-/// `CDBlockDevice`, plan §8.1b): SCSI family with the SPC-4 and MMC-6
-/// version descriptors replacing the block device's SBC.
+/// `CDBlockDevice`): SCSI family with the SPC-4 and MMC-6 version
+/// descriptors replacing the block device's SBC.
 pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
     product: *b"HyperMulti DVD  ",
@@ -55,7 +55,7 @@ impl<D> Copy for WriteOps<D> {}
 ///
 /// "Not writable" comes in two kinds that a single device type must
 /// express at runtime (the constructor-chosen difference necessarily
-/// degrades to runtime state; see plan §14 D1):
+/// degrades to runtime state):
 ///
 /// - [`WritePath::Absent`] — capability missing (`cdrom()` profile /
 ///   read-only plane). Writes are DATA PROTECT, forever.
@@ -217,8 +217,7 @@ impl<D: FlatData> BlockDevice<D> {
     ///
     /// `Absent` ⇒ nothing was ever writable, always clean. `Locked` still
     /// flushes: the lock is *policy*, not capability — dirty pages written
-    /// during an Open window must stay reachable after `set_writable(false)`
-    /// (plan §14 D1-②).
+    /// during an Open window must stay reachable after `set_writable(false)`.
     pub(crate) fn sync_backend(&mut self) -> Result<(), BlockStorageError> {
         match self.write_path {
             WritePath::Absent => Ok(()),
@@ -309,7 +308,7 @@ impl<D: FlatData> BlockDevice<D> {
         }
         if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
             // Read-only plane masquerading as writable through the
-            // blanket impl (plan §14 D5): the backend's policy rejection
+            // blanket impl: the backend's policy rejection
             // surfaces as NotWritable, not a medium fault.
             if e == BlockStorageError::NotWritable {
                 self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
@@ -1035,7 +1034,7 @@ mod tests {
         std::fs::write(&path, [0u8; 512]).unwrap();
 
         // A read-only FileBackend handed *directly* to `disk()` bypasses
-        // the policy bit (plan §14 D5): the backend's PermissionDenied
+        // the policy bit: the backend's PermissionDenied
         // must surface as DATA PROTECT, not WRITE FAULT.
         let backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), false).unwrap();
@@ -1151,7 +1150,7 @@ mod tests {
 
     #[test]
     fn cdrom_profile_set_writable_cannot_unlock() {
-        // Plan §14 D1 landmine: `set_writable(true)` on a `cdrom()`
+        // Regression landmine: `set_writable(true)` on a `cdrom()`
         // device used to flip the policy bit while the captured write ops
         // stayed None ⇒ panic at the first WRITE. With `WritePath`, the
         // Absent state is sticky and the rejection happens at the command
@@ -1206,7 +1205,7 @@ mod tests {
 
     #[test]
     fn sync_flushes_open_and_locked_but_not_absent() {
-        // Plan §14 D1-②: Locked is policy, not capability — dirty pages
+        // Locked is policy, not capability — dirty pages
         // from an Open window must stay reachable, so sync flushes.
         let mut dev = BlockDevice::disk(
             CountingBackend {

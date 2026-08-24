@@ -1,8 +1,8 @@
 //! Empty UDF void volume generation — UDF void volume generation.
 //!
 //! Pure algorithms: **no storage, no FS, no alloc** — mirror of
-//! `iso9660::live`. The media layer (`CdMedia::UdfRw`, plan §7) materializes
-//! an empty volume by calling [`gen_sector`] for every structured LBA into a
+//! `iso9660::live`. The media layer ([`CdMedia::Rw`](crate::cdrom::media::CdMedia::Rw))
+//! materializes an empty volume by calling [`gen_sector`] for every structured LBA into a
 //! writable byte plane (all other sectors stay zero).
 //!
 //! "Void" = this module only produces the empty skeleton; it is **not** a

@@ -1,4 +1,4 @@
-//! SCSI core + devices (plan §3 / §5).
+//! SCSI core + devices.
 //!
 //! ## Modules (filled in as the leaf `snowscsi` crate is folded in)
 //! - [`scsi`]: opcodes, sense data, CDB field parsing (SPC-4 / SBC-3 /

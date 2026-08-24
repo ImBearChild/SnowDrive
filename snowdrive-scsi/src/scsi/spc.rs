@@ -263,7 +263,7 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             }
         },
 
-        // R1 adjudication (plan §8.1): SEND DIAGNOSTIC is GOOD only for
+        // SEND DIAGNOSTIC is GOOD only for
         // PF=1 + SELFTEST=0 (SPC-3 table 171 — PF = bit 3 = 0x08,
         // SELFTEST = bit 1 = 0x02). The legacy C check `cdb[1] & 0x04`
         // probed the reserved bit and was dropped.

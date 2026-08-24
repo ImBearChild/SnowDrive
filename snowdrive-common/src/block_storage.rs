@@ -161,7 +161,7 @@ impl<B: BlockStorage + ?Sized> WritableFlatData for B {
 
 /// Error mapping for the write path of the [`BlockStorage`] blanket.
 ///
-/// Convention (plan §14 D5): a backend that refuses writes as *policy*
+/// Convention: a backend that refuses writes as *policy*
 /// reports `ErrorKind::PermissionDenied`, which lands here as
 /// [`BlockStorageError::NotWritable`] (→ SCSI DATA PROTECT). Any other
 /// kind is a plain I/O failure. Third-party backends should follow the

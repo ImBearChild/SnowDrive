@@ -1,4 +1,4 @@
-//! CdromDrive: unified CD-ROM device with swappable media (plan ).
+//! CdromDrive: unified CD-ROM device with swappable media.
 //!
 //! One constant device identity + one mutable media slot.  **All** MMC
 //! command dispatch lives here; media types only provide geometry and a
@@ -47,15 +47,15 @@ pub struct CdromDrive<'a> {
     pub(crate) identity: DeviceIdentity,
     /// Tray: at most one disc, loaded or parked after a SCSI eject.
     pub(crate) tray: Tray<'a>,
-    /// Tray state: `true` = open (plan  ASCQ).
+    /// Tray state: `true` = open.
     pub(crate) tray_open: bool,
-    /// Page 0x05 write parameter cache (plan /).
-    #[allow(dead_code)] // used in later milestones
+    /// Page 0x05 write parameter cache.
+    #[allow(dead_code)] // reserved for the future write-path (page 0x05)
     pub(crate) mode_page_05: [u8; 52],
     #[allow(dead_code)]
     pub(crate) mode_page_05_valid: bool,
-    /// `true` when `load()` was requested by START STOP Load=1 on empty tray
-    /// (plan /).
+    /// `true` when `load()` was requested by START STOP Load=1 on an
+    /// empty tray.
     pub(crate) media_requested: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
@@ -160,7 +160,7 @@ impl<'a> CdromDrive<'a> {
     /// SCSI-initiated eject (`START STOP loej=1`): Loaded → Parked plus
     /// UNIT ATTENTION. The disc stays owned by the drive — physically it
     /// sticks out of the slot until [`Self::take_media`] reclaims it or
-    /// a new [`Self::load`] swaps it (plan §4.2 truth table). On an
+    /// a new [`Self::load`] swaps it. On an
     /// empty or already-parked tray it merely presents the tray; an
     /// empty tray presenting itself is not a medium-change event
     /// (§14.3 次-1), so no UNIT ATTENTION is queued.
@@ -1118,7 +1118,7 @@ impl<'a> CdromDrive<'a> {
     ///
     /// Parked media is flushed too: the disc physically sits on the tray
     /// until `take_media()` reclaims it, and host-written data must not
-    /// be lost in that window (plan §14 D2). Empty ⇒ nothing to flush.
+    /// be lost in that window. Empty ⇒ nothing to flush.
     pub fn sync_media(&mut self) -> Result<(), MediaError> {
         match &mut self.tray {
             Tray::Loaded(m) | Tray::Parked(m) => m.sync(),
@@ -1298,7 +1298,7 @@ impl<'a> CdromDriveBuilder<'a> {
         self
     }
 
-    /// Enable/disable eject and lock (plan  true-device calibration).
+    /// Enable/disable eject and lock.
     pub fn eject_capable(mut self, eject: bool) -> Self {
         self.caps.eject = eject;
         self.caps.lock = eject;
@@ -1751,7 +1751,7 @@ mod tests {
     #[cfg(feature = "udf_void")]
     #[test]
     fn sync_reaches_parked_media() {
-        // Plan §14 D2: after a SCSI eject the disc sits Parked on the
+        // After a SCSI eject the disc sits Parked on the
         // tray until take_media(); shutdown (`ScsiDevice::sync`) and
         // SYNCHRONIZE CACHE must both reach it — the former behavior
         // returned Ok/Status without flushing ⇒ data-loss window.
@@ -1796,7 +1796,7 @@ mod tests {
 
     #[test]
     fn tray_parked_rows_of_truth_table() {
-        // Plan §4.2 truth table: app-side eject() on a parked tray is a
+        // App-side eject() on a parked tray is a
         // no-op (Parked → Parked); load() over a parked disc hands the
         // parked media back to the caller.
         use crate::scsi::spc::SpcDevice;

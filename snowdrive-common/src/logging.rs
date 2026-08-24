@@ -1,4 +1,4 @@
-//! Unified logging macros for the `snowdrive` lib crate (plan §15.7 P0.2).
+//! Unified logging macros for the SnowDrive workspace crates.
 //!
 //! Dispatched by feature:
 //! - `log` feature  — `::log::trace!()` etc.

@@ -53,7 +53,7 @@ pub enum TrackKind {
     Audio,
 }
 
-/// Track recording status (plan MC-6 Table 367 analogous).
+/// Track recording status (analogous to MMC-6 Table 367).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackStatus {
     /// RESERVE TRACK issued but no data written yet.
@@ -73,7 +73,7 @@ pub enum RecordingMode {
     RestrictedOverwrite,
 }
 
-/// Overall disc state (plan MC-6 Table 367).
+/// Overall disc state (MMC-6 Table 367).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscState {
     /// No tracks written; disc is empty.
@@ -165,9 +165,9 @@ pub struct SessionInfo {
     pub closed: bool,
 }
 
-// ── Write-path error model (plan  A1) ─────────────────────────
+// ── Write-path error model ────────────────────────────────────
 
-/// Errors from the media write path (plan  A1).
+/// Errors from the media write path.
 ///
 /// The drive layer maps these to SCSI sense codes:
 /// - `IllegalField` → 24h/00h (INVALID FIELD IN CDB)
@@ -210,7 +210,7 @@ impl From<BlockStorageError> for MediaError {
     }
 }
 
-// ── GESN media event status (plan MC-6 ) ─────────────
+// ── GESN media event status (GET EVENT STATUS NOTIFICATION) ────
 
 /// Media event status for GET EVENT STATUS NOTIFICATION (MMC-6 Table 265).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

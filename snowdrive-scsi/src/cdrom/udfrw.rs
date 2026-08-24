@@ -206,7 +206,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
 /// Floor `capacity` to whole 2048-byte sectors, rejecting volumes that do
 /// not fit in the UDF void address space. Takes the plain byte capacity —
 /// callers read it from the backend themselves (the former `Result`
-/// parameter had no failing caller; plan §14 D3).
+/// parameter had no failing caller).
 fn sectors_of(capacity: u64) -> Result<u32, UdfRwError> {
     u32::try_from(capacity / u64::from(SECTOR_SIZE)).map_err(|_| UdfRwError::CapacityTooLarge)
 }
