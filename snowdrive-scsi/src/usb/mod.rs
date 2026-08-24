@@ -10,6 +10,47 @@
 //! The data area handed to the SCSI device layer is a pure data region
 //! ([`crate::MIN_DATA_LEN`]); CBWs and CSWs live in `BotSession`'s internal
 //! buffers, so protocol frames never share memory with SCSI data.
+//!
+//! # Example: driving one BOT transaction
+//!
+//! The driver feeds bulk events in; the session hands back the next need.
+//! A complete no-data transaction (TEST UNIT READY) is two steps:
+//!
+//! ```
+//! use snowdrive_scsi::common::block_storage::RamBackend;
+//! use snowdrive_scsi::scsi::block::BlockDevice;
+//! use snowdrive_scsi::usb::{
+//!     BotSession, BotStepResult, SessionEvent, SessionStep, CBW_LEN,
+//!     CBW_SIGNATURE, CSW_LEN,
+//! };
+//! use snowdrive_scsi::MIN_DATA_LEN;
+//!
+//! let mut ram = vec![0u8; 64 * 1024];
+//! let mut lun = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+//! let mut devs = [lun];
+//! let mut session = BotSession::new();
+//! let mut data = vec![0u8; MIN_DATA_LEN];
+//!
+//! // A valid TEST UNIT READY CBW: signature + tag + declared length 0 +
+//! // flags 0 (no data phase) + LUN 0 + 6-byte CDB (opcode 0x00).
+//! let mut cbw = [0u8; CBW_LEN];
+//! cbw[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
+//! cbw[14] = 6;
+//! cbw[15] = 0x00; // TEST UNIT READY
+//!
+//! // One bulk-OUT completion → the CSW is pending on the bulk-IN pipe.
+//! match session.poll(SessionEvent::OutRecv { data: &cbw }, &mut data, &mut devs) {
+//!     SessionStep::NeedIn(csw) => assert_eq!(csw.len(), CSW_LEN),
+//!     other => panic!("expected CSW, got {other:?}"),
+//! }
+//!
+//! // Bulk-IN sent → transaction complete; the session is back in the
+//! // Command phase and can accept the next CBW.
+//! assert_eq!(
+//!     session.poll(SessionEvent::InSent, &mut data, &mut devs),
+//!     SessionStep::Done(BotStepResult::Processed)
+//! );
+//! ```
 
 pub mod bot;
 pub mod gadget;
