@@ -412,35 +412,30 @@ impl<'a> CdromDrive<'a> {
         // PendingXfer is per-command: clear at entry.
         self.pending = None;
 
-        // Unit attention is the ONLY sense that may preempt a later command
-        // (SPC-4 §5.14): it is reported exactly once as CHECK CONDITION on
-        // the next non-bypass command (INQUIRY / REPORT LUNS / REQUEST SENSE
-        // bypass) and then dropped. Any OTHER pending sense is stale — the
-        // host simply never fetched it (e.g. it skipped REQUEST SENSE after
-        // rejecting a vendor probe) — and is discarded here so it cannot
-        // poison unrelated commands. Without this, one rejected SECURITY
-        // PROTOCOL IN during Windows enumeration would fail every following
-        // GET EVENT STATUS NOTIFICATION / GET CONFIGURATION and the medium
-        // would be treated as unwritable.
+        // Sense delivery rules (SPC-4 §5.14 / §7.9):
+        // - REQUEST SENSE must ALWAYS reach the executor untouched: it has
+        //   to serve whatever the last CHECK CONDITION carried. Neither the
+        //   UA preemption below nor stale-sense cleanup may consume or drop
+        //   a pending sense on its behalf. (Regression: discarding stale
+        //   sense at entry made every REQUEST SENSE answer NO SENSE, which
+        //   blinded Windows' eject retries.)
+        // - A UNIT ATTENTION preempts exactly one other command — reported
+        //   once as CHECK CONDITION carrying it, consumed on delivery —
+        //   except for INQUIRY / REPORT LUNS (SPC-4: these never clear a
+        //   unit attention).
+        // - Any other pending sense is inert for command dispatch: it must
+        //   not preempt, but it is left in place so a following REQUEST
+        //   SENSE can still report it; the next error simply overwrites it.
+        let spc_parsed = parse_spc(cdb);
+        let is_request_sense = matches!(spc_parsed, Some(SpcCommand::RequestSense { .. }))
+            || cdb_opcode(cdb) == Some(op::REQUEST_SENSE);
         if let Some(s) = self.peek_sense() {
-            if s.key == SenseKey::UnitAttention {
-                let spc = parse_spc(cdb);
-                let bypass = match spc {
-                    Some(cmd) => matches!(
-                        cmd,
-                        SpcCommand::Inquiry { .. } | SpcCommand::RequestSense { .. }
-                    ),
-                    None => matches!(
-                        cdb_opcode(cdb),
-                        Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::REQUEST_SENSE)
-                    ),
-                };
-                if !bypass {
-                    let _ = self.take_sense(); // reported once — drop it
-                    return Ok(CommandOutcome::CheckCondition);
-                }
-            } else {
-                let _ = self.take_sense(); // stale non-UA sense: discard
+            let ua_bypass = is_request_sense
+                || matches!(spc_parsed, Some(SpcCommand::Inquiry { .. }))
+                || matches!(cdb_opcode(cdb), Some(op::INQUIRY) | Some(op::REPORT_LUNS));
+            if s.key == SenseKey::UnitAttention && !ua_bypass {
+                let _ = self.take_sense(); // reported once — drop it
+                return Ok(CommandOutcome::CheckCondition);
             }
         }
 

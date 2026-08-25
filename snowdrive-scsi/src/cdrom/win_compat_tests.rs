@@ -182,6 +182,20 @@ fn win_rejected_probe_does_not_poison_next_command() {
         );
     }
 
+    // The host fetches the reason via REQUEST SENSE — it must see the exact
+    // ASC/ASCQ the rejection carried. (Regression: stale-sense cleanup used
+    // to blind REQUEST SENSE into answering NO SENSE, breaking Windows'
+    // eject retry loop which relies on reading MEDIUM REMOVAL PREVENTED.)
+    {
+        let rs = [0x03u8, 0, 0, 0, 0x12, 0];
+        let out = dev.do_cmd(&rs, &mut w).unwrap();
+        let CommandOutcome::OutInline { .. } = out else {
+            panic!("REQUEST SENSE must serve data");
+        };
+        assert_eq!(w[2], 0x05);
+        assert_eq!(w[12], crate::scsi::scsi::asc::INVALID_COMMAND);
+    }
+
     let gesn = [0x4Au8, 1, 0, 0, 0x00, 0, 0, 0, 0x08, 0];
     let out = dev.do_cmd(&gesn, &mut w).unwrap();
     assert!(
@@ -457,5 +471,13 @@ mod enumeration_sequence {
             dev.peek_sense().map(|s| (s.asc, s.ascq)),
             Some((0x53, 0x02))
         );
+        // REQUEST SENSE must report exactly that (usbms-28: answering
+        // NO SENSE here made Windows retry the eject forever).
+        {
+            let rs = [0x03u8, 0, 0, 0, 0x12, 0];
+            let (st, sense) = tx(&mut session, &mut dev, &mut work, true, 18, &rs, &[]);
+            assert_eq!(st, 0);
+            assert_eq!((sense[2], sense[12], sense[13]), (0x05, 0x53, 0x02));
+        }
     }
 }
