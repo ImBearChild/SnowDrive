@@ -54,6 +54,8 @@ pub mod asc {
     pub const INVALID_COMMAND: u8 = 0x20;
     pub const LBA_OUT_OF_RANGE: u8 = 0x21;
     pub const INVALID_FIELD: u8 = 0x24;
+    /// ASC 26h — INVALID FIELD IN PARAMETER LIST (SPC-4 §4.5.6).
+    pub const INVALID_FIELD_IN_PARAMETER_LIST: u8 = 0x26;
     pub const LOGICAL_UNIT_NOT_SUPPORTED: u8 = 0x25;
     pub const WRITE_PROTECTED: u8 = 0x27;
     /// ASC 29h — POWER ON, RESET, OR BUS DEVICE RESET OCCURRED (SPC-4

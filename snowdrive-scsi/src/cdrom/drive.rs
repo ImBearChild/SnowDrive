@@ -412,25 +412,35 @@ impl<'a> CdromDrive<'a> {
         // PendingXfer is per-command: clear at entry.
         self.pending = None;
 
-        // Generic pending sense (UA is just a sense): if a sense is
-        // pending, the next command (except INQUIRY/REPORT LUNS/REQUEST SENSE)
-        // gets it as CHECK. REQUEST SENSE itself is allowed to proceed and
-        // will return the sense as DataIn via execute_spc and clear it.
-        if self.peek_sense().is_some() {
-            let spc = parse_spc(cdb);
-            let bypass = if let Some(cmd) = spc {
-                matches!(
-                    cmd,
-                    SpcCommand::Inquiry { .. } | SpcCommand::RequestSense { .. }
-                )
+        // Unit attention is the ONLY sense that may preempt a later command
+        // (SPC-4 §5.14): it is reported exactly once as CHECK CONDITION on
+        // the next non-bypass command (INQUIRY / REPORT LUNS / REQUEST SENSE
+        // bypass) and then dropped. Any OTHER pending sense is stale — the
+        // host simply never fetched it (e.g. it skipped REQUEST SENSE after
+        // rejecting a vendor probe) — and is discarded here so it cannot
+        // poison unrelated commands. Without this, one rejected SECURITY
+        // PROTOCOL IN during Windows enumeration would fail every following
+        // GET EVENT STATUS NOTIFICATION / GET CONFIGURATION and the medium
+        // would be treated as unwritable.
+        if let Some(s) = self.peek_sense() {
+            if s.key == SenseKey::UnitAttention {
+                let spc = parse_spc(cdb);
+                let bypass = match spc {
+                    Some(cmd) => matches!(
+                        cmd,
+                        SpcCommand::Inquiry { .. } | SpcCommand::RequestSense { .. }
+                    ),
+                    None => matches!(
+                        cdb_opcode(cdb),
+                        Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::REQUEST_SENSE)
+                    ),
+                };
+                if !bypass {
+                    let _ = self.take_sense(); // reported once — drop it
+                    return Ok(CommandOutcome::CheckCondition);
+                }
             } else {
-                matches!(
-                    cdb_opcode(cdb),
-                    Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::REQUEST_SENSE)
-                )
-            };
-            if !bypass {
-                return Ok(CommandOutcome::CheckCondition);
+                let _ = self.take_sense(); // stale non-UA sense: discard
             }
         }
 
@@ -701,7 +711,10 @@ impl<'a> CdromDrive<'a> {
         if !self.loaded() {
             return self.not_ready();
         }
-        if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
+        // MMC-6 Table 237: byte 1 carries FmtData (bit 4), CmpList (bit 3)
+        // and the Format Code (bits 2-0). Multi-Media drives require
+        // FmtData=1 and Format Code=001b; CmpList is accepted (DVD-RAM).
+        if cdb[1] & 0x10 == 0 || cdb[1] & 0x07 != 0x01 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         // 12-byte parameter list; completion happens in `complete_format_unit`
@@ -714,25 +727,48 @@ impl<'a> CdromDrive<'a> {
             return self.not_ready();
         }
         if data.len() != 12 {
+            return self.cc(
+                SenseKey::IllegalRequest,
+                asc::INVALID_FIELD_IN_PARAMETER_LIST,
+            );
+        }
+        if cdb[1] & 0x10 == 0 || cdb[1] & 0x07 != 0x01 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        if cdb[1] & 0x10 == 0 || cdb[1] & 0x03 != 0x01 {
-            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
-        }
-        let options = data[1];
-        if options & (0x40 | 0x10 | 0x04) != 0
+        // Format List Header validation (MMC-6 §6.4.3.2, Table 240):
+        // DPRY shall be zero, STPF is reserved, IP shall be zero for
+        // Multi-Media drives, and when FOV=0 the host must also clear
+        // DCRT and Try-out (defaults apply). Immed/VS/DCRT are accepted.
+        if data[1] & (0x40 | 0x10 | 0x08) != 0
+            || (data[1] & 0x80 == 0 && data[1] & (0x20 | 0x04) != 0)
             || u16::from_be_bytes([data[2], data[3]]) != 8
-            || data[4..8] != [0, 0, 0, 0]
         {
-            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+            return self.cc(
+                SenseKey::IllegalRequest,
+                asc::INVALID_FIELD_IN_PARAMETER_LIST,
+            );
         }
-        let format_type = data[8];
-        if format_type != 0x00 || u16::from_be_bytes([data[10], data[11]]) != 2048 {
-            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        // Format Descriptor (MMC-6 Table 241). The Number of Blocks field is
+        // advisory ("typically ... the number of addressable blocks for the
+        // entire disc") — initiators such as dvd+rw-format echo the medium
+        // capacity back — so it is not validated. Only the DVD-RAM Full
+        // Format (type 00h) with 2048-byte blocks is implemented; a zero
+        // block length is tolerated for leniency towards other initiators.
+        let block_len = u32::from_be_bytes([0, data[9], data[10], data[11]]);
+        if data[8] != 0x00 || (block_len != 2048 && block_len != 0) {
+            return self.cc(
+                SenseKey::IllegalRequest,
+                asc::INVALID_FIELD_IN_PARAMETER_LIST,
+            );
         }
-        if options & 0x02 != 0 {
+        // Try-out determines formatting feasibility without touching the
+        // medium (MMC-6 §6.4.3.2 e): validation above is the whole job.
+        if data[1] & 0x04 != 0 {
             return CommandOutcome::Status;
         }
+        // The format runs synchronously in this emulation, so Immed and
+        // non-Immed are observably identical: clear now, report GOOD,
+        // queue UNIT ATTENTION so the host re-reads DiscInfo/TOC/Capacity.
         #[cfg(feature = "udf_void")]
         if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
             return match media.format_unit() {
@@ -1107,6 +1143,14 @@ impl<'a> CdromDrive<'a> {
         } else {
             0x26 << 2
         };
+        // Type Dependent Parameter of the Formattable Capacity Descriptor
+        // (MMC-6 Tables 468/469): Full Format (00h) reports the block length
+        // in bytes. Hosts echo this descriptor back inside the FORMAT UNIT
+        // parameter list, so it must be accurate — dvd+rw-format copies it
+        // verbatim. DVD+RW Basic Format (26h) is "set to zeros".
+        if self.is_random_writable() {
+            buf[18] = 0x08; // Block Length 2048 (24-bit)
+        }
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
@@ -1220,7 +1264,22 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
         cdb: &[u8],
         data: &mut [u8],
     ) -> Result<CommandOutcome, crate::scsi::device::Error> {
-        self.do_cmd(cdb, data)
+        let mut hx = [0u8; 48];
+        crate::debug!(
+            "cdrom cmd {}",
+            core::str::from_utf8(hex_of(&mut hx, cdb)).unwrap_or("?")
+        );
+        let outcome = self.do_cmd(cdb, data);
+        if matches!(outcome, Ok(CommandOutcome::CheckCondition)) {
+            let s = self.sense();
+            crate::debug!(
+                "cdrom cc key={:#04x} asc={:#04x} ascq={:#04x}",
+                s.key as u8,
+                s.asc,
+                s.ascq
+            );
+        }
+        outcome
     }
 
     fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
@@ -1244,6 +1303,13 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
     }
 
     fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> crate::scsi::device::CommandOutcome {
+        let mut hx = [0u8; 64];
+        crate::debug!(
+            "cdrom param op={:#04x} len={} {}",
+            cdb.first().copied().unwrap_or(0),
+            data.len(),
+            core::str::from_utf8(hex_of(&mut hx, data)).unwrap_or("?")
+        );
         match cdb.first().copied() {
             Some(op::MODE_SELECT_6) => {
                 let alloc = u16::from(cdb[4]);
@@ -1324,6 +1390,27 @@ impl<'a> CdromDriveBuilder<'a> {
             _phantom: core::marker::PhantomData,
         }
     }
+}
+
+/// Render `data` as space-separated uppercase hex into `out`; returns the
+/// used subslice. Debug-logging helper (no_std, no alloc).
+pub(crate) fn hex_of<'o>(out: &'o mut [u8], data: &[u8]) -> &'o [u8] {
+    let mut i = 0;
+    for (n, b) in data.iter().enumerate() {
+        if i + 3 > out.len() {
+            break;
+        }
+        let hi = b >> 4;
+        let lo = b & 0x0F;
+        out[i] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+        out[i + 1] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+        i += 2;
+        if n + 1 < data.len() {
+            out[i] = b' ';
+            i += 1;
+        }
+    }
+    &out[..i]
 }
 
 #[cfg(test)]
@@ -1540,13 +1627,12 @@ mod tests {
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
-        let s = dev.peek_sense().unwrap();
-        assert_eq!(s.key, SenseKey::UnitAttention);
-        assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-        // UA stays until taken (autosense). Simulate transport taking it.
-        let taken = dev.take_sense().unwrap();
-        assert_eq!(taken.key, SenseKey::UnitAttention);
-        assert!(dev.peek_sense().is_none());
+        // UA is consumed when it is reported (delivered exactly once); the
+        // host fetches the details via autosense/REQUEST SENSE.
+        assert!(
+            dev.peek_sense().is_none(),
+            "UA must not linger after being reported"
+        );
         // Next TUR should not be UA again (may be NOT READY if no media).
         let outcome2 = dev.do_cmd(&cdb, &mut w).unwrap();
         match outcome2 {
@@ -1635,17 +1721,12 @@ mod tests {
         dev.load(CdMedia::ro(&mut bb));
         assert!(dev.is_media_present());
 
-        // TUR → CC(UA 28h/00h).
+        // TUR → CC(UA 28h/00h) — reported once, consumed on delivery.
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
-        {
-            let s = dev.peek_sense().unwrap();
-            assert_eq!(s.key, SenseKey::UnitAttention);
-            assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-        }
-        // Do not take here — let REQUEST SENSE consume UA.
-        // REQUEST SENSE still returns the UA sense.
+        assert!(dev.peek_sense().is_none(), "UA must not linger");
+        // REQUEST SENSE still completes fine (empty sense now).
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
         let outcome_rs = dev.do_cmd(&cdb, &mut w).unwrap();
@@ -1663,15 +1744,11 @@ mod tests {
         assert!(dev.tray_open);
         assert!(!dev.is_media_present());
 
-        // TUR → CC(UA 28h/00h) then → NOT READY 3Ah/02h.
+        // TUR → CC(UA 28h/00h) — consumed on delivery.
         cdb[0] = op::TEST_UNIT_READY;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
-        {
-            let s = dev.peek_sense().unwrap();
-            assert_eq!(s.key, SenseKey::UnitAttention);
-            assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
-        }
+        assert!(dev.peek_sense().is_none());
         // REQUEST SENSE → clears UA.
         cdb[0] = op::REQUEST_SENSE;
         cdb[4] = 18;
@@ -1698,9 +1775,8 @@ mod tests {
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         assert_eq!(outcome, CommandOutcome::CheckCondition);
-        let s = dev.peek_sense().unwrap();
-        assert_eq!(s.key, SenseKey::UnitAttention);
-        assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+        // UA is consumed when reported; nothing lingers.
+        assert!(dev.peek_sense().is_none());
     }
 
     #[test]
@@ -1848,7 +1924,10 @@ mod tests {
                 CommandOutcome::CheckCondition
             );
             assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
-            assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+            assert_eq!(
+                dev.peek_sense().unwrap().asc,
+                asc::INVALID_FIELD_IN_PARAMETER_LIST
+            );
         }
         #[cfg(not(feature = "udf_void"))]
         {
@@ -1872,9 +1951,10 @@ mod tests {
             cdb[0] = op::FORMAT_UNIT;
             cdb[1] = 0x11;
             let mut w = work();
-            w[1] = 0x00;
+            w[1] = 0x08; // IP=1 — initialization pattern descriptor present,
+                         // which Multi-Media drives reject (MMC-6 §6.4.3.2 d)
             w[2..4].copy_from_slice(&8u16.to_be_bytes());
-            w[4..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // non-zero init pattern with IP=0
+            w[4..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
@@ -1884,7 +1964,10 @@ mod tests {
                 CommandOutcome::CheckCondition
             );
             assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
-            assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+            assert_eq!(
+                dev.peek_sense().unwrap().asc,
+                asc::INVALID_FIELD_IN_PARAMETER_LIST
+            );
         }
         #[cfg(not(feature = "udf_void"))]
         {
@@ -1923,13 +2006,15 @@ mod tests {
                 }
                 _ => panic!("expected InXfer"),
             }
-            // Try-out format (byte1 bit1 = 0x02) should validate and return GOOD without clearing
+            // Try-out format (header bit 2 = 0x04, with FOV) should validate
+            // and return GOOD without clearing the medium (MMC-6 §6.4.3.2 e).
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
             cdb[1] = 0x11;
             let mut w = work();
-            w[1] = 0x02; // Try-out
+            w[1] = 0x84; // FOV | Try-out
             w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[4..8].copy_from_slice(&2048u32.to_be_bytes()); // Number of Blocks
             w[8] = 0x00;
             w[10..12].copy_from_slice(&2048u16.to_be_bytes());
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
@@ -2017,6 +2102,71 @@ mod tests {
             let n = data_in_xfer(&mut dev, outcome, &w, &mut sec);
             assert_eq!(n, 2048);
             assert_eq!(sec, [0u8; 2048]);
+        }
+    }
+
+    /// Regression: replay the exact FORMAT UNIT wire bytes emitted by
+    /// `dvd+rw-format` for DVD-RAM (CDB `04 19 …`, parameter list with
+    /// FOV|DCRT|Immed and the Formattable Capacity Descriptor echoed back
+    /// verbatim). The Number of Blocks field carries the medium capacity —
+    /// it must be accepted — and Immed=1 must still clear the medium (the
+    /// format itself runs synchronously in this emulation).
+    #[test]
+    #[allow(unused_mut, unused_variables)]
+    fn drive_format_unit_dvd_rw_format_compat() {
+        let mut img = vec![0u8; 4096 * 2048];
+        #[cfg(feature = "udf_void")]
+        {
+            use crate::cdrom::udfrw::UdfRwMedia;
+            let mut scratch = [0u8; 256];
+            let mut dev = CdromDrive::new();
+            let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
+            // Leave a pattern at LBA 1 so we can observe the clear.
+            {
+                let mut w = work();
+                let mut cdb = [0u8; 10];
+                cdb[0] = op::WRITE_10;
+                cdb[5] = 1;
+                cdb[8] = 1;
+                match dev.do_cmd(&cdb, &mut w).unwrap() {
+                    CommandOutcome::InXfer { .. } => {
+                        assert_eq!(dev.xfer_in(0, &[0x5A; 2048]), XferOutcome::Ok);
+                    }
+                    _ => panic!("expected InXfer"),
+                }
+            }
+            // Exactly what dvd+rw-format puts on the wire: CDB byte1
+            // 0x19 = FmtData | CmpList | Format Code 001b; parameter list
+            // header FOV|DCRT|Immed, descriptor length 8, Number of Blocks =
+            // medium capacity (0x00032000), Format Type 00h, block length 0.
+            let cdb = [0x04u8, 0x19, 0, 0, 0, 0];
+            let mut w = work();
+            w[1] = 0xA2;
+            w[2..4].copy_from_slice(&8u16.to_be_bytes());
+            w[4..8].copy_from_slice(&0x0003_2000u32.to_be_bytes());
+            w[8] = 0x00;
+            assert_eq!(
+                dev.do_cmd(&cdb, &mut w).unwrap(),
+                CommandOutcome::InParam { expected_len: 12 }
+            );
+            assert_eq!(dev.complete_param(&cdb, &w[..12]), CommandOutcome::Status);
+            // The format ran even though Immed was set.
+            let s = dev.take_sense().expect("UNIT ATTENTION after format");
+            assert_eq!(s.key, SenseKey::UnitAttention);
+            assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
+            // Medium is cleared.
+            let mut w = work();
+            let mut cdb = [0u8; 10];
+            cdb[0] = op::READ_10;
+            cdb[5] = 1;
+            cdb[8] = 1;
+            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+            let mut out = [0u8; 2048];
+            let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
+            assert_eq!(n, 2048);
+            assert_eq!(out, [0u8; 2048]);
         }
     }
 
@@ -2120,9 +2270,8 @@ mod tests {
             assert_eq!(dev.complete_param(&cdbf, &w2[..12]), CommandOutcome::Status);
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             assert_eq!(outcome, CommandOutcome::CheckCondition);
-            let s = dev.peek_sense().unwrap();
-            assert_eq!(s.key, SenseKey::UnitAttention);
-            assert_eq!(s.asc, 0x28);
+            // UA is consumed when reported (autosense carries it).
+            assert!(dev.peek_sense().is_none());
             let mut cdb_rs = [0u8; 6];
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;

@@ -51,6 +51,9 @@ pub mod media;
 #[cfg(feature = "udf_void")]
 pub mod udfrw;
 
+#[cfg(all(test, feature = "usb"))]
+mod win_compat_tests;
+
 pub use common::{
     build_get_config_response, build_read_buffer_capacity, build_read_disc_info, CdromCapabilities,
     CurrentProfile, DiscInfo, MediaState, CDROM_IDENTITY, HYPER_MULTI_CAPS, SECTOR_SIZE,
