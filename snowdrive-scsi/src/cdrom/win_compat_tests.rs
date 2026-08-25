@@ -232,3 +232,230 @@ fn win_ua_still_reports_once() {
         CommandOutcome::OutInline { len: 8 }
     );
 }
+
+// ── Scripted Windows enumeration sequence ───────────────────────────
+//
+// Ordered transactions distilled from a real usbredir capture (win10 /
+// usbstor, see tools/usbms-pcap.py to extract more when a new host quirk
+// shows up). Driven through the real `BotSession` so core-level UA
+// handling and the device pending-sense gate are exercised together.
+// Assertions are spec-level invariants, not byte parity with the capture.
+
+#[cfg(feature = "usb")]
+mod enumeration_sequence {
+    use super::*;
+    use crate::scsi::scsi::{asc, SenseKey};
+    use crate::usb::target::{BotSession, SessionEvent, SessionNeed};
+
+    /// One BOT transaction: build the CBW, run the state machine to
+    /// completion, return (csw_status, response bytes).
+    fn tx(
+        session: &mut BotSession,
+        dev: &mut CdromDrive<'_>,
+        work: &mut [u8],
+        dir_in: bool,
+        declared: usize,
+        cdb: &[u8],
+        payload: &[u8],
+    ) -> (u8, Vec<u8>) {
+        let mut cbw = [0u8; 31];
+        cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());
+        cbw[8..12].copy_from_slice(&(declared as u32).to_le_bytes());
+        if dir_in {
+            cbw[12] = 0x80;
+        }
+        cbw[14] = cdb.len() as u8;
+        cbw[15..15 + cdb.len()].copy_from_slice(cdb);
+
+        let mut sent_payload = 0usize;
+        let mut out: Vec<u8> = Vec::new();
+        let mut csw_status = 0xFFu8;
+        let mut csw_seen = false;
+        let mut guard = 0usize;
+
+        session.poll(SessionEvent::OutRecv { data: &cbw }, work, &mut [&mut *dev]);
+        loop {
+            guard += 1;
+            assert!(
+                guard < 64,
+                "tx stuck: cdb={cdb:02x?} need={:?}",
+                session.need()
+            );
+            match session.need() {
+                SessionNeed::Done(_) => break,
+                // CSW sent: the core is back in Command phase waiting for
+                // the next CBW — transaction complete.
+                SessionNeed::NeedOut {
+                    len: 31,
+                    probe: false,
+                } if csw_seen => break,
+                SessionNeed::NeedIn { len } => {
+                    let owned = session.out_slice(work)[..len].to_vec();
+                    if len == 13 {
+                        csw_status = owned[12];
+                        csw_seen = true;
+                    } else {
+                        out.extend_from_slice(&owned);
+                    }
+                    session.poll(SessionEvent::InSent, work, &mut [&mut *dev]);
+                }
+                SessionNeed::NeedOut { len, probe } => {
+                    // Overrun probe: try once with no data — "nothing more
+                    // from the host" ends the drain and moves to the CSW.
+                    if probe {
+                        session.poll(SessionEvent::OutIdle, work, &mut [&mut *dev]);
+                        continue;
+                    }
+                    // Data-Out payload (FORMAT UNIT parameter list etc.)
+                    let take = len.min(payload.len().saturating_sub(sent_payload)).max(1);
+                    let end = (sent_payload + take).min(payload.len());
+                    let chunk = if sent_payload < payload.len() {
+                        payload[sent_payload..end].to_vec()
+                    } else {
+                        vec![0u8; len]
+                    };
+                    sent_payload += chunk.len();
+                    session.poll(
+                        SessionEvent::OutRecv { data: &chunk },
+                        work,
+                        &mut [&mut *dev],
+                    );
+                }
+            }
+        }
+        (csw_status, out)
+    }
+
+    #[test]
+    fn windows_enumeration_and_format_flow() {
+        use crate::cdrom::media::CdMedia;
+        let mut img = vec![0u8; 2048 * 204800];
+        let mut scratch = [0u8; 256];
+        let mut dev = CdromDrive::new();
+        let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+        #[cfg(feature = "udf_void")]
+        {
+            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            dev.load_quiet(CdMedia::Rw(media));
+        }
+        #[cfg(not(feature = "udf_void"))]
+        dev.load_quiet(CdMedia::ro(&mut bb));
+
+        let mut session = BotSession::new();
+        // Production arms a reset-UA on link events before the first command.
+        session.reset();
+        let mut work = vec![0u8; crate::MIN_DATA_LEN];
+
+        macro_rules! run {
+            ($dirin:expr, $decl:expr, $cdb:expr, $payload:expr) => {{
+                let r = tx(
+                    &mut session,
+                    &mut dev,
+                    &mut work,
+                    $dirin,
+                    $decl,
+                    &$cdb,
+                    $payload,
+                );
+                assert_eq!(r.0, 0, "tx {:?} must pass", $cdb);
+                r.1
+            }};
+        }
+
+        // Attach burst: INQUIRY / VPD / GESN(class=00!) — the class-00 GESN is
+        // what used to fail with the stale A2 sense.
+        run!(true, 36, [0x12u8, 0, 0, 0, 0x24, 0], &[]);
+        run!(true, 96, [0x12u8, 0, 0, 0, 0x60, 0], &[]);
+        run!(true, 8, [0x4Au8, 1, 0, 0, 0x00, 0, 0, 0, 0x08, 0], &[]);
+
+        // Hosts open with TEST UNIT READY: delivers the core's reset-UA once,
+        // fetched via REQUEST SENSE (ASC 29h).
+        {
+            let tur = [0x00u8; 6];
+            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            assert_eq!(st, 1, "reset-UA delivered on first TUR");
+            let rs = [0x03u8, 0, 0, 0, 0x12, 0];
+            let (st, sense) = tx(&mut session, &mut dev, &mut work, true, 18, &rs, &[]);
+            assert_eq!(st, 0);
+            assert_eq!(sense[2], 0x06, "sense key UNIT ATTENTION");
+            assert_eq!(sense[12], 0x29, "POWER ON, RESET OR BUS DEVICE RESET");
+        }
+
+        // The A2 probe storm must keep failing without poisoning anything.
+        for _ in 0..3 {
+            let (st, _) = tx(
+                &mut session,
+                &mut dev,
+                &mut work,
+                false,
+                0,
+                &[0xA2u8, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0],
+                &[],
+            );
+            assert_eq!(st, 1);
+            assert_eq!(dev.peek_sense().map(|s| s.asc), Some(asc::INVALID_COMMAND));
+        }
+
+        // GET CONFIGURATION right after the storm — regression for #109.
+        let cfg = run!(true, 240, [0x46u8, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0], &[]);
+        assert_eq!(&cfg[..4], &[0x00, 0x00, 0x00, cfg[3]]);
+
+        // Media query set.
+        run!(true, 10, [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[]);
+        let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
+        assert_eq!(disc[2] & 0x03, 2, "disc status complete");
+        assert_ne!(disc[2] & 0x10, 0, "erasable");
+        let cap = run!(true, 20, [0x23u8, 0, 0, 0, 0, 0, 0, 0, 0x14, 0], &[]);
+        assert_eq!(&cap[17..20], &[0x00, 0x08, 0x00], "formattable TDP");
+
+        // MODE SENSE(10) page 2A: write DVD-RAM capability bit set.
+        let p2a = run!(
+            true,
+            0x48,
+            [0x5Au8, 0x08, 0x2A, 0, 0, 0, 0, 0, 0x48, 0],
+            &[]
+        );
+        assert_eq!(p2a[8], 0x2A);
+        assert_ne!(p2a[11] & 0x20, 0, "write DVD-RAM bit");
+
+        // dvd+rw-format style quick FORMAT UNIT (Immed), then UA once.
+        let nb = 204800u32.to_be_bytes();
+        let mut pl = Vec::new();
+        pl.extend_from_slice(&[0x00, 0xA2, 0x00, 0x08]);
+        pl.extend_from_slice(&nb);
+        pl.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]);
+        let fu = [0x04u8, 0x19, 0, 0, 0, 0];
+        let r = tx(&mut session, &mut dev, &mut work, false, 12, &fu, &pl);
+        assert_eq!(r.0, 0, "FORMAT UNIT must pass");
+
+        let tur = [0x00u8; 6];
+        let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+        assert_eq!(st, 1, "UA delivered on next TUR");
+        assert!(dev.peek_sense().is_none(), "UA consumed once");
+
+        // Polling resumes cleanly; medium now empty.
+        let gesn = run!(true, 8, [0x4Au8, 1, 0, 0, 0x10, 0, 0, 0, 0x08, 0], &[]);
+        assert_eq!(gesn[2], 0x84); // NEA=0, notification class = Media
+        assert_eq!(gesn[3], 0x10); // supported classes
+        assert_eq!(gesn[5], 0x02); // media present
+        let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
+        assert_eq!(disc[2] & 0x03, 0, "formatted → empty until host writes FS");
+
+        // Eject while PREVENT is held: refused with MEDIUM REMOVAL PREVENTED.
+        run!(false, 0, [0x1Eu8, 0, 0, 0, 0x01, 0], &[]);
+        let (st, _) = tx(
+            &mut session,
+            &mut dev,
+            &mut work,
+            false,
+            0,
+            &[0x1Bu8, 0, 0, 0, 0x02, 0],
+            &[],
+        );
+        assert_eq!(st, 1);
+        assert_eq!(
+            dev.peek_sense().map(|s| (s.asc, s.ascq)),
+            Some((0x53, 0x02))
+        );
+    }
+}
