@@ -391,6 +391,15 @@ impl BotSession {
         self.num_luns = devs.len().clamp(1, 16) as u8;
         let cdb = cbw.cdb_slice();
         let declared = u64::from(cbw.data_len);
+        let mut hx = [0u8; 49];
+        crate::debug!(
+            "bot cbw lun={} dir={:?} len={} tag={} cdb={}",
+            cbw.lun,
+            cbw.dir,
+            declared,
+            cbw.tag,
+            core::str::from_utf8(crate::cdrom::drive::hex_of(&mut hx, cdb)).unwrap_or("?")
+        );
 
         // REPORT LUNS is served for any addressed LUN (§5.3).
         if cdb.first() == Some(&scsi_op::REPORT_LUNS) {
@@ -621,6 +630,12 @@ impl BotSession {
         status: CswStatus,
     ) -> SessionStep<'a> {
         let actual = actual.min(declared);
+        crate::debug!(
+            "bot csw tag={} residue={} status={:?}",
+            tag,
+            declared - actual,
+            status
+        );
         let csw = Csw {
             tag,
             residue: (declared - actual) as u32,
