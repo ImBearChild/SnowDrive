@@ -412,6 +412,32 @@ impl<'a> CdromDrive<'a> {
         // PendingXfer is per-command: clear at entry.
         self.pending = None;
 
+        let spc = parse_spc(cdb);
+
+        // DELIBERATE SPEC DEVIATION, documented here so nobody "fixes" it
+        // back by accident. With a PREVENT latch set, the letter of the
+        // standards requires rejecting a LoEj ejection: SPC-3 §6.13 says the
+        // LU "shall not allow medium removal" and shall inhibit even
+        // operator mechanisms while prevention is in effect, and MMC-6 §6.13
+        // states plainly that such a START STOP UNIT "is rejected by the
+        // Drive". The compliant answer is CHECK CONDITION 05/53/02.
+        //
+        // We honour the request anyway and clear the latch: Windows' eject
+        // path never sends PREVENT=0 first (usbms-28/snow4), so strict
+        // compliance makes ejection permanently impossible against this
+        // guest. If strict semantics are ever wanted, gate this block
+        // behind a CLI flag.
+        let is_user_eject = matches!(
+            spc,
+            Some(SpcCommand::StartStop {
+                loej: true,
+                load: false,
+            })
+        );
+        if is_user_eject && self.prevent_removal {
+            self.prevent_removal = false;
+        }
+
         // Sense delivery rules (SPC-4 §5.14 / §7.9):
         // - REQUEST SENSE must ALWAYS reach the executor untouched: it has
         //   to serve whatever the last CHECK CONDITION carried. Neither the
@@ -421,17 +447,17 @@ impl<'a> CdromDrive<'a> {
         //   blinded Windows' eject retries.)
         // - A UNIT ATTENTION preempts exactly one other command — reported
         //   once as CHECK CONDITION carrying it, consumed on delivery —
-        //   except for INQUIRY / REPORT LUNS (SPC-4: these never clear a
-        //   unit attention).
+        //   except for INQUIRY / REPORT LUNS / REQUEST SENSE (SPC-4: these
+        //   never clear a unit attention) and the user eject above (a tray
+        //   button press neither reports nor clears it).
         // - Any other pending sense is inert for command dispatch: it must
         //   not preempt, but it is left in place so a following REQUEST
         //   SENSE can still report it; the next error simply overwrites it.
-        let spc_parsed = parse_spc(cdb);
-        let is_request_sense = matches!(spc_parsed, Some(SpcCommand::RequestSense { .. }))
-            || cdb_opcode(cdb) == Some(op::REQUEST_SENSE);
         if let Some(s) = self.peek_sense() {
-            let ua_bypass = is_request_sense
-                || matches!(spc_parsed, Some(SpcCommand::Inquiry { .. }))
+            let ua_bypass = is_user_eject
+                || matches!(spc, Some(SpcCommand::RequestSense { .. }))
+                || cdb_opcode(cdb) == Some(op::REQUEST_SENSE)
+                || matches!(spc, Some(SpcCommand::Inquiry { .. }))
                 || matches!(cdb_opcode(cdb), Some(op::INQUIRY) | Some(op::REPORT_LUNS));
             if s.key == SenseKey::UnitAttention && !ua_bypass {
                 let _ = self.take_sense(); // reported once — drop it

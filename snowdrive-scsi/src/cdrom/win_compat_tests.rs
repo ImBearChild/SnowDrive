@@ -455,7 +455,8 @@ mod enumeration_sequence {
         let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
         assert_eq!(disc[2] & 0x03, 0, "formatted → empty until host writes FS");
 
-        // Eject while PREVENT is held: refused with MEDIUM REMOVAL PREVENTED.
+        // Eject while PREVENT is held: the user intent overrides the lock —
+        // tray opens, GOOD, and the medium parks (NOT READY 3Ah/02h after).
         run!(false, 0, [0x1Eu8, 0, 0, 0, 0x01, 0], &[]);
         let (st, _) = tx(
             &mut session,
@@ -466,18 +467,19 @@ mod enumeration_sequence {
             &[0x1Bu8, 0, 0, 0, 0x02, 0],
             &[],
         );
-        assert_eq!(st, 1);
-        assert_eq!(
-            dev.peek_sense().map(|s| (s.asc, s.ascq)),
-            Some((0x53, 0x02))
-        );
-        // REQUEST SENSE must report exactly that (usbms-28: answering
-        // NO SENSE here made Windows retry the eject forever).
+        assert_eq!(st, 0, "user eject overrides PREVENT");
+        assert!(!dev.is_media_present());
         {
-            let rs = [0x03u8, 0, 0, 0, 0x12, 0];
-            let (st, sense) = tx(&mut session, &mut dev, &mut work, true, 18, &rs, &[]);
-            assert_eq!(st, 0);
-            assert_eq!((sense[2], sense[12], sense[13]), (0x05, 0x53, 0x02));
+            // First TUR delivers the eject's MEDIUM-MAY-HAVE-CHANGED UA…
+            let tur = [0x00u8; 6];
+            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            assert_eq!(st, 1);
+            assert!(dev.peek_sense().is_none(), "UA consumed once");
+            // …the next one reports the open tray.
+            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            assert_eq!(st, 1);
+            let s = dev.peek_sense().unwrap();
+            assert_eq!((s.asc, s.ascq), (asc::MEDIUM_NOT_PRESENT, 0x02));
         }
     }
 }
