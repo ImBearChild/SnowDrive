@@ -563,6 +563,18 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x0105 Timeout (Version 0001b, Group3=0)
 /// - 0x0107 Real-Time Streaming (Version 0101b, RBCB/SCS/MP2A)
 /// - 0x010A Disc Control Block (for DVD+RW media)
+///
+/// Feature header byte2 encoding (MMC-6 Table 88):
+/// `byte2 = (version << 3) | (persistent << 1) | current`.
+///
+/// P/C model: MMC-6 §5.2.2.3 forbids P=1 when C may be 0. Media-dependent
+/// features use the capability model (P=0, C=1 when active). Mechanism-level
+/// "always active" features (Core, Removable Medium, Morphing, Power Management,
+/// Timeout, RTS) use P=1, C=1.
+const fn feat_hdr(version: u8, persistent: bool, current: bool) -> u8 {
+    (version << 3) | ((persistent as u8) << 1) | (current as u8)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_get_config_features_for_media(
     buf: &mut [u8],
@@ -652,21 +664,21 @@ pub fn build_get_config_features_for_media(
             off += 1;
         }
     }
-    // Core (0x0001)
+    // Core (0x0001) — MMC-6 Table 93 Ver 0010b, mechanism-level always active.
     if include(0x0001) {
         buf[off] = 0x00;
         buf[off + 1] = 0x01;
-        buf[off + 2] = 0x03; // version 2 + persistent + current
+        buf[off + 2] = feat_hdr(2, true, true); // 0x13
         buf[off + 3] = 0x08; // additional length
         buf[off + 4..off + 8].copy_from_slice(&[0, 0, 0, 1]); // SCSI family
         buf[off + 8] = 0x06; // INQ2 | DBE
         off += 12;
     }
-    // Morphing (0x0002) — MMC-6 Table 96 Version 0001b Persistent+Current
+    // Morphing (0x0002) — MMC-6 Table 96 Ver 0001b, mechanism-level.
     if include(0x0002) {
         buf[off] = 0x00;
         buf[off + 1] = 0x02;
-        buf[off + 2] = 0x07; // Version 0001b + persistent + current
+        buf[off + 2] = feat_hdr(1, true, true); // 0x0B
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x02; // OCEvent=1 ASYNC=0
         buf[off + 5] = 0x00;
@@ -674,11 +686,11 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Removable Medium (0x0003)
+    // Removable Medium (0x0003) — MMC-6 Table 98 Ver 0010b, mechanism-level.
     if include(0x0003) {
         buf[off] = 0x00;
         buf[off + 1] = 0x03;
-        buf[off + 2] = 0x01; // current
+        buf[off + 2] = feat_hdr(2, true, true); // 0x13
         buf[off + 3] = 0x04; // additional length
                              // Byte 4: Loading Mechanism Type (bits 7-5) | Load | Eject | Pvnt
                              // Jmpr | DBML | Lock (MMC-6 Table 98) — same model as the 0x2A page.
@@ -688,70 +700,66 @@ pub fn build_get_config_features_for_media(
             | bit(caps.lock);
         off += 8;
     }
-    // Write Protect (0x0004) — reports the media write-protect state.
-    // Windows expects this feature; without it the disc is treated as
-    // write-protected. All protection bits are clear (not protected); the
-    // Current bit is 0 because this device does not change write protection.
-    // WDCB is also clear: the device can report the DCB, but does not claim
-    // support for modifying it with SEND DISC STRUCTURE.
+    // Write Protect (0x0004) — MMC-6 Table 101 Ver 0010b, P=1 C=0 (WP state
+    // doesn't change dynamically; C=0 because no WP control via GET CONFIG).
     if caps.write_protect && include(0x0004) {
         buf[off] = 0x00;
         buf[off + 1] = 0x04;
-        buf[off + 2] = 0x08; // version 2, current clear
+        buf[off + 2] = feat_hdr(2, true, false); // 0x12
         buf[off + 3] = 0x04; // additional length
         buf[off + 4..off + 8].copy_from_slice(&[0x00, 0, 0, 0]);
         off += 8;
     }
-    // Random Readable (0x0010) — persistent+current
+    // Random Readable (0x0010) — MMC-6 Table 104 Ver 0000b, capability model.
     if include(0x0010) {
         buf[off] = 0x00;
         buf[off + 1] = 0x10;
-        buf[off + 2] = 0x02 | u8::from(media.present);
+        buf[off + 2] = feat_hdr(0, false, media.present);
         buf[off + 3] = 0x08; // additional length
         buf[off + 4..off + 8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         buf[off + 8] = 0x00;
         buf[off + 9] = 0x01; // blocking = 1
         off += 12;
     }
-    // DVD-RAM Read (0x0012)
+    // DVD-RAM Read (0x0012) — capability model, current when DVD-RAM profile.
     if caps.read_dvd_ram && include(0x0012) {
         buf[off] = 0x00;
         buf[off + 1] = 0x12;
-        buf[off + 2] = 0x02 | u8::from(media.profile == CurrentProfile::DvdRam);
+        buf[off + 2] = feat_hdr(0, false, media.profile == CurrentProfile::DvdRam);
         buf[off + 3] = 0x00;
         off += 4;
     }
-    // Multi-Read (0x001D)
+    // Multi-Read (0x001D) — MMC-6 Table 107 Ver 0000b, capability model.
     if include(0x001D) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1D;
-        buf[off + 2] = 0x02 | u8::from(media.present);
+        buf[off + 2] = feat_hdr(0, false, media.present);
         off += 4;
     }
-    // CD Read (0x001E)
+    // CD Read (0x001E) — MMC-6 Table 109 Ver 0010b, capability model.
     if include(0x001E) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1E;
-        buf[off + 2] = 0x02 | u8::from(media.present);
+        buf[off + 2] = feat_hdr(2, false, media.present);
         buf[off + 3] = 0x04; // additional length
         off += 8;
     }
-    // DVD Read (0x001F) — caps-based, persistent+current
+    // DVD Read (0x001F) — MMC-6 Table 111 Ver 0010b, capability model.
     if caps.read_dvd_rom && include(0x001F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1F;
-        buf[off + 2] = 0x02
-            | u8::from(matches!(
-                media.profile,
-                CurrentProfile::DvdRom | CurrentProfile::DvdRam
-            ));
+        buf[off + 2] = feat_hdr(
+            2,
+            false,
+            matches!(media.profile, CurrentProfile::DvdRom | CurrentProfile::DvdRam),
+        );
         off += 4;
     }
-    // Random Writable (0x0020)
+    // Random Writable (0x0020) — MMC-6 Table 113 Ver 0001b, capability model.
     if caps.random_writable && include(0x0020) {
         buf[off] = 0x00;
         buf[off + 1] = 0x20;
-        buf[off + 2] = 0x06 | u8::from(media.random_writable);
+        buf[off + 2] = feat_hdr(1, false, media.random_writable);
         buf[off + 3] = 0x0C; // additional length
         buf[off + 4..off + 8].copy_from_slice(&last_lba.to_be_bytes());
         buf[off + 8..off + 12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
@@ -760,30 +768,30 @@ pub fn build_get_config_features_for_media(
         buf[off + 15] = 0x00;
         off += 16;
     }
-    // Incremental Streaming Writable (0x0021)
+    // Incremental Streaming Writable (0x0021) — MMC-6 Table 116 Ver 0011b.
+    // No DVD-R profile in CurrentProfile; current when write_dvd_r cap is set.
     if caps.write_dvd_r && include(0x0021) {
         buf[off] = 0x00;
         buf[off + 1] = 0x21;
-        buf[off + 2] = 0x07; // version 1, persistent+current
+        buf[off + 2] = feat_hdr(3, false, true);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4..off + 8].fill(0);
         off += 8;
     }
-    // Formattable (0x0023)
+    // Formattable (0x0023) — MMC-6 Table 121 Ver 0010b, capability model.
     if (caps.dvd_plus_rw || caps.random_writable) && include(0x0023) {
         buf[off] = 0x00;
         buf[off + 1] = 0x23;
-        buf[off + 2] = 0x0A | u8::from(media.formattable);
+        buf[off + 2] = feat_hdr(2, false, media.formattable);
         buf[off + 3] = 0x08;
         buf[off + 4..off + 12].fill(0);
         off += 12;
     }
-    // Hardware Defect Management (0x0024) — MMC-6 Table 123 Ver 0001b AddLen 04h
-    // Current when defect_management media, SSA=0, Mode Page 01h
+    // Hardware Defect Management (0x0024) — MMC-6 Table 123 Ver 0001b.
     if caps.defect_management && include(0x0024) {
         buf[off] = 0x00;
         buf[off + 1] = 0x24;
-        buf[off + 2] = 0x06 | u8::from(media.defect_management);
+        buf[off + 2] = feat_hdr(1, false, media.defect_management);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x00; // SSA=0, no spare area
         buf[off + 5] = 0x00;
@@ -791,19 +799,19 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Restricted Overwrite (0x0026)
+    // Restricted Overwrite (0x0026) — MMC-6 Table 129 Ver 0001b (per spec scan).
     if caps.write_dvd_rw && include(0x0026) {
         buf[off] = 0x00;
         buf[off + 1] = 0x26;
-        buf[off + 2] = 0x06 | u8::from(media.profile == CurrentProfile::DvdRw);
+        buf[off + 2] = feat_hdr(1, false, media.profile == CurrentProfile::DvdRw);
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // DVD+RW (0x002A)
+    // DVD+RW (0x002A) — MMC-6 §5.3.x Ver 0001b, capability model.
     if caps.dvd_plus_rw && include(0x002A) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2A;
-        buf[off + 2] = 0x06 | u8::from(media.profile == CurrentProfile::DvdRw);
+        buf[off + 2] = feat_hdr(1, false, media.profile == CurrentProfile::DvdRw);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x01; // Write
         buf[off + 5] = 0x00; // Quick Start / Close Only clear
@@ -811,11 +819,12 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // DVD+R (0x002B)
+    // DVD+R (0x002B) — MMC-6 §5.3.x Ver 0000b, capability model.
+    // No DVD+R profile in CurrentProfile; current when read/write cap is set.
     if (caps.read_dvd_plus_r || caps.write_dvd_plus_r) && include(0x002B) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2B;
-        buf[off + 2] = 0x06 | u8::from(media.profile == CurrentProfile::CdR);
+        buf[off + 2] = feat_hdr(0, false, true);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x01; // Write
         buf[off + 5] = 0x00;
@@ -823,19 +832,19 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // DVD-R/-RW Write (0x002F)
+    // DVD-R/-RW Write (0x002F) — MMC-6 Table 155 Ver 0010b, capability model.
     if (caps.write_dvd_r || caps.write_dvd_rw) && include(0x002F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2F;
-        buf[off + 2] = 0x06 | u8::from(media.profile == CurrentProfile::DvdRw);
+        buf[off + 2] = feat_hdr(2, false, media.profile == CurrentProfile::DvdRw);
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // CD-RW Media Write Support (0x0037) — MMC-4 Table 163.
+    // CD-RW Media Write Support (0x0037) — MMC-6 Table 163 Ver 0000b (low risk).
     if caps.write_cdrw && include(0x0037) {
         buf[off] = 0x00;
         buf[off + 1] = 0x37;
-        buf[off + 2] = 0x02 | u8::from(media.profile == CurrentProfile::CdRw);
+        buf[off + 2] = feat_hdr(0, false, media.profile == CurrentProfile::CdRw);
         buf[off + 3] = 0x04; // additional length 4
         buf[off + 4] = 0x00; // reserved
         buf[off + 5] = 0x0F; // multi|high|ultra|ultra+
@@ -843,19 +852,19 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Power Management (0x0100) — MMC-6 Table 178 Version 0000b
+    // Power Management (0x0100) — MMC-6 Table 178 Ver 0000b, mechanism-level.
     if include(0x0100) {
         buf[off] = 0x01;
         buf[off + 1] = 0x00;
-        buf[off + 2] = 0x03; // Version 0000b + persistent + current
+        buf[off + 2] = feat_hdr(0, true, true); // 0x03
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // Timeout (0x0105) — MMC-6 Table 186 Version 0001b AddLen 04h
+    // Timeout (0x0105) — MMC-6 §5.3.x Ver 0001b, mechanism-level.
     if include(0x0105) {
         buf[off] = 0x01;
         buf[off + 1] = 0x05;
-        buf[off + 2] = 0x07; // Version 0001b + persistent + current
+        buf[off + 2] = feat_hdr(1, true, true); // 0x0B
         buf[off + 3] = 0x04;
         buf[off + 4] = 0x00; // Group3=0
         buf[off + 5] = 0x00;
@@ -863,11 +872,11 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Real-Time Streaming (0x0107) — MMC-6 Table 190 Version 0101b
+    // Real-Time Streaming (0x0107) — MMC-6 Table 190 Ver 0101b, mechanism-level.
     if include(0x0107) {
         buf[off] = 0x01;
         buf[off + 1] = 0x07;
-        buf[off + 2] = 0x17; // Version 0101b + persistent + current
+        buf[off + 2] = feat_hdr(5, true, true); // 0x2B
         buf[off + 3] = 0x04;
         buf[off + 4] = 0x1C; // RBCB=1 SCS=1 MP2A=1
         buf[off + 5] = 0x00;
@@ -876,11 +885,11 @@ pub fn build_get_config_features_for_media(
         off += 8;
     }
     // MRW (Mount Rainier, 0x0028) is deliberately NOT reported
-    // Disc Control Block (0x010A)
+    // Disc Control Block (0x010A) — capability model.
     if caps.dvd_plus_rw && include(0x010A) {
         buf[off] = 0x01;
         buf[off + 1] = 0x0A;
-        buf[off + 2] = 0x02 | u8::from(media.profile == CurrentProfile::DvdRw);
+        buf[off + 2] = feat_hdr(0, false, media.profile == CurrentProfile::DvdRw);
         buf[off + 3] = 0x0C;
         buf[off + 4..off + 16].copy_from_slice(b"FDC\0SDC\0TOC\0");
         off += 16;
@@ -1584,7 +1593,8 @@ mod tests {
             match code {
                 0x0020 => {
                     saw_rw = true;
-                    assert_eq!(buf[off + 2], 0x07); // version 1, persistent+current
+                    // MMC-6 Table 113 Ver 0001b, capability model (P=0, C=1).
+                    assert_eq!(buf[off + 2], 0x09);
                     assert_eq!(add_len, 12);
                     assert_eq!(&buf[off + 4..off + 8], &0x1234u32.to_be_bytes());
                     assert_eq!(&buf[off + 8..off + 12], &2048u32.to_be_bytes());
@@ -1646,7 +1656,8 @@ mod tests {
             match code {
                 0x0002 => {
                     saw_0002 = true;
-                    assert_eq!(ver_pers_cur, 0x07, "Morphing Version 0001b + P+C");
+                    // MMC-6 Table 96 Ver 0001b + P + C = 0x0B
+                    assert_eq!(ver_pers_cur, 0x0B, "Morphing Ver 0001b + P+C");
                     assert_eq!(add_len, 0x04);
                     assert_eq!(check[off + 4], 0x02, "OCEvent=1");
                 }
@@ -1655,23 +1666,26 @@ mod tests {
                     saw_0024_len = Some(add_len);
                     saw_0024_ssa = Some(check[off + 4]);
                     assert_eq!(add_len, 0x04);
-                    // Version 0001b (0x04) + Persistent 1 (0x02) + Current 1 =0x07
-                    assert_eq!(ver_pers_cur, 0x07, "0024 ver 0001b + P + Current");
+                    // MMC-6 Table 123 Ver 0001b, capability model = 0x09
+                    assert_eq!(ver_pers_cur, 0x09, "0024 Ver 0001b + C (P=0)");
                     assert_eq!(check[off + 4] & 0x80, 0x00, "SSA=0");
                 }
                 0x0100 => {
                     saw_0100 = true;
+                    // MMC-6 Table 178 Ver 0000b + P + C = 0x03
                     assert_eq!(ver_pers_cur, 0x03);
                     assert_eq!(add_len, 0x00);
                 }
                 0x0105 => {
                     saw_0105 = true;
-                    assert_eq!(ver_pers_cur, 0x07);
+                    // MMC-6 §5.3.x Ver 0001b + P + C = 0x0B
+                    assert_eq!(ver_pers_cur, 0x0B);
                     assert_eq!(add_len, 0x04);
                 }
                 0x0107 => {
                     saw_0107 = true;
-                    assert_eq!(ver_pers_cur, 0x17);
+                    // MMC-6 Table 190 Ver 0101b + P + C = 0x2B
+                    assert_eq!(ver_pers_cur, 0x2B);
                     assert_eq!(add_len, 0x04);
                 }
                 0x0008 => panic!("old defect code 0x0008 must not be emitted, should be 0x0024"),
@@ -1694,7 +1708,7 @@ mod tests {
         assert!(saw_0100, "Power Management 0100 missing");
         assert!(saw_0105, "Timeout 0105 missing");
         assert!(saw_0107, "Real-Time Streaming 0107 missing");
-        assert_eq!(saw_0024_ver, Some(0x07));
+        assert_eq!(saw_0024_ver, Some(0x09));
         assert_eq!(saw_0024_len, Some(0x04));
         assert_eq!(saw_0024_ssa, Some(0x00));
         // Defect management must be Current when media defect_management true
@@ -1728,8 +1742,8 @@ mod tests {
         }
         assert_eq!(
             ver_off,
-            Some(0x06),
-            "defect_management false -> Current 0 => 0x06"
+            Some(0x08),
+            "defect_management false -> Current 0 => 0x08 (Ver 0001b, P=0, C=0)"
         );
     }
 }
