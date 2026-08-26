@@ -462,7 +462,9 @@ impl<'a> CdromDrive<'a> {
                 || matches!(spc, Some(SpcCommand::Inquiry { .. }))
                 || matches!(
                     cdb_opcode(cdb),
-                    Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::GET_CONFIGURATION)
+                    Some(op::INQUIRY)
+                        | Some(op::REPORT_LUNS)
+                        | Some(op::GET_CONFIGURATION)
                         | Some(op::GET_EVENT_STATUS_NOTIFICATION)
                 );
             if s.key == SenseKey::UnitAttention && !ua_bypass {
@@ -851,10 +853,14 @@ impl<'a> CdromDrive<'a> {
         if !self.loaded() {
             return self.not_ready();
         }
+        // SBC-3 §5.15.2: PMI=0 requires LBA=0; PMI=1 requires LBA ≤ RETURNED LBA.
+        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
+        if pmi && req_lba > max_lba {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         data[0..4].copy_from_slice(&max_lba.to_be_bytes());
         data[4..8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         CommandOutcome::OutInline { len: 8 }
