@@ -97,6 +97,7 @@ pub enum SpcCommand {
         load: bool,
     },
     SendDiagnostic {
+        self_test_code: u8,
         pf: bool,
         self_test: bool,
         param_list_len: u16,
@@ -151,8 +152,11 @@ pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
             load: cdb[4] & 0x01 != 0,
         }),
         op::SEND_DIAGNOSTIC => Some(SpcCommand::SendDiagnostic {
-            pf: cdb[1] & 0x08 != 0,
-            self_test: cdb[1] & 0x02 != 0,
+            // SPC-3 Table 171: byte1 = Self-Test Code(7:5) | PF(4=0x10) |
+            // Reserved(3) | Self-Test(2=0x04) | DevOffL(1) | UnitOffL(0).
+            self_test_code: (cdb[1] >> 5) & 0x07,
+            pf: cdb[1] & 0x10 != 0,
+            self_test: cdb[1] & 0x04 != 0,
             param_list_len: (u16::from(cdb[3]) << 8) | u16::from(cdb[4]),
         }),
         op::RECEIVE_DIAGNOSTIC => Some(SpcCommand::ReceiveDiagnosticResults {
@@ -263,12 +267,23 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             }
         },
 
-        // SEND DIAGNOSTIC is GOOD only for
-        // PF=1 + SELFTEST=0 (SPC-3 table 171 — PF = bit 3 = 0x08,
-        // SELFTEST = bit 1 = 0x02). The legacy C check `cdb[1] & 0x04`
-        // probed the reserved bit and was dropped.
-        SpcCommand::SendDiagnostic { pf, self_test, .. } => {
-            if pf && !self_test {
+        // SPC-3 Table 171: byte1 = Self-Test Code(7:5) | PF(4=0x10) |
+        // Reserved(3) | Self-Test(2=0x04) | DevOffL(1) | UnitOffL(0).
+        // §6.28: support default self-test (SELFTEST=1, param len 0) at minimum.
+        SpcCommand::SendDiagnostic {
+            self_test_code,
+            pf,
+            self_test,
+            param_list_len,
+        } => {
+            if self_test_code != 0 {
+                // Unsupported self-test code (only 000b default is supported).
+                cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD)
+            } else if self_test && param_list_len == 0 {
+                // Default self-test (§6.28 minimum requirement).
+                CommandOutcome::Status
+            } else if pf && !self_test {
+                // PF bit set, no self-test (vendor-specific diagnostic).
                 CommandOutcome::Status
             } else {
                 cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD)
@@ -544,11 +559,13 @@ mod tests {
 
         let mut cdb = [0u8; 6];
         cdb[0] = op::SEND_DIAGNOSTIC;
-        cdb[1] = 0x0A; /* PF=1, SELFTEST=1 */
+        // SPC-3 Table 171: PF=0x10 (bit 4), SELFTEST=0x04 (bit 2).
+        cdb[1] = 0x14; /* PF=1, SELFTEST=1 */
         cdb[4] = 4;
         assert_eq!(
             parse_spc(&cdb),
             Some(SpcCommand::SendDiagnostic {
+                self_test_code: 0,
                 pf: true,
                 self_test: true,
                 param_list_len: 4
@@ -780,16 +797,42 @@ mod tests {
         let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::SEND_DIAGNOSTIC;
-        cdb[1] = 0x08; /* PF=1, SELFTEST=0 */
+        // SPC-3 Table 171: PF = bit 4 = 0x10, SELFTEST = bit 2 = 0x04.
+        cdb[1] = 0x10; /* PF=1, SELFTEST=0 */
         assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
     }
 
     #[test]
-    fn execute_send_diagnostic_selftest_rejected() {
+    fn execute_send_diagnostic_default_selftest_is_good() {
+        // SPC-3 §6.28: default self-test (SELFTEST=1, param len 0) must succeed.
         let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::SEND_DIAGNOSTIC;
-        cdb[1] = 0x0A; /* PF=1, SELFTEST=1 */
+        cdb[1] = 0x04; /* SELFTEST=1, param len 0 */
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+    }
+
+    #[test]
+    fn execute_send_diagnostic_selftest_with_params_rejected() {
+        // SELFTEST=1 with non-zero param list len is invalid.
+        let mut dev = TestDev::new();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::SEND_DIAGNOSTIC;
+        cdb[1] = 0x04; /* SELFTEST=1 */
+        cdb[3] = 0x02; /* param list len = 512 */
+        let outcome = run_static(&mut dev, &cdb);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
+    }
+
+    #[test]
+    fn execute_send_diagnostic_unsupported_code_rejected() {
+        // Non-zero self-test code (bits 7:5) is unsupported.
+        let mut dev = TestDev::new();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::SEND_DIAGNOSTIC;
+        cdb[1] = 0x20; /* Self-Test Code = 001b */
         let outcome = run_static(&mut dev, &cdb);
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
