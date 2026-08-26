@@ -298,42 +298,12 @@ impl CdromCapabilities {
 }
 /// The capabilities of the read-only CD-ROM devices (flat / livefs).
 pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
-/// Capabilities of the UdfRw device: reads DVD media and presents a
-/// formatted, random-writable DVD-RAM (features 0x0024 + 0x0020).
-pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities {
-    tray: true,
-    load: true,
-    eject: true,
-    lock: true,
-    mode2_form1: true,
-    mode2_form2: false,
-    multi_session: true,
-    cd_da: false,
-    read_cdr: true,
-    read_cdrw: true,
-    read_dvd_rom: true,
-    random_writable: true,
-    dvd_plus_rw: false,
-    write_protect: true,
-    defect_management: true,
-    write_cdr: true,
-    write_cdrw: true,
-    test_write: true,
-    burn_proof: true,
-    read_dvd_r: false,
-    read_dvd_ram: true,
-    read_dvd_rw: false,
-    read_dvd_plus_r: false,
-    write_dvd_r: false,
-    write_dvd_ram: true,
-    write_dvd_rw: false,
-    write_dvd_plus_r: false,
-    dual_layer: false,
-    num_volume_levels: 0,
-    buffer_size: 0,
-    max_read_speed: 0x2B48,
-    max_write_speed: 0x2B48,
-};
+/// Capabilities of the UdfRw device: a HyperMulti optical drive that
+/// advertises the full CD/DVD read/write capability set via hyper_multi().
+/// The actual inserted media (DVD-RAM via UDF-RW) still drives the Current
+/// bits in GET CONFIGURATION — this declares what the drive *can* support,
+/// not what the current medium exposes.
+pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities::hyper_multi();
 /// Full HyperMulti recorder capabilities — the default for the SnowDrive
 /// CD/DVD device.  Reads and writes every CD/DVD variant including
 /// dual-layer; capabilities are intrinsic to the drive and never depend on
@@ -1310,7 +1280,7 @@ mod tests {
         assert_eq!(removable_payload, 0x39);
     }
     #[test]
-    fn cdrom_get_config_udfrw_features_no_mrw() {
+    fn cdrom_get_config_udfrw_features_hyper_multi() {
         let mut w = work();
         let profile = CurrentProfile::DvdRam;
         let outcome = build_get_config_response(
@@ -1325,21 +1295,24 @@ mod tests {
         );
         let mut buf = [0u8; 256];
         let n = data_in(outcome, &w, &mut buf);
-        // DVD-RAM exposes Random Writable and Formattable, but not DVD+RW
-        // or MRW.
+        // HyperMulti: all capabilities are reported, including DVD+RW and MRW.
         let mut off = 8;
         let mut saw_random = false;
         let mut saw_formattable = false;
         let mut saw_dvdrw = false;
+        let mut saw_mrw = false;
         while off + 4 <= n {
             let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
             let add_len = buf[off + 3] as usize;
             saw_random |= code == 0x0020;
             saw_formattable |= code == 0x0023;
             saw_dvdrw |= code == 0x002A;
+            saw_mrw |= code == 0x0028;
             off += 4 + add_len;
         }
-        assert!(saw_random && saw_formattable && !saw_dvdrw);
+        assert!(saw_random && saw_formattable && saw_dvdrw);
+        // MRW (0x0028) is deliberately NOT implemented even if caps say so.
+        assert!(!saw_mrw);
     }
     #[test]
     fn cdrom_get_config_udfrw_write_protect_clear() {
