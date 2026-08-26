@@ -1380,6 +1380,18 @@ impl<'a> Gadget<'a> for FfsGadget {
                     },
                 })
             }
+            // CLEAR FEATURE(ENDPOINT_HALT): bmRequestType 0x02 = Recipient=
+            // Endpoint, Host-to-Device, Standard. request=0x01 (CLEAR_FEATURE),
+            // value=0x00 (ENDPOINT_HALT). index=endpoint address.
+            // BOT §3.1: BotReset preserves STALL; the host must send this to
+            // clear it and resume operation.
+            Event::SetupHostToDevice(receiver)
+                if receiver.ctrl_req().request_type == 0x02
+                    && receiver.ctrl_req().request == 0x01
+                    && receiver.ctrl_req().value == 0x00 =>
+            {
+                Some(CtrlReq::ClearFeatureHalt)
+            }
             Event::Bind | Event::Enable | Event::Disable => Some(CtrlReq::LinkReset),
             _ => None,
         }
@@ -1412,7 +1424,12 @@ fn serve_bot(
                 CtrlReq::BotReset { ack } => {
                     session.reset();
                     ack.ack();
-                    stalled = false;
+                    // BOT §3.1: BotReset preserves STALL. The core keeps the
+                    // STALLed state; clear_feature_halt() transitions out.
+                    // Only clear our local flag if the core did not stay STALLed.
+                    if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
+                        stalled = false;
+                    }
                 }
                 CtrlReq::GetMaxLun { mut reply } => {
                     reply
@@ -1421,6 +1438,12 @@ fn serve_bot(
                 }
                 CtrlReq::LinkReset => {
                     session.reset();
+                    if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
+                        stalled = false;
+                    }
+                }
+                CtrlReq::ClearFeatureHalt => {
+                    session.clear_feature_halt();
                     stalled = false;
                 }
             }

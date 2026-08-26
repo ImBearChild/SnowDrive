@@ -255,11 +255,31 @@ impl BotSession {
     /// Bulk-Only Reset / LinkReset: abort any in-flight transaction, return
     /// to the Command phase, and inject a UNIT ATTENTION for the next
     /// TEST UNIT READY (BOT §4.2, §5.2).
+    ///
+    /// Per BOT §3.1, a Bulk-Only Reset **preserves** the endpoint STALL
+    /// condition. If the session is currently STALLed (invalid CBW), the
+    /// reset keeps it STALLed until the host sends CLEAR FEATURE(ENDPOINT_HALT);
+    /// see [`clear_feature_halt`](Self::clear_feature_halt).
     pub fn reset(&mut self) {
-        self.state = BotState::Command { got: 0 };
         self.cbw = [0u8; CBW_LEN];
         self.invalid_lun_sense = None;
         self.pending_ua = Some(Sense::new(SenseKey::UnitAttention, asc::POWER_ON_RESET, 0));
+        // BOT §3.1: preserve STALL across BotReset. Only leave the STALLed
+        // state via CLEAR FEATURE(ENDPOINT_HALT).
+        if !matches!(self.state, BotState::Stalled) {
+            self.state = BotState::Command { got: 0 };
+        }
+    }
+
+    /// CLEAR FEATURE(ENDPOINT_HALT): clear a bulk-endpoint STALL condition
+    /// (USB 2.0 §9.4.1) and return to the Command phase.
+    ///
+    /// Per BOT §3.1, the host must send this request after a BotReset that
+    /// preserved a STALL condition to resume normal operation.
+    pub fn clear_feature_halt(&mut self) {
+        if matches!(self.state, BotState::Stalled) {
+            self.state = BotState::Command { got: 0 };
+        }
     }
 
     /// Non-blocking state-machine step: consume one event and return the
@@ -1537,9 +1557,13 @@ mod tests {
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         assert_eq!(step, SessionStep::Done(BotStepResult::Stalled));
 
-        // Reset unfreezes; a valid CBW is then processed (INQUIRY, since the
-        // injected unit attention would intercept TEST UNIT READY).
+        // BOT §3.1: BotReset preserves the STALL condition. The session stays
+        // STALLed until CLEAR FEATURE(ENDPOINT_HALT) is received.
         s.reset();
+        assert_eq!(s.need(), SessionNeed::Done(BotStepResult::Stalled));
+
+        // CLEAR FEATURE(ENDPOINT_HALT) unfreezes; a valid CBW is then processed.
+        s.clear_feature_halt();
         assert_eq!(
             s.need(),
             SessionNeed::NeedOut {

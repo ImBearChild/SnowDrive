@@ -161,6 +161,7 @@ fn serve_ctrl_once(session: &mut BotSession, gadget: &mut MockGadget) -> bool {
                 reply.send(&[session.max_lun()]).unwrap();
             }
             CtrlReq::LinkReset => session.reset(),
+            CtrlReq::ClearFeatureHalt => session.clear_feature_halt(),
         }
         true
     } else {

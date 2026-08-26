@@ -41,6 +41,10 @@ pub enum CtrlReq<A: CtrlAck, R: CtrlReply> {
     GetMaxLun { reply: R },
     /// Link-level event (bind / enable / disable) — equivalent to a reset.
     LinkReset,
+    /// CLEAR FEATURE(ENDPOINT_HALT) on a bulk endpoint (USB 2.0 §9.4.1).
+    /// The driver must call `BotSession::clear_feature_halt()` to clear a
+    /// STALL condition preserved across a BotReset (BOT §3.1).
+    ClearFeatureHalt,
 }
 
 /// The control-plane driver seam.
