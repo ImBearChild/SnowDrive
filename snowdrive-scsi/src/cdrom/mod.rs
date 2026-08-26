@@ -51,7 +51,9 @@ pub mod media;
 #[cfg(feature = "udf_void")]
 pub mod udfrw;
 
-#[cfg(all(test, feature = "usb"))]
+// Windows-compatibility regression tests require UDF-RW media (udf_void)
+// to exercise the DVD-RAM profile that the captured traffic targets.
+#[cfg(all(test, feature = "usb", feature = "udf_void"))]
 mod win_compat_tests;
 
 pub use common::{

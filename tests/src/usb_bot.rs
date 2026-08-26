@@ -76,8 +76,10 @@ fn on_stalled(
             *stalled = true;
             return Some(BotStepResult::Stalled);
         }
-        // No STALL capability: drop the CBW and return to Command.
-        session.reset();
+        // No STALL capability (BOT §4.5): drop the CBW and return to
+        // Command. clear_feature_halt() transitions out of the STALLed
+        // state without injecting a UA (unlike reset()).
+        session.clear_feature_halt();
         return None;
     }
     Some(BotStepResult::Stalled)
@@ -579,9 +581,10 @@ fn invalid_cbw_with_stall_available_freezes_until_reset() {
     assert_eq!(r, BotStepResult::Stalled);
     assert_eq!(io.stall_count, 1);
 
-    // Reset unfreezes; a valid CBW (INQUIRY; the injected UA would
-    // intercept TEST UNIT READY) is then processed.
+    // BOT §3.1: BotReset preserves STALL. The host must send
+    // CLEAR FEATURE(ENDPOINT_HALT) to unfreeze.
     s.reset();
+    s.clear_feature_halt();
     stalled = false;
     let cdb = [0x12, 0, 0, 0, 36, 0];
     let r = run_command(
