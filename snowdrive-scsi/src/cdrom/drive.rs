@@ -454,11 +454,17 @@ impl<'a> CdromDrive<'a> {
         //   not preempt, but it is left in place so a following REQUEST
         //   SENSE can still report it; the next error simply overwrites it.
         if let Some(s) = self.peek_sense() {
+            // MMC-6 §4.1.6.1: GET CONFIGURATION / GESN must not be terminated
+            // by Unit Attention (same exemption as INQUIRY / REQUEST SENSE).
             let ua_bypass = is_user_eject
                 || matches!(spc, Some(SpcCommand::RequestSense { .. }))
                 || cdb_opcode(cdb) == Some(op::REQUEST_SENSE)
                 || matches!(spc, Some(SpcCommand::Inquiry { .. }))
-                || matches!(cdb_opcode(cdb), Some(op::INQUIRY) | Some(op::REPORT_LUNS));
+                || matches!(
+                    cdb_opcode(cdb),
+                    Some(op::INQUIRY) | Some(op::REPORT_LUNS) | Some(op::GET_CONFIGURATION)
+                        | Some(op::GET_EVENT_STATUS_NOTIFICATION)
+                );
             if s.key == SenseKey::UnitAttention && !ua_bypass {
                 let _ = self.take_sense(); // reported once — drop it
                 return Ok(CommandOutcome::CheckCondition);

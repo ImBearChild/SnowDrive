@@ -213,6 +213,10 @@ fn win_rejected_probe_does_not_poison_next_command() {
 
 /// UNIT ATTENTION keeps its preemption semantics: reported exactly once on
 /// the next non-bypass command, consumed on delivery.
+///
+/// MMC-6 §4.1.6.1: GET CONFIGURATION (0x46) and GESN (0x4A) are exempt from
+/// UA preemption (same as INQUIRY / REQUEST SENSE). The UA remains pending
+/// until a non-bypassed command delivers it.
 #[test]
 fn win_ua_still_reports_once() {
     use crate::scsi::scsi::{asc, Sense, SenseKey};
@@ -235,16 +239,38 @@ fn win_ua_still_reports_once() {
         asc::MEDIUM_MAY_HAVE_CHANGED,
         0,
     ));
+
+    // GESN (0x4A) must bypass UA per MMC-6 §4.1.6.1 — UA stays pending.
     let gesn = [0x4Au8, 1, 0, 0, 0x10, 0, 0, 0, 0x08, 0];
+    let out = dev.do_cmd(&gesn, &mut w).unwrap();
+    assert!(
+        matches!(out, CommandOutcome::OutInline { .. }),
+        "GESN must not be preempted by UA"
+    );
+    assert!(
+        dev.peek_sense().is_some(),
+        "UA must remain pending after GESN (bypassed)"
+    );
+
+    // GET CONFIGURATION (0x46) must also bypass UA per MMC-6 §4.1.6.1.
+    let getcfg = [0x46u8, 0, 0, 0, 0, 0, 0, 0, 0x08, 0];
+    let out = dev.do_cmd(&getcfg, &mut w).unwrap();
+    assert!(
+        matches!(out, CommandOutcome::OutInline { .. }),
+        "GET CONFIGURATION must not be preempted by UA"
+    );
+    assert!(
+        dev.peek_sense().is_some(),
+        "UA must remain pending after GET CONFIGURATION (bypassed)"
+    );
+
+    // A non-bypassed command (e.g. MODE SENSE(6)) delivers the UA exactly once.
+    let mode_sense = [0x1Au8, 0, 0x3F, 0, 0x08, 0];
     assert_eq!(
-        dev.do_cmd(&gesn, &mut w).unwrap(),
+        dev.do_cmd(&mode_sense, &mut w).unwrap(),
         CommandOutcome::CheckCondition
     );
     assert!(dev.peek_sense().is_none(), "UA delivered once");
-    assert_eq!(
-        dev.do_cmd(&gesn, &mut w).unwrap(),
-        CommandOutcome::OutInline { len: 8 }
-    );
 }
 
 // ── Scripted Windows enumeration sequence ───────────────────────────
