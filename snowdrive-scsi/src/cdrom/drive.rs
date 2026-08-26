@@ -546,7 +546,8 @@ impl<'a> CdromDrive<'a> {
                     let Some(lba) = cdb_lba10(cdb) else {
                         return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
                     };
-                    self.read_capacity_10_cmd(cdb[1] & 0x01 != 0, lba, data)
+                    // SBC-3 Table 62: PMI is byte 8 bit 0; byte 1 bit 0 is Obsolete.
+                    self.read_capacity_10_cmd(cdb[8] & 0x01 != 0, lba, data)
                 }
 
                 // ── READ CAPACITY(16) ───────────────────────────

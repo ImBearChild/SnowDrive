@@ -422,10 +422,15 @@ impl<D: FlatData> BlockDevice<D> {
         req_lba: u32,
         data: &mut [u8],
     ) -> CommandOutcome {
+        // SBC-3 Table 62 / §5.15.2: PMI=0 requires LBA=0; PMI=1 requires
+        // LBA ≤ RETURNED LBA.
+        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
         if !pmi && req_lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
-        let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
+        if pmi && req_lba > max_lba {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         let mut buf = [0u8; 8];
         buf[0..4].copy_from_slice(&max_lba.to_be_bytes());
         buf[4..8].copy_from_slice(&self.sector_size.to_be_bytes());

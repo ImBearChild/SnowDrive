@@ -113,7 +113,8 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
             count: cdb_transfer_len16(cdb)?,
         }),
         op::READ_CAPACITY_10 => Some(SbcCommand::ReadCapacity10 {
-            pmi: cdb[1] & 0x01 != 0,
+            // SBC-3 Table 62: PMI is byte 8 bit 0; byte 1 bit 0 is Obsolete.
+            pmi: cdb[8] & 0x01 != 0,
             lba: (u32::from(cdb[2]) << 24)
                 | (u32::from(cdb[3]) << 16)
                 | (u32::from(cdb[4]) << 8)
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn parse_read_capacity_10() {
         let mut cdb = make_cdb10(op::READ_CAPACITY_10, 0, 0);
-        cdb[1] = 0x01; /* PMI */
+        cdb[8] = 0x01; /* PMI (SBC-3 Table 62: byte 8 bit 0) */
         assert_eq!(
             parse_sbc(&cdb),
             Some(SbcCommand::ReadCapacity10 { pmi: true, lba: 0 })
