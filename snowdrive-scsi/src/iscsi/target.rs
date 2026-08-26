@@ -1453,10 +1453,31 @@ impl IscsiSession {
 
     fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
+        let itt = bhs.itt();
+        let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
+
+        if itt == 0xFFFF_FFFF {
+            // RFC 3720 §10.18.1: ITT=0xFFFFFFFF requires I bit set, no response,
+            // CmdSN not advanced.
+            if !immediate_flag {
+                return self.reject(work, reject::PROTOCOL_ERROR, bhs);
+            }
+            return SessionStep::NeedRecv;
+        }
+
+        // RFC 3720 §3.2.2.1: non-immediate commands advance CmdSN.
+        if !immediate_flag {
+            let recv_cmd_sn = bhs.cmd_sn();
+            if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
+                return SessionStep::NeedRecv;
+            }
+            self.cmd_sn = recv_cmd_sn;
+        }
+
         let mut resp = Bhs::new();
         resp.set_opcode(op::NOP_IN);
         resp.set_flags(flag::F_BIT);
-        resp.set_itt(bhs.itt());
+        resp.set_itt(itt);
         resp.set_ttt(bhs.ttt());
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
