@@ -432,7 +432,7 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
-    // INQUIRY response is 95 bytes; the host declared 192 → short + residue.
+    // INQUIRY alloc 95 truncates the 96-byte response; host declared 192 → short + residue.
     let cdb = [0x12, 0, 0, 0, 95, 0];
     let r = run_command(
         &mut s,

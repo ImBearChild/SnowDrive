@@ -15,7 +15,7 @@ const INQUIRY_STD_LEN: usize = 96;
 const VPD_PAGE_LIST_LEN: usize = 7;
 /// VPD 0x80 unit serial length (4 header + 16 serial).
 const VPD_SERIAL_LEN: usize = 20;
-/// VPD 0x83 device identification length (4 header + 4 descriptor + 8 NAA-3).
+/// VPD 0x83 device identification length (4 header + 4 descriptor + 8 NAA-5).
 const VPD_ID_LEN: usize = 16;
 /// REQUEST SENSE response length (fixed format).
 const SENSE_LEN: usize = 18;
@@ -176,7 +176,7 @@ pub trait SpcDevice {
         0
     }
     /// Capacity-derived identifier used for VPD 0x80 (unit serial) and VPD
-    /// 0x83 (NAA-3) synthesis.
+    /// 0x83 (NAA-5) synthesis.
     fn id(&self) -> u64;
     /// Bytes of the mode page(s) for `page` (`0x3F` = every supported page).
     /// `None` for unsupported pages.

@@ -248,19 +248,19 @@ def _test_csw_rejects_bad_signature():
 def _test_full_good_transaction():
     """Full CBW→Data→CSW round-trip with GOOD status."""
     cdb = bytes([0x12, 0, 0, 0, 96, 0])  # INQUIRY, alloc=96
-    inquiry_resp = bytes(range(95))  # 95-byte INQUIRY response
+    inquiry_resp = bytes(range(96))  # 96-byte INQUIRY response (SPC-3 Table 81)
     frames = [
         ("OUT", _cbw(1, 96, "IN", 0, cdb)),
         ("IN", inquiry_resp),
-        ("IN", _csw(1, 1, "GOOD")),  # residue=1 because 95 < 96
+        ("IN", _csw(1, 0, "GOOD")),  # residue=0: 96 == 96
     ]
     txns = _run(_build_pcapng(frames))
     _check(len(txns) == 1, f"expected 1 txn, got {len(txns)}")
     t = txns[0]
     _check(t.cbw.cdb[0] == 0x12, f"opcode={t.cbw.cdb[0]:#x}")
     _check(t.csw_status == "GOOD", f"status={t.csw_status}")
-    _check(t.csw_residue == 1, f"residue={t.csw_residue}")
-    _check(len(t.data_in) == 95, f"data_in len={len(t.data_in)}")
+    _check(t.csw_residue == 0, f"residue={t.csw_residue}")
+    _check(len(t.data_in) == 96, f"data_in len={len(t.data_in)}")
 
 
 def _test_failed_csw_check_condition():
@@ -303,7 +303,7 @@ def _test_unit_attention_correlation():
 def _test_inquiry_decoder():
     """INQUIRY standard data decoded correctly."""
     cdb = bytes([0x12, 0, 0, 0, 96, 0])
-    data = bytearray(95)
+    data = bytearray(96)
     data[0] = 0x05  # PDT = CD-ROM
     data[1] = 0x80  # removable
     data[2] = 0x06  # SPC-4
@@ -530,7 +530,7 @@ def _test_filter_by_direction():
 def _test_no_payload():
     """--no-payload clears details."""
     cdb = bytes([0x12, 0, 0, 0, 96, 0])
-    data = bytearray(95)
+    data = bytearray(96)
     data[8:16] = b"TESTVEND"
     frames = [
         ("OUT", _cbw(1, 96, "IN", 0, cdb)),

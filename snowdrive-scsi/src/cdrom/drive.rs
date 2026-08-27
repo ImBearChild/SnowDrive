@@ -1533,7 +1533,7 @@ mod tests {
         cdb[4] = 96;
         let mut buf = [0u8; 96];
         let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
-        assert!(n >= 95);
+        assert_eq!(n, 96);
         assert_eq!(buf[0] & 0x1F, 0x05); // PDT = CD-ROM
         assert_eq!(&buf[8..16], b"SnowSCSI");
     }
