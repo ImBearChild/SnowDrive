@@ -608,6 +608,24 @@ impl<'a> CdromDrive<'a> {
                     self.read_track_information_cmd(cdb, data)
                 }
 
+                // ── READ CD (0xBE) / READ CD MSF (0xB9) ───────────
+                // Minimal Mode-1 alias for CD Read feature (M9, Current=1).
+                op::READ_CD | op::READ_CD_MSF => {
+                    if !self.loaded() {
+                        return Ok(self.not_ready());
+                    }
+                    self.read_cd_cmd(cdb, data)
+                }
+
+                // ── GET PERFORMANCE (0xAC) ─────────────────────────
+                // Minimal empty performance table for RTS feature (M9).
+                op::GET_PERFORMANCE => {
+                    if !self.loaded() {
+                        return Ok(self.not_ready());
+                    }
+                    self.get_performance_cmd(cdb, data)
+                }
+
                 // ── READ FORMAT CAPACITIES (0x23) ────────────────
                 op::READ_FORMAT_CAPACITIES => self.read_format_capacities_cmd(cdb, data),
 
@@ -1187,6 +1205,46 @@ impl<'a> CdromDrive<'a> {
         buf[24..28].copy_from_slice(&capacity.to_be_bytes());
         buf[28..32].copy_from_slice(&0u32.to_be_bytes());
         let n = buf.len().min(alloc as usize).min(data.len());
+        data[..n].copy_from_slice(&buf[..n]);
+        CommandOutcome::OutInline { len: n }
+    }
+
+    fn read_cd_cmd(&mut self, cdb: &[u8], _data: &mut [u8]) -> CommandOutcome {
+        // MMC-6 READ CD (BEh/B9h) minimal Mode-1 alias: LBA at 2-5, 24-bit
+        // transfer length at 6-8 (BE) or MSF at 3-5 (B9). For B9, convert MSF.
+        let lba = if cdb[0] == op::READ_CD_MSF {
+            let m = u32::from(cdb[3]);
+            let s = u32::from(cdb[4]);
+            let f = u32::from(cdb[5]);
+            // MSF to LBA: LBA = ((M*60)+S)*75 + F -150
+            (m * 60 * 75 + s * 75 + f).saturating_sub(150)
+        } else {
+            u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]])
+        };
+        let sectors = (u32::from(cdb[6]) << 16) | (u32::from(cdb[7]) << 8) | u32::from(cdb[8]);
+        let count = sectors;
+        if count == 0 {
+            return CommandOutcome::Status;
+        }
+        self.read_cmd(u64::from(lba), count, _data)
+    }
+
+    fn get_performance_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> CommandOutcome {
+        // MMC-6 §6.7 GET PERFORMANCE minimal empty table (Type 00h).
+        // CDB is 12 bytes; alloc at bytes 8-9 (or 10-11 for 12-byte variant).
+        let alloc = if cdb.len() >= 12 {
+            let a10 = u16::from_be_bytes([cdb[10], cdb[11]]) as usize;
+            let a8 = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
+            a10.max(a8)
+        } else if cdb.len() >= 9 {
+            u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+        } else {
+            0
+        };
+        // Header: Data Length (4 bytes) = 0, no descriptors. Host's alloc may
+        // be larger, but Data Length indicates valid bytes.
+        let buf = [0u8; 8];
+        let n = buf.len().min(alloc).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
     }

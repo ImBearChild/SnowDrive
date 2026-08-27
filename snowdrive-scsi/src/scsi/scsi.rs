@@ -40,6 +40,8 @@ pub mod op {
     pub const READ_BUFFER_CAPACITY: u8 = 0x5C;
     pub const READ_TRACK_INFORMATION: u8 = 0x52;
     pub const GET_EVENT_STATUS_NOTIFICATION: u8 = 0x4A;
+    pub const READ_CD: u8 = 0xBE;
+    pub const READ_CD_MSF: u8 = 0xB9;
     pub const GET_PERFORMANCE: u8 = 0xAC;
     pub const READ_DVD_STRUCTURE: u8 = 0xAD;
     pub const SET_CD_SPEED: u8 = 0xBB;
