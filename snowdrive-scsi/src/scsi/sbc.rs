@@ -9,8 +9,8 @@ use crate::common::block_storage::FlatData;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{
-    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode,
-    cdb_transfer_len10, cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
+    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode, cdb_transfer_len10,
+    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, SpcCommand};
 
