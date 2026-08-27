@@ -497,8 +497,8 @@ const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
     out
 }
 /// All CD-ROM mode pages, in MODE SENSE page order (for `0x3F`).
+/// SPC-3 §6.9 (line ~6511) requires vendor page 00h last after all others.
 const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
-    &VENDOR_PAGE,
     &READ_WRITE_ERROR_RECOVERY_PAGE,
     &WRITE_PARAMS_PAGE,
     &CACHING_PAGE,
@@ -507,6 +507,7 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
     &POWER_CONDITION_PAGE,
     &TIMEOUT_PROTECT_PAGE,
     &CDROM_CAPABILITIES,
+    &VENDOR_PAGE,
 ]);
 // ── GET CONFIGURATION common features builder ───────────────────────
 /// Build GET CONFIGURATION feature descriptors common to all CD-ROM
@@ -1168,9 +1169,10 @@ pub struct DiscInfo {
 /// synthesized bytes (`immediate`). An `alloc` of zero is not an error and
 /// yields an empty data phase (MMC-6 ).
 pub fn build_read_disc_info(data: &mut [u8], alloc: u16, info: &DiscInfo) -> CommandOutcome {
-    // Standard block: Disc Information Length = 0x32 (+8×OPC tables, none).
+    // Standard block: Disc Information Length = 0x20 (32+8×OPC, no OPC tables
+    // → 32, MMC-6 §6.21.3.1.1). The old 0x32 (50) was a hex/decimal mix-up.
     let mut buf = [0u8; 52];
-    buf[0..2].copy_from_slice(&0x0032u16.to_be_bytes());
+    buf[0..2].copy_from_slice(&0x0020u16.to_be_bytes());
     // Byte 2: Disc Information Data Type 000b | Erasable | State of last
     // Session | Disc Status (bits 7:5 | 4 | 3:2 | 1:0) — MMC-6 Table 365.
     let state = (info.state_of_last_session & 0b11) << 2;
@@ -1312,7 +1314,7 @@ mod tests {
         assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + pages */
         assert_eq!(buf[0], ((n - 2) >> 8) as u8);
         assert_eq!(buf[1], (n - 2) as u8); /* mode data length */
-        // Walk pages by length fields and collect codes — order: 0x00,0x01,0x05,0x08,0x0D,0x0E,0x1A,0x1D,0x2A.
+        // Walk pages by length fields and collect codes — order: 0x01,0x05,0x08,0x0D,0x0E,0x1A,0x1D,0x2A,0x00 (SPC-3 §6.9 vendor last).
         let mut codes = Vec::new();
         let mut off = 8;
         while off + 2 <= n {
@@ -1322,7 +1324,7 @@ mod tests {
         }
         assert_eq!(
             codes,
-            vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]
+            vec![0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A, 0x00]
         );
     }
     #[test]
@@ -1339,7 +1341,7 @@ mod tests {
         }
         assert_eq!(
             codes,
-            vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]
+            vec![0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A, 0x00]
         );
     }
     // ── GET CONFIGURATION common features ───────────────────────────
@@ -1568,8 +1570,8 @@ mod tests {
         let mut buf = [0u8; 52];
         let n = data_in(build_read_disc_info(&mut w, 52, &info), &w, &mut buf);
         assert_eq!(n, 52);
-        // Disc Information Length (excludes itself).
-        assert_eq!(&buf[0..2], &[0x00, 0x32]);
+        // Disc Information Length (excludes itself, MMC-6 §6.21.3.1.1: 32).
+        assert_eq!(&buf[0..2], &[0x00, 0x20]);
         // Byte 2: Erasable 0 | State of last Session 11b | Disc Status 10b
         // = 0b00001110 (MMC-6 Table 365: erasable<<4 | state<<2 | status).
         assert_eq!(buf[2], 0x0E);
@@ -1590,7 +1592,7 @@ mod tests {
         let mut buf = [0u8; 2];
         let n = data_in(build_read_disc_info(&mut w, 2, &info), &w, &mut buf);
         assert_eq!(n, 2);
-        assert_eq!(buf, [0x00, 0x32]);
+        assert_eq!(buf, [0x00, 0x20]);
         // Zero alloc is not an error → empty data phase.
         let outcome = build_read_disc_info(&mut w, 0, &info);
         match outcome {

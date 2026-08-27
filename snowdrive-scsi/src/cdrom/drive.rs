@@ -1014,13 +1014,14 @@ impl<'a> CdromDrive<'a> {
         buf[0..2].copy_from_slice(&4u16.to_be_bytes());
         if class & 0x10 != 0 {
             buf[2] = 0x80 | 0x04; // NEA=0, Notification Class = Media (100b)
-            buf[3] = 0x10;
+            buf[3] = 0x10; // Supported Event Class = Media (MMC-6 Table 265)
         } else {
             buf[2] = 0x80; // NEA=1
+            buf[3] = 0x10; // Supported Event Class still reports Media
         }
-        // Event Code 0 (NoChg)edia Present (bit 1).
+        // Event Code 0 (NoChg), byte5 bit1=Media Present, bit0=Door/Tray open (Table 280).
         buf[4] = 0x00;
-        buf[5] = 0x02;
+        buf[5] = (u8::from(self.loaded()) << 1) | u8::from(self.tray_open);
         let n = buf.len().min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
@@ -1144,6 +1145,34 @@ impl<'a> CdromDrive<'a> {
         if type_code > 3 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
+        // Address type validation (MMC-6 Table 493): 0=LBA, 1=track, 2=session.
+        let addr = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        match type_code {
+            0 => {
+                // LBA addressing: must be within the single data track.
+                if addr > self.lead_out_lba() {
+                    return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+                }
+            }
+            1 => {
+                // Track number: single track 1 only. Allow 0 (wildcard) and
+                // 0xFF (lead-out) for compatibility, reject 2..0xFE.
+                let track = (addr & 0xFF) as u8;
+                if track != 0 && track != 1 && track != 0xFF {
+                    return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+                }
+            }
+            2 => {
+                // Session number: single session 1 only.
+                let sess = (addr & 0xFF) as u8;
+                if sess != 0 && sess != 1 {
+                    return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+                }
+            }
+            _ => {}
+        }
+        // Open bit (cdb[1] bit4, TRIO) is ignored for this single-track
+        // finalized media — the track is always closed.
         let capacity = self.lead_out_lba();
         let mut buf = [0u8; 48];
         buf[0..2].copy_from_slice(&0x002Eu16.to_be_bytes());
