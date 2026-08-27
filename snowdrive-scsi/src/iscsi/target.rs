@@ -1192,8 +1192,31 @@ impl IscsiSession {
         if !bhs.lun_is_single_level() {
             return self.reject(work, reject::INVALID_PDU_FIELD, bhs);
         }
+        let cdb = bhs.cdb();
+        let scsi_opcode = opcode_from_cdb(cdb);
+
+        // REPORT LUNS is a well-known command (SPC-3) and must be served
+        // from any LUN, even an unsupported one.
+        if scsi_opcode == scsi_op::REPORT_LUNS {
+            return self.handle_report_luns(work, itt, devs.len());
+        }
+
         let lun = bhs.lun() as usize;
         if lun >= devs.len() {
+            if scsi_opcode == scsi_op::REQUEST_SENSE {
+                // SPC-3 §6.27: REQUEST SENSE to an unsupported LUN shall
+                // return GOOD with sense ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED.
+                let alloc = cdb.get(4).copied().unwrap_or(0) as usize;
+                let sense =
+                    Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
+                let mut buf = [0u8; 18];
+                let n = sense.write_fixed(&mut buf);
+                let n = n.min(alloc).min(work.len() - BHS_SIZE);
+                if n > 0 {
+                    work[BHS_SIZE..BHS_SIZE + n].copy_from_slice(&buf[..n]);
+                }
+                return self.send_data_in_final(work, itt, n, 0, 0, status::GOOD);
+            }
             let sense = Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
             return self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense));
         }
@@ -1203,13 +1226,6 @@ impl IscsiSession {
         let w_bit = bhs.as_bytes()[1] & 0x20 != 0;
         if pdu.dsl > 0 && !w_bit {
             return self.reject(work, reject::PROTOCOL_ERROR, bhs);
-        }
-
-        let cdb = bhs.cdb();
-        let scsi_opcode = opcode_from_cdb(cdb);
-
-        if scsi_opcode == scsi_op::REPORT_LUNS {
-            return self.handle_report_luns(work, itt, devs.len());
         }
 
         crate::debug!(

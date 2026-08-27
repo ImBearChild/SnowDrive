@@ -990,10 +990,8 @@ mod tests {
 
     #[test]
     fn report_luns_on_unsupported_lun_check_condition() {
-        // The LUN-validity check happens before the REPORT LUNS intercept,
-        // so an out-of-range single-level LUN in the BHS still yields a
-        // SCSI error — CHECK CONDITION / LOGICAL UNIT NOT SUPPORTED
-        // (SPC-3 §6.21) — not an iSCSI Reject.
+        // REPORT LUNS is a well-known command (SPC-3 §6.21) and must be
+        // served from any LUN, even an unsupported one (M7).
         let mut ram = vec![0u8; 16 * 1024];
         let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         let mut devs = [dev];
@@ -1011,12 +1009,11 @@ mod tests {
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
-        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
-        assert_eq!(bhs[3], status::CHECK_CONDITION);
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
         assert_eq!(&bhs[16..20], &be32(0xDEAD)); // ITT echoed
-        assert_eq!(data[2], 0x70);
-        assert_eq!(data[4], 0x05); // ILLEGAL REQUEST
-        assert_eq!(data[14], 0x25); // LOGICAL UNIT NOT SUPPORTED
+        assert_eq!(&data[..4], &[0, 0, 0, 8]);
+        assert_eq!(&data[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     // ── Mixed heterogeneous LUNs: Device enum (Block + CdBlock) ───────

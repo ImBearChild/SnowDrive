@@ -429,13 +429,18 @@ impl BotSession {
 
         if cbw.lun as usize >= devs.len() {
             // Invalid LUN (§4.6): Failed CSW + REQUEST SENSE (ASC 0x25).
-            // The stored sense is served by the core's REQUEST SENSE path
-            // below, since the addressed device does not exist.
+            // SPC-3 §6.27: REQUEST SENSE to an unsupported LUN shall return
+            // GOOD with sense ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED,
+            // and shall do so on *every* REQUEST SENSE (not consume once).
             if cdb.first() == Some(&scsi_op::REQUEST_SENSE) {
-                if let Some(sense) = self.invalid_lun_sense.take() {
-                    let n = sense.write_fixed(data);
-                    return self.synthesize_data_in(cbw, data, n as u64);
-                }
+                let sense = self.invalid_lun_sense.unwrap_or(Sense::new(
+                    SenseKey::IllegalRequest,
+                    asc::LOGICAL_UNIT_NOT_SUPPORTED,
+                    0,
+                ));
+                self.invalid_lun_sense = Some(sense);
+                let n = sense.write_fixed(data);
+                return self.synthesize_data_in(cbw, data, n as u64);
             }
             self.invalid_lun_sense = Some(Sense::new(
                 SenseKey::IllegalRequest,
