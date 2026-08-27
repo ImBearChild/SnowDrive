@@ -560,11 +560,16 @@ impl<'a> CdromDrive<'a> {
 
                 // ── READ CAPACITY(16) ───────────────────────────
                 op::SERVICE_ACTION_IN => {
+                    let sa = cdb[1] & 0x1F;
                     let alloc = (u32::from(cdb[10]) << 24)
                         | (u32::from(cdb[11]) << 16)
                         | (u32::from(cdb[12]) << 8)
                         | u32::from(cdb[13]);
-                    self.read_capacity_16_cmd(cdb[1], alloc, data)
+                    let lba = u64::from_be_bytes([
+                        cdb[2], cdb[3], cdb[4], cdb[5], cdb[6], cdb[7], cdb[8], cdb[9],
+                    ]);
+                    let pmi = cdb[14] & 0x01 != 0;
+                    self.read_capacity_16_cmd(sa, alloc, lba, pmi, data)
                 }
 
                 // ── READ TOC (0x43) ─────────────────────────────
@@ -630,7 +635,26 @@ impl<'a> CdromDrive<'a> {
                 op::READ_FORMAT_CAPACITIES => self.read_format_capacities_cmd(cdb, data),
 
                 // ── SYNCHRONIZE CACHE(10) ────────────────────────
-                op::SYNCHRONIZE_CACHE_10 => self.sync_cache_cmd(),
+                op::SYNCHRONIZE_CACHE_10 => {
+                    let immed = cdb[1] & 0x02 != 0;
+                    if immed {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
+                    }
+                    let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                    let num_blocks = u16::from_be_bytes([cdb[7], cdb[8]]);
+                    let max_lba = self.max_lba();
+                    if num_blocks == 0 {
+                        if u64::from(lba) > max_lba {
+                            return Ok(self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE));
+                        }
+                    } else if u64::from(lba) > max_lba
+                        || u64::from(lba) + u64::from(num_blocks) > max_lba + 1
+                    {
+                        return Ok(self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE));
+                    }
+                    // SYNC_NV (cdb[1] & 0x04) is ignored (no non-volatile cache).
+                    self.sync_cache_cmd()
+                }
 
                 // ── SET CD SPEED (0xBB) ──────────────────────────
                 op::SET_CD_SPEED => CommandOutcome::Status,
@@ -884,14 +908,27 @@ impl<'a> CdromDrive<'a> {
         CommandOutcome::OutInline { len: 8 }
     }
 
-    fn read_capacity_16_cmd(&mut self, sa: u8, alloc: u32, data: &mut [u8]) -> CommandOutcome {
+    fn read_capacity_16_cmd(
+        &mut self,
+        sa: u8,
+        alloc: u32,
+        lba: u64,
+        pmi: bool,
+        data: &mut [u8],
+    ) -> CommandOutcome {
         if !self.loaded() {
             return self.not_ready();
         }
         if sa != 0x10 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
+        if !pmi && lba != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         let max_lba = self.max_lba();
+        if pmi && lba > max_lba {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         let mut buf = [0u8; 32];
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());

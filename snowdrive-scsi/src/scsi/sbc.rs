@@ -9,8 +9,8 @@ use crate::common::block_storage::FlatData;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{
-    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode, cdb_transfer_len10,
-    cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
+    cdb_lba10, cdb_lba12, cdb_lba16, cdb_lba6, cdb_len_from_opcode, cdb_opcode,
+    cdb_transfer_len10, cdb_transfer_len12, cdb_transfer_len16, cdb_transfer_len6, op,
 };
 use crate::scsi::spc::{execute_spc, parse_spc, SpcCommand};
 
@@ -60,8 +60,15 @@ pub enum SbcCommand {
     ReadCapacity16 {
         sa: u8,
         alloc: u32,
+        lba: u64,
+        pmi: bool,
     },
-    SynchronizeCache,
+    SynchronizeCache {
+        lba: u32,
+        num_blocks: u16,
+        immed: bool,
+        sync_nv: bool,
+    },
     /// FORMAT UNIT (04h, SBC-3 §5.3). Minimal direct-access profile:
     /// `FMTDATA=0` (no parameter list) is the mandatory simple format.
     FormatUnit {
@@ -126,13 +133,30 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
                 | u32::from(cdb[5]),
         }),
         op::SERVICE_ACTION_IN => Some(SbcCommand::ReadCapacity16 {
-            sa: cdb[1],
+            sa: cdb[1] & 0x1F,
             alloc: (u32::from(cdb[10]) << 24)
                 | (u32::from(cdb[11]) << 16)
                 | (u32::from(cdb[12]) << 8)
                 | u32::from(cdb[13]),
+            lba: (u64::from(cdb[2]) << 56)
+                | (u64::from(cdb[3]) << 48)
+                | (u64::from(cdb[4]) << 40)
+                | (u64::from(cdb[5]) << 32)
+                | (u64::from(cdb[6]) << 24)
+                | (u64::from(cdb[7]) << 16)
+                | (u64::from(cdb[8]) << 8)
+                | u64::from(cdb[9]),
+            pmi: cdb[14] & 0x01 != 0,
         }),
-        op::SYNCHRONIZE_CACHE_10 => Some(SbcCommand::SynchronizeCache),
+        op::SYNCHRONIZE_CACHE_10 => Some(SbcCommand::SynchronizeCache {
+            lba: (u32::from(cdb[2]) << 24)
+                | (u32::from(cdb[3]) << 16)
+                | (u32::from(cdb[4]) << 8)
+                | u32::from(cdb[5]),
+            num_blocks: (u16::from(cdb[7]) << 8) | u16::from(cdb[8]),
+            immed: cdb[1] & 0x02 != 0,
+            sync_nv: cdb[1] & 0x04 != 0,
+        }),
         op::FORMAT_UNIT => Some(SbcCommand::FormatUnit { cdb1: cdb[1] }),
         _ => None,
     }
@@ -168,11 +192,18 @@ pub(crate) fn execute_sbc<D: FlatData>(
         SbcCommand::Read16 { lba, count } => dev.read_cmd(dev.max_lba(), lba, count, data),
         SbcCommand::Write16 { lba, count } => dev.write_cmd(dev.max_lba(), lba, count, data),
         SbcCommand::ReadCapacity10 { pmi, lba } => dev.read_capacity_10_cmd(pmi, lba, data),
-        SbcCommand::ReadCapacity16 { sa, alloc } => dev.read_capacity_16_cmd(sa, alloc, data),
-        SbcCommand::SynchronizeCache => {
-            let _ = dev.sync_backend();
-            CommandOutcome::Status
-        }
+        SbcCommand::ReadCapacity16 {
+            sa,
+            alloc,
+            lba,
+            pmi,
+        } => dev.read_capacity_16_cmd(sa, alloc, lba, pmi, data),
+        SbcCommand::SynchronizeCache {
+            lba,
+            num_blocks,
+            immed,
+            sync_nv,
+        } => dev.synchronize_cache_cmd(lba, num_blocks, immed, sync_nv),
         SbcCommand::FormatUnit { cdb1 } => dev.format_unit_cmd(cdb1),
         SbcCommand::Spc(spc) => execute_spc(dev, spc, data),
     }
@@ -352,7 +383,9 @@ mod tests {
             parse_sbc(&cdb),
             Some(SbcCommand::ReadCapacity16 {
                 sa: 0x10,
-                alloc: 64
+                alloc: 64,
+                lba: 0,
+                pmi: false
             })
         );
 
@@ -360,8 +393,10 @@ mod tests {
         assert_eq!(
             parse_sbc(&cdb),
             Some(SbcCommand::ReadCapacity16 {
-                sa: 0xFF,
-                alloc: 64
+                sa: 0x1F,
+                alloc: 64,
+                lba: 0,
+                pmi: false
             })
         );
     }
@@ -369,7 +404,15 @@ mod tests {
     #[test]
     fn parse_synchronize_cache() {
         let cdb = make_cdb10(op::SYNCHRONIZE_CACHE_10, 0, 0);
-        assert_eq!(parse_sbc(&cdb), Some(SbcCommand::SynchronizeCache));
+        assert_eq!(
+            parse_sbc(&cdb),
+            Some(SbcCommand::SynchronizeCache {
+                lba: 0,
+                num_blocks: 0,
+                immed: false,
+                sync_nv: false
+            })
+        );
     }
 
     #[test]

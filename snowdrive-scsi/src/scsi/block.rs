@@ -394,14 +394,14 @@ impl<D: FlatData> BlockDevice<D> {
         count: u32,
         _data: &mut [u8],
     ) -> CommandOutcome {
+        if count == 0 {
+            return CommandOutcome::Status;
+        }
         if !matches!(self.write_path, WritePath::Open(_)) {
             // Read-only profile (Absent) or locked read-only *image*
             // (Locked): immediate DATA PROTECT — the former CDBlockDevice
             // behavior plus the policy bit.
             return self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED);
-        }
-        if count == 0 {
-            return CommandOutcome::Status;
         }
         if !self.check_lba_range(max_lba, lba, count) {
             return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
@@ -460,18 +460,54 @@ impl<D: FlatData> BlockDevice<D> {
         &mut self,
         sa: u8,
         alloc: u32,
+        lba: u64,
+        pmi: bool,
         data: &mut [u8],
     ) -> CommandOutcome {
-        if sa != 0x10 {
+        if (sa & 0x1F) != 0x10 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        // SBC-3 §5.16: PMI handling mirrors READ CAPACITY(10) §5.15.2
+        if !pmi && lba != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let max_lba = self.max_lba();
+        if pmi && lba > max_lba {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         let mut buf = [0u8; 32];
         buf[0..8].copy_from_slice(&max_lba.to_be_bytes());
         buf[8..12].copy_from_slice(&self.sector_size.to_be_bytes());
         let n = 32.min(alloc as usize);
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
+    }
+
+    pub(crate) fn synchronize_cache_cmd(
+        &mut self,
+        lba: u32,
+        num_blocks: u16,
+        immed: bool,
+        _sync_nv: bool,
+    ) -> CommandOutcome {
+        // SBC-3 §5.24: IMMED=1 not supported (no async cache flush).
+        if immed {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        // SYNC_NV is ignored (RAM disk has no non-volatile cache).
+        let max_lba = self.max_lba();
+        let lba64 = u64::from(lba);
+        if num_blocks == 0 {
+            if lba64 > max_lba {
+                return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
+            }
+        } else if lba64 > max_lba || lba64 + u64::from(num_blocks) > max_lba + 1 {
+            return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
+        }
+        match self.sync_backend() {
+            Ok(()) => CommandOutcome::Status,
+            Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
+        }
     }
 
     pub(crate) fn format_unit_cmd(&mut self, cdb1: u8) -> CommandOutcome {
