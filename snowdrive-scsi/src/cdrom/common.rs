@@ -570,40 +570,14 @@ pub fn build_get_config_features_for_media(
     // per MMC-6 §5.4.2. It identifies the profiles supported by the drive;
     // the mounted profile is marked current (or 0000h when no media).
     if include(0x0000) {
-        // Build profile list from caps: each supported profile gets a slot.
-        // Start with the known profiles from the caps bitmask.
+        // Build profile list from caps in descending numerical order
+        // per MMC-6 §6.5.2.3.
         let mut profiles = heapless::Vec::<u16, 16>::new();
-        if caps.read_cdr || caps.write_cdr {
-            let _ = profiles.push(0x0009); // CD-R
-        }
-        if caps.read_cdrw || caps.write_cdrw {
-            let _ = profiles.push(0x000A); // CD-RW
-        }
-        if caps.read_dvd_rom {
-            let _ = profiles.push(0x0010); // DVD-ROM
-        }
-        if caps.read_dvd_r || caps.write_dvd_r {
-            let _ = profiles.push(0x0011); // DVD-R
-            let _ = profiles.push(0x0015); // DVD-R Dual Layer sequential
-            if caps.dual_layer {
-                let _ = profiles.push(0x0016); // DVD-R Dual Layer jump
-            }
-        }
-        if caps.read_dvd_ram || caps.write_dvd_ram {
-            let _ = profiles.push(0x0012); // DVD-RAM
-        }
-        if caps.read_dvd_rw || caps.write_dvd_rw {
-            let _ = profiles.push(0x0013); // DVD-RW sequential
-            let _ = profiles.push(0x0014); // DVD-RW restricted overwrite
-            if caps.dual_layer {
-                let _ = profiles.push(0x0017); // DVD-RW Dual Layer
-            }
-        }
         if caps.read_dvd_plus_r || caps.write_dvd_plus_r {
-            let _ = profiles.push(0x001B); // DVD+R
             if caps.dual_layer {
                 let _ = profiles.push(0x002B); // DVD+R Dual Layer
             }
+            let _ = profiles.push(0x001B); // DVD+R
         }
         if caps.dvd_plus_rw {
             let _ = profiles.push(0x001A); // DVD+RW
@@ -611,15 +585,34 @@ pub fn build_get_config_features_for_media(
                 let _ = profiles.push(0x0018); // DVD+RW Dual Layer
             }
         }
-        // Removable disk (0x0002) — advertised by real HyperMulti drives
-        let _ = profiles.push(0x0002);
-        // Always include CD-ROM as a baseline profile.
-        if profiles.iter().all(|&p| p != 0x0008) {
-            let _ = profiles.insert(0, 0x0008);
+        if caps.dual_layer && (caps.read_dvd_rw || caps.write_dvd_rw) {
+            let _ = profiles.push(0x0017); // DVD-RW Dual Layer
         }
-        // Ensure at least CD-ROM is present.
+        if caps.dual_layer && (caps.read_dvd_r || caps.write_dvd_r) {
+            let _ = profiles.push(0x0016); // DVD-R Dual Layer jump
+        }
+        if caps.read_dvd_r || caps.write_dvd_r {
+            let _ = profiles.push(0x0015); // DVD-R Dual Layer sequential
+            let _ = profiles.push(0x0011); // DVD-R
+        }
+        if caps.read_dvd_rw || caps.write_dvd_rw {
+            let _ = profiles.push(0x0014); // DVD-RW restricted overwrite
+            let _ = profiles.push(0x0013); // DVD-RW sequential
+        }
+        if caps.read_dvd_ram || caps.write_dvd_ram {
+            let _ = profiles.push(0x0012); // DVD-RAM
+        }
+        if caps.read_dvd_rom {
+            let _ = profiles.push(0x0010); // DVD-ROM
+        }
+        if caps.read_cdrw || caps.write_cdrw {
+            let _ = profiles.push(0x000A); // CD-RW
+        }
+        if caps.read_cdr || caps.write_cdr {
+            let _ = profiles.push(0x0009); // CD-R
+        }
         if profiles.is_empty() {
-            let _ = profiles.push(0x0008);
+            let _ = profiles.push(0x0008); // CD-ROM (baseline)
         }
         // Feature header: feature code 0x0000, version 0, persistent + current.
         buf[off] = 0x00;
@@ -715,7 +708,14 @@ pub fn build_get_config_features_for_media(
     if caps.read_dvd_rom && include(0x001F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1F;
-        buf[off + 2] = feat_hdr(2, false, matches!(media.profile, CurrentProfile::DvdRom | CurrentProfile::DvdRam));
+        buf[off + 2] = feat_hdr(
+            2,
+            false,
+            matches!(
+                media.profile,
+                CurrentProfile::DvdRom | CurrentProfile::DvdRam
+            ),
+        );
         off += 4;
     }
     // Random Writable (0x0020) — MMC-6 Table 113 Ver 0001b, P0.
@@ -861,7 +861,10 @@ pub fn build_get_config_features_for_media(
         off += 8;
     }
     // Layer Jump Recording (0x0033) — Ver 0000b, P0.
-    if caps.dual_layer && (caps.write_dvd_r || caps.write_dvd_rw || caps.write_dvd_plus_r) && include(0x0033) {
+    if caps.dual_layer
+        && (caps.write_dvd_r || caps.write_dvd_rw || caps.write_dvd_plus_r)
+        && include(0x0033)
+    {
         buf[off] = 0x00;
         buf[off + 1] = 0x33;
         buf[off + 2] = feat_hdr(0, false, false);
@@ -966,7 +969,11 @@ pub fn build_get_config_features_for_media(
         buf[off + 3] = 0x10;
         let serial: &[u8; 16] = b"B9GRXF2232256   ";
         let snow_serial: &[u8; 16] = b"SNOW000000000000";
-        let s = if caps.write_dvd_ram { snow_serial } else { serial };
+        let s = if caps.write_dvd_ram {
+            snow_serial
+        } else {
+            serial
+        };
         buf[off + 4..off + 20].copy_from_slice(s);
         off += 20;
     }
@@ -1307,7 +1314,10 @@ mod tests {
             codes.push(buf[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
+        assert_eq!(
+            codes,
+            vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]
+        );
     }
     #[test]
     fn cdrom_mode_page_all_pages_contains_each_page() {
@@ -1321,7 +1331,10 @@ mod tests {
             codes.push(all[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
+        assert_eq!(
+            codes,
+            vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]
+        );
     }
     // ── GET CONFIGURATION common features ───────────────────────────
     #[test]

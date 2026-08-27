@@ -1002,6 +1002,12 @@ impl<'a> CdromDrive<'a> {
     // ── GET EVENT STATUS NOTIFICATION ────────────────────────────────
 
     fn gesn_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> CommandOutcome {
+        // Polled bit (byte 1 bit 0): Poll=0 requests async operation.
+        // This drive does not support async (no command queuing), so
+        // reject per MMC-6 §6.6.1.2.
+        if cdb[1] & 0x01 == 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         let class = cdb[4];
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
         let mut buf = [0u8; 8];

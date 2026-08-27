@@ -442,7 +442,10 @@ mod enumeration_sequence {
         // full payload size (it is not truncated by the allocation limit, per
         // MMC-6 §6.5).  Just verify it is present and consistent.
         let data_len = u32::from_be_bytes(cfg[0..4].try_into().unwrap());
-        assert!(data_len > 0 && data_len <= 0xFFFF, "DataLength out of range");
+        assert!(
+            data_len > 0 && data_len <= 0xFFFF,
+            "DataLength out of range"
+        );
 
         // Media query set.
         run!(true, 10, [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[]);
