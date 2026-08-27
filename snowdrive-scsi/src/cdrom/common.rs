@@ -611,9 +611,14 @@ pub fn build_get_config_features_for_media(
         if caps.read_cdr || caps.write_cdr {
             let _ = profiles.push(0x0009); // CD-R
         }
-        if profiles.is_empty() {
-            let _ = profiles.push(0x0008); // CD-ROM (baseline)
+        // Removable disk (0x0002) — advertised by real HyperMulti drives
+        let _ = profiles.push(0x0002);
+        // Ensure CD-ROM baseline is present
+        if !profiles.contains(&0x0008) {
+            let _ = profiles.push(0x0008);
         }
+        // MMC-6 §6.5.2.3: descending numerical order
+        profiles.as_mut_slice().sort_unstable_by(|a, b| b.cmp(a));
         // Feature header: feature code 0x0000, version 0, persistent + current.
         buf[off] = 0x00;
         buf[off + 1] = 0x00;
