@@ -603,7 +603,7 @@ impl IscsiSession {
 
                 match iscsi_op {
                     op::SCSI_CMD => self.handle_scsi_cmd(work, devs, &pdu),
-                    op::SCSI_TASK_REQ => self.handle_tmf(work, &pdu),
+                    op::SCSI_TASK_REQ => self.handle_tmf(work, &pdu, devs),
                     op::NOP_OUT => self.handle_nop(work, &pdu),
                     op::LOGOUT_REQ => self.handle_logout(work, &pdu),
                     op::TEXT_REQ => self.handle_text(work, &pdu),
@@ -1488,7 +1488,12 @@ impl IscsiSession {
 
     // ── Full Feature: Task Management / NOP / Logout ─────────────
 
-    fn handle_tmf<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+    fn handle_tmf<'a, D: ScsiDevice>(
+        &'a mut self,
+        work: &'a mut [u8],
+        pdu: &Pdu,
+        devs: &mut [D],
+    ) -> SessionStep<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
@@ -1498,9 +1503,21 @@ impl IscsiSession {
         }
         self.cmd_sn = recv_cmd_sn;
 
+        if !bhs.lun_is_single_level() {
+            return self.reject(work, reject::INVALID_PDU_FIELD, bhs);
+        }
+        let lun = bhs.lun() as usize;
         let function = bhs.tmf_function();
         let response = match function {
-            tmf::ABORT_TASK | tmf::LOGICAL_UNIT_RESET => tmf_response::COMPLETE,
+            tmf::LOGICAL_UNIT_RESET => {
+                if lun < devs.len() {
+                    devs[lun].inject_unit_attention(asc::POWER_ON_RESET, 0);
+                    tmf_response::COMPLETE
+                } else {
+                    tmf_response::NOT_SUPPORTED
+                }
+            }
+            tmf::ABORT_TASK => tmf_response::COMPLETE,
             _ => tmf_response::NOT_SUPPORTED,
         };
 

@@ -1363,6 +1363,10 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
             _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
         }
     }
+
+    fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
+        self.sense = Some(Sense::new(SenseKey::UnitAttention, asc, ascq));
+    }
 }
 
 // ── Builder ───────────────────────────────────────────

@@ -292,6 +292,13 @@ pub trait ScsiDevice {
     fn sync(&mut self) -> Result<(), BlockStorageError> {
         Ok(())
     }
+
+    /// Inject a Unit Attention condition (SAM-4 §5.14 / SPC-4 §5.14).
+    ///
+    /// The device queues `SenseKey::UnitAttention` with the given `asc`/`ascq`
+    /// so the next non-bypass command reports `CHECK CONDITION` once.
+    /// Default no-op for compute LUNs; storage/optical devices override.
+    fn inject_unit_attention(&mut self, _asc: u8, _ascq: u8) {}
 }
 
 /// Heterogeneous LUN arrays: `[&mut dyn ScsiDevice]` elements satisfy
@@ -328,6 +335,10 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
 
     fn sync(&mut self) -> Result<(), BlockStorageError> {
         (**self).sync()
+    }
+
+    fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
+        (**self).inject_unit_attention(asc, ascq)
     }
 }
 

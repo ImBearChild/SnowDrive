@@ -332,6 +332,23 @@ impl<D: FlatData> BlockDevice<D> {
         if data.len() < crate::MIN_DATA_LEN {
             return Err(Error::WorkBufTooSmall);
         }
+        // Unit Attention preemption (SPC-4 §5.14 / SAM-4): UA is reported once
+        // as CHECK CONDITION, except for INQUIRY / REPORT LUNS / REQUEST SENSE.
+        if let Some(s) = self.peek_sense() {
+            if s.key == SenseKey::UnitAttention {
+                let op = cdb.first().copied().unwrap_or(0);
+                let bypass = matches!(
+                    op,
+                    crate::scsi::scsi::op::INQUIRY
+                        | crate::scsi::scsi::op::REQUEST_SENSE
+                        | crate::scsi::scsi::op::REPORT_LUNS
+                );
+                if !bypass {
+                    let _ = self.take_sense();
+                    return Ok(CommandOutcome::CheckCondition);
+                }
+            }
+        }
         let Some(cmd) = parse_sbc(cdb) else {
             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
         };
@@ -606,6 +623,10 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
 
     fn sync(&mut self) -> Result<(), BlockStorageError> {
         self.sync_backend()
+    }
+
+    fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
+        self.sense = Some(Sense::new(SenseKey::UnitAttention, asc, ascq));
     }
 }
 
