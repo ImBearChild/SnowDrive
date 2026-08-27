@@ -438,7 +438,11 @@ mod enumeration_sequence {
 
         // GET CONFIGURATION right after the storm — regression for #109.
         let cfg = run!(true, 240, [0x46u8, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0], &[]);
-        assert_eq!(&cfg[..4], &[0x00, 0x00, 0x00, cfg[3]]);
+        // Data Length may exceed the allocation length — the drive reports the
+        // full payload size (it is not truncated by the allocation limit, per
+        // MMC-6 §6.5).  Just verify it is present and consistent.
+        let data_len = u32::from_be_bytes(cfg[0..4].try_into().unwrap());
+        assert!(data_len > 0 && data_len <= 0xFFFF, "DataLength out of range");
 
         // Media query set.
         run!(true, 10, [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[]);

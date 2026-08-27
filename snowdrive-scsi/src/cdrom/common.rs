@@ -472,6 +472,7 @@ pub(crate) fn cdrom_mode_page_for_caps(
 /// Total byte count of all CD-ROM mode pages (for 0x3F sizing).
 pub(crate) const ALL_CDROM_PAGES_LEN: usize = VENDOR_PAGE.len()
     + READ_WRITE_ERROR_RECOVERY_PAGE.len()
+    + WRITE_PARAMS_PAGE.len()
     + CACHING_PAGE.len()
     + CDROM_PARAMS.len()
     + CDROM_AUDIO.len()
@@ -498,6 +499,7 @@ const fn concat_pages<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
 const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
     &VENDOR_PAGE,
     &READ_WRITE_ERROR_RECOVERY_PAGE,
+    &WRITE_PARAMS_PAGE,
     &CACHING_PAGE,
     &CDROM_PARAMS,
     &CDROM_AUDIO,
@@ -535,20 +537,14 @@ const ALL_CDROM_PAGES: [u8; ALL_CDROM_PAGES_LEN] = concat_pages(&[
 /// - 0x010A Disc Control Block (for DVD+RW media)
 ///
 /// Feature header byte2 encoding (MMC-6 Table 88):
-/// `byte2 = (version << 3) | (persistent << 1) | current`.
+/// `byte2 = (version << 2) | (persistent << 1) | current`
+/// (Reserved 7:6=0, Version 5:2, Persistent 1, Current 0).
 ///
-/// HyperMulti model: this drive advertises all supported features as
-/// persistent and current (P=1, C=1). A HyperMulti optical drive can handle
-/// any supported media format, so all features are always "current" from the
-/// host's perspective. The actual media state still determines which features
-/// are *functional* with the inserted medium.
+/// P/C model per MMC-6 §5.2.2.3: P=0 for media-dependent features (C varies
+/// with the inserted medium), P=1 only for mechanism-level "always active"
+/// features. The Profile List advertises all supported profiles.
 const fn feat_hdr(version: u8, persistent: bool, current: bool) -> u8 {
-    (version << 3) | ((persistent as u8) << 1) | (current as u8)
-}
-
-/// HyperMulti: all features report as persistent and current.
-const fn feat_hdr_active(version: u8) -> u8 {
-    feat_hdr(version, true, true)
+    (version << 2) | ((persistent as u8) << 1) | (current as u8)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -588,15 +584,17 @@ pub fn build_get_config_features_for_media(
         }
         if caps.read_dvd_r || caps.write_dvd_r {
             let _ = profiles.push(0x0011); // DVD-R
+            let _ = profiles.push(0x0015); // DVD-R Dual Layer sequential
             if caps.dual_layer {
-                let _ = profiles.push(0x0016); // DVD-R Dual Layer
+                let _ = profiles.push(0x0016); // DVD-R Dual Layer jump
             }
         }
         if caps.read_dvd_ram || caps.write_dvd_ram {
             let _ = profiles.push(0x0012); // DVD-RAM
         }
         if caps.read_dvd_rw || caps.write_dvd_rw {
-            let _ = profiles.push(0x0013); // DVD-RW
+            let _ = profiles.push(0x0013); // DVD-RW sequential
+            let _ = profiles.push(0x0014); // DVD-RW restricted overwrite
             if caps.dual_layer {
                 let _ = profiles.push(0x0017); // DVD-RW Dual Layer
             }
@@ -613,6 +611,8 @@ pub fn build_get_config_features_for_media(
                 let _ = profiles.push(0x0018); // DVD+RW Dual Layer
             }
         }
+        // Removable disk (0x0002) — advertised by real HyperMulti drives
+        let _ = profiles.push(0x0002);
         // Always include CD-ROM as a baseline profile.
         if profiles.iter().all(|&p| p != 0x0008) {
             let _ = profiles.insert(0, 0x0008);
@@ -644,17 +644,17 @@ pub fn build_get_config_features_for_media(
     if include(0x0001) {
         buf[off] = 0x00;
         buf[off + 1] = 0x01;
-        buf[off + 2] = feat_hdr(2, true, true); // 0x13
+        buf[off + 2] = feat_hdr(2, true, true); // 0x0B
         buf[off + 3] = 0x08; // additional length
         buf[off + 4..off + 8].copy_from_slice(&[0, 0, 0, 1]); // SCSI family
         buf[off + 8] = 0x06; // INQ2 | DBE
         off += 12;
     }
-    // Morphing (0x0002) — MMC-6 Table 96 Ver 0001b, mechanism-level.
+    // Morphing (0x0002) — MMC-6 Table 96 Ver 0001b, mechanism-level P=1 C=1.
     if include(0x0002) {
         buf[off] = 0x00;
         buf[off + 1] = 0x02;
-        buf[off + 2] = feat_hdr(1, true, true); // 0x0B
+        buf[off + 2] = feat_hdr(1, true, true); // 0x07
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x02; // OCEvent=1 ASYNC=0
         buf[off + 5] = 0x00;
@@ -666,7 +666,7 @@ pub fn build_get_config_features_for_media(
     if include(0x0003) {
         buf[off] = 0x00;
         buf[off + 1] = 0x03;
-        buf[off + 2] = feat_hdr(2, true, true); // 0x13
+        buf[off + 2] = feat_hdr(2, true, true); // 0x0B
         buf[off + 3] = 0x04; // additional length
                              // Byte 4: Loading Mechanism Type (bits 7-5) | Load | Eject | Pvnt
                              // Jmpr | DBML | Lock (MMC-6 Table 98) — same model as the 0x2A page.
@@ -676,61 +676,53 @@ pub fn build_get_config_features_for_media(
             | bit(caps.lock);
         off += 8;
     }
-    // Write Protect (0x0004) — MMC-6 Table 101 Ver 0010b, Hyper-Multi.
+    // Write Protect (0x0004) — MMC-6 Table 101 Ver 0010b, P0 C0.
     if caps.write_protect && include(0x0004) {
         buf[off] = 0x00;
         buf[off + 1] = 0x04;
-        buf[off + 2] = feat_hdr_active(2); // 0x13
+        buf[off + 2] = feat_hdr(2, false, false); // 0x08
         buf[off + 3] = 0x04; // additional length
         buf[off + 4..off + 8].copy_from_slice(&[0x00, 0, 0, 0]);
         off += 8;
     }
-    // Random Readable (0x0010) — MMC-6 Table 104 Ver 0000b, Hyper-Multi.
+    // Random Readable (0x0010) — MMC-6 Table 104 Ver 0000b, P0.
     if include(0x0010) {
         buf[off] = 0x00;
         buf[off + 1] = 0x10;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
+        buf[off + 2] = feat_hdr(0, false, media.present);
         buf[off + 3] = 0x08; // additional length
         buf[off + 4..off + 8].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
         buf[off + 8] = 0x00;
         buf[off + 9] = 0x01; // blocking = 1
         off += 12;
     }
-    // DVD-RAM Read (0x0012) — MMC-6 Table Ver 0000b, Hyper-Multi.
-    if caps.read_dvd_ram && include(0x0012) {
-        buf[off] = 0x00;
-        buf[off + 1] = 0x12;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
-        buf[off + 3] = 0x00;
-        off += 4;
-    }
-    // Multi-Read (0x001D) — MMC-6 Table 107 Ver 0000b, Hyper-Multi.
+    // Multi-Read (0x001D) — MMC-6 Table 107 Ver 0000b, P0.
     if include(0x001D) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1D;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
+        buf[off + 2] = feat_hdr(0, false, media.present);
         off += 4;
     }
-    // CD Read (0x001E) — MMC-6 Table 109 Ver 0010b, Hyper-Multi.
+    // CD Read (0x001E) — MMC-6 Table 109 Ver 0010b, P0.
     if include(0x001E) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1E;
-        buf[off + 2] = feat_hdr_active(2); // 0x13
+        buf[off + 2] = feat_hdr(2, false, media.present);
         buf[off + 3] = 0x04; // additional length
         off += 8;
     }
-    // DVD Read (0x001F) — MMC-6 Table 111 Ver 0010b, Hyper-Multi.
+    // DVD Read (0x001F) — MMC-6 Table 111 Ver 0010b, P0.
     if caps.read_dvd_rom && include(0x001F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x1F;
-        buf[off + 2] = feat_hdr_active(2); // 0x13
+        buf[off + 2] = feat_hdr(2, false, matches!(media.profile, CurrentProfile::DvdRom | CurrentProfile::DvdRam));
         off += 4;
     }
-    // Random Writable (0x0020) — MMC-6 Table 113 Ver 0001b, Hyper-Multi.
+    // Random Writable (0x0020) — MMC-6 Table 113 Ver 0001b, P0.
     if caps.random_writable && include(0x0020) {
         buf[off] = 0x00;
         buf[off + 1] = 0x20;
-        buf[off + 2] = feat_hdr_active(1); // 0x0B
+        buf[off + 2] = feat_hdr(1, false, media.random_writable);
         buf[off + 3] = 0x0C; // additional length
         buf[off + 4..off + 8].copy_from_slice(&last_lba.to_be_bytes());
         buf[off + 8..off + 12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
@@ -739,30 +731,36 @@ pub fn build_get_config_features_for_media(
         buf[off + 15] = 0x00;
         off += 16;
     }
-    // Incremental Streaming Writable (0x0021) — MMC-6 Table 116 Ver 0011b.
-    // No DVD-R profile in CurrentProfile; current when write_dvd_r cap is set.
+    // Incremental Streaming Writable (0x0021) — MMC-6 Table 116 Ver 0011b, P0.
     if caps.write_dvd_r && include(0x0021) {
         buf[off] = 0x00;
         buf[off + 1] = 0x21;
-        buf[off + 2] = feat_hdr(3, false, true);
-        buf[off + 3] = 0x04; // additional length
-        buf[off + 4..off + 8].fill(0);
-        off += 8;
+        buf[off + 2] = feat_hdr(3, false, false);
+        buf[off + 3] = 0x08; // additional length
+        buf[off + 4] = 0x01;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x07;
+        buf[off + 7] = 0x01;
+        buf[off + 8] = 0x10;
+        buf[off + 9] = 0x00;
+        buf[off + 10] = 0x00;
+        buf[off + 11] = 0x00;
+        off += 12;
     }
-    // Formattable (0x0023) — MMC-6 Table 121 Ver 0010b, Hyper-Multi.
+    // Formattable (0x0023) — MMC-6 Table 121 Ver 0010b, P0.
     if (caps.dvd_plus_rw || caps.random_writable) && include(0x0023) {
         buf[off] = 0x00;
         buf[off + 1] = 0x23;
-        buf[off + 2] = feat_hdr_active(2); // 0x13
+        buf[off + 2] = feat_hdr(2, false, media.formattable);
         buf[off + 3] = 0x08;
         buf[off + 4..off + 12].fill(0);
         off += 12;
     }
-    // Hardware Defect Management (0x0024) — MMC-6 Table 123 Ver 0001b, Hyper-Multi.
+    // Hardware Defect Management (0x0024) — MMC-6 Table 123 Ver 0001b, P0.
     if caps.defect_management && include(0x0024) {
         buf[off] = 0x00;
         buf[off + 1] = 0x24;
-        buf[off + 2] = feat_hdr_active(1); // 0x0B
+        buf[off + 2] = feat_hdr(1, false, media.defect_management);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x00; // SSA=0, no spare area
         buf[off + 5] = 0x00;
@@ -770,19 +768,19 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Restricted Overwrite (0x0026) — MMC-6 Table 129 Ver 0001b, Hyper-Multi.
+    // Restricted Overwrite (0x0026) — MMC-6 Table 129 Ver 0000b, P0.
     if caps.write_dvd_rw && include(0x0026) {
         buf[off] = 0x00;
         buf[off + 1] = 0x26;
-        buf[off + 2] = feat_hdr_active(1); // 0x0B
+        buf[off + 2] = feat_hdr(0, false, false);
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // DVD+RW (0x002A) — MMC-6 §5.3.x Ver 0001b, Hyper-Multi.
+    // DVD+RW (0x002A) — MMC-6 §5.3.x Ver 0001b, P0.
     if caps.dvd_plus_rw && include(0x002A) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2A;
-        buf[off + 2] = feat_hdr_active(1); // 0x0B
+        buf[off + 2] = feat_hdr(1, false, false);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x01; // Write
         buf[off + 5] = 0x00; // Quick Start / Close Only clear
@@ -790,11 +788,11 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // DVD+R (0x002B) — MMC-6 §5.3.x Ver 0000b, Hyper-Multi.
+    // DVD+R (0x002B) — MMC-6 §5.3.x Ver 0000b, P0.
     if (caps.read_dvd_plus_r || caps.write_dvd_plus_r) && include(0x002B) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2B;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
+        buf[off + 2] = feat_hdr(0, false, false);
         buf[off + 3] = 0x04; // additional length
         buf[off + 4] = 0x01; // Write
         buf[off + 5] = 0x00;
@@ -802,22 +800,104 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // DVD-R/-RW Write (0x002F) — MMC-6 Table 155 Ver 0010b, Hyper-Multi.
+    // DVD-R/-RW Write (0x002F) — MMC-6 Table 155 Ver 0010b, P0.
     if (caps.write_dvd_r || caps.write_dvd_rw) && include(0x002F) {
         buf[off] = 0x00;
         buf[off + 1] = 0x2F;
-        buf[off + 2] = feat_hdr_active(2); // 0x13
-        buf[off + 3] = 0x00; // additional length
-        off += 4;
+        buf[off + 2] = feat_hdr(2, false, false);
+        buf[off + 3] = 0x04; // additional length
+        buf[off + 4] = 0x4E;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
     }
-    // CD-RW Media Write Support (0x0037) — MMC-6 Table 163 Ver 0000b, Hyper-Multi.
+    // CD-RW Media Write Support (0x0037) — MMC-6 Table 163 Ver 0000b, P0.
     if caps.write_cdrw && include(0x0037) {
         buf[off] = 0x00;
         buf[off + 1] = 0x37;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
+        buf[off + 2] = feat_hdr(0, false, media.profile == CurrentProfile::CdRw);
         buf[off + 3] = 0x04; // additional length 4
         buf[off + 4] = 0x00; // reserved
         buf[off + 5] = 0x0F; // multi|high|ultra|ultra+
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // Rigid Restricted Overwrite (0x002C) — MMC-6 Ver 0000b, P0.
+    if caps.write_dvd_rw && include(0x002C) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2C;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x03;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // CD Track at Once (0x002D) — Ver 0010b, P0.
+    if caps.write_cdr && include(0x002D) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2D;
+        buf[off + 2] = feat_hdr(2, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x46;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x35;
+        buf[off + 7] = 0x01;
+        off += 8;
+    }
+    // CD Mastering (0x002E) — Ver 0001b, P0.
+    if caps.write_cdr && include(0x002E) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x2E;
+        buf[off + 2] = feat_hdr(1, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x6F;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x0C;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // Layer Jump Recording (0x0033) — Ver 0000b, P0.
+    if caps.dual_layer && (caps.write_dvd_r || caps.write_dvd_rw || caps.write_dvd_plus_r) && include(0x0033) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x33;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x08;
+        buf[off + 4] = 0x00;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x01;
+        buf[off + 8] = 0x10;
+        buf[off + 9] = 0x00;
+        buf[off + 10] = 0x00;
+        buf[off + 11] = 0x00;
+        off += 12;
+    }
+    // DVD+R Dual Layer (0x003B) — Ver 0000b, P0.
+    if caps.write_dvd_plus_r && caps.dual_layer && include(0x003B) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x3B;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x01;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // DVD+RW Dual Layer (0x003A) — Legacy feature, P0.
+    // Present when Profile 0018h is advertised (dual_layer + dvd_plus_rw).
+    // Minimal descriptor: no feature-specific data required.
+    if caps.dvd_plus_rw && caps.dual_layer && include(0x003A) {
+        buf[off] = 0x00;
+        buf[off + 1] = 0x3A;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x00;
+        buf[off + 5] = 0x00;
         buf[off + 6] = 0x00;
         buf[off + 7] = 0x00;
         off += 8;
@@ -830,11 +910,35 @@ pub fn build_get_config_features_for_media(
         buf[off + 3] = 0x00; // additional length
         off += 4;
     }
-    // Timeout (0x0105) — MMC-6 §5.3.x Ver 0001b, mechanism-level.
+    // CD Audio External Play (0x0103) — Ver 0000b, P0.
+    if caps.cd_da && include(0x0103) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x03;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x03;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0xFF;
+        off += 8;
+    }
+    // Microcode Upgrade (0x0104) — Ver 0001b, P0 C1.
+    if include(0x0104) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x04;
+        buf[off + 2] = feat_hdr(1, false, true); // 0x05
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x01;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x00;
+        off += 8;
+    }
+    // Timeout (0x0105) — MMC-6 §5.3.37 Ver 0001b, mechanism-level P=1 C=1.
     if include(0x0105) {
         buf[off] = 0x01;
         buf[off + 1] = 0x05;
-        buf[off + 2] = feat_hdr(1, true, true); // 0x0B
+        buf[off + 2] = feat_hdr(1, true, true); // 0x07
         buf[off + 3] = 0x04;
         buf[off + 4] = 0x00; // Group3=0
         buf[off + 5] = 0x00;
@@ -842,27 +946,61 @@ pub fn build_get_config_features_for_media(
         buf[off + 7] = 0x00;
         off += 8;
     }
-    // Real-Time Streaming (0x0107) — MMC-6 Table 190 Ver 0101b, mechanism-level.
+    // Real-Time Streaming (0x0107) — MMC-6 Table 190 Ver 0101b, mechanism-level P=1 C=1.
     if include(0x0107) {
         buf[off] = 0x01;
         buf[off + 1] = 0x07;
-        buf[off + 2] = feat_hdr(5, true, true); // 0x2B
+        buf[off + 2] = feat_hdr(5, true, true); // 0x17
         buf[off + 3] = 0x04;
-        buf[off + 4] = 0x1C; // RBCB=1 SCS=1 MP2A=1
+        buf[off + 4] = 0x1F;
         buf[off + 5] = 0x00;
         buf[off + 6] = 0x00;
         buf[off + 7] = 0x00;
         off += 8;
     }
+    // Drive Serial Number (0x0108) — Ver 0000b, P1 C1.
+    if include(0x0108) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x08;
+        buf[off + 2] = feat_hdr(0, true, true); // 0x03
+        buf[off + 3] = 0x10;
+        let serial: &[u8; 16] = b"B9GRXF2232256   ";
+        let snow_serial: &[u8; 16] = b"SNOW000000000000";
+        let s = if caps.write_dvd_ram { snow_serial } else { serial };
+        buf[off + 4..off + 20].copy_from_slice(s);
+        off += 20;
+    }
     // MRW (Mount Rainier, 0x0028) is deliberately NOT reported
-    // Disc Control Block (0x010A) — Hyper-Multi.
+    // Disc Control Block (0x010A) — P0.
     if caps.dvd_plus_rw && include(0x010A) {
         buf[off] = 0x01;
         buf[off + 1] = 0x0A;
-        buf[off + 2] = feat_hdr_active(0); // 0x03
+        buf[off + 2] = feat_hdr(0, false, false);
         buf[off + 3] = 0x0C;
         buf[off + 4..off + 16].copy_from_slice(b"FDC\0SDC\0TOC\0");
         off += 16;
+    }
+    // DVD CPRM (0x010B) — Ver 0000b, P0.
+    if caps.read_dvd_rom && include(0x010B) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x0B;
+        buf[off + 2] = feat_hdr(0, false, false);
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x00;
+        buf[off + 5] = 0x00;
+        buf[off + 6] = 0x00;
+        buf[off + 7] = 0x01;
+        off += 8;
+    }
+    // Firmware Information (0x010C) — Ver 0000b, P1 C1.
+    if include(0x010C) {
+        buf[off] = 0x01;
+        buf[off + 1] = 0x0C;
+        buf[off + 2] = feat_hdr(0, true, true); // 0x03
+        buf[off + 3] = 0x10;
+        let fw = b"20161110144100\x00\x00";
+        buf[off + 4..off + 20].copy_from_slice(&fw[..16]);
+        off += 20;
     }
     off
 }
@@ -1155,13 +1293,13 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::MODE_SENSE_10;
         cdb[2] = 0x3F;
-        cdb[8] = 200;
-        let mut buf = [0u8; 200];
+        cdb[8] = 255;
+        let mut buf = [0u8; 255];
         let n = run_data(&mut dev, &cdb, &mut buf);
         assert_eq!(n, 8 + ALL_CDROM_PAGES_LEN); /* 8 header + pages */
         assert_eq!(buf[0], ((n - 2) >> 8) as u8);
         assert_eq!(buf[1], (n - 2) as u8); /* mode data length */
-        // Walk pages by length fields and collect codes — order: 0x00,0x01,0x08,0x0D,0x0E,0x1A,0x1D,0x2A.
+        // Walk pages by length fields and collect codes — order: 0x00,0x01,0x05,0x08,0x0D,0x0E,0x1A,0x1D,0x2A.
         let mut codes = Vec::new();
         let mut off = 8;
         while off + 2 <= n {
@@ -1169,7 +1307,7 @@ mod tests {
             codes.push(buf[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x00, 0x01, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
+        assert_eq!(codes, vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
     }
     #[test]
     fn cdrom_mode_page_all_pages_contains_each_page() {
@@ -1183,7 +1321,7 @@ mod tests {
             codes.push(all[off] & 0x3F);
             off += page_len + 2;
         }
-        assert_eq!(codes, vec![0x00, 0x01, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
+        assert_eq!(codes, vec![0x00, 0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A]);
     }
     // ── GET CONFIGURATION common features ───────────────────────────
     #[test]
@@ -1559,23 +1697,19 @@ mod tests {
                                   // Walk the feature list and check codes + key fields.
         let mut off = 8usize;
         let mut saw_rw = false;
-        let mut saw_dvdram = false;
         while off + 4 <= n {
             let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
             let add_len = buf[off + 3] as usize;
             match code {
                 0x0020 => {
                     saw_rw = true;
-                    // MMC-6 Table 113 Ver 0001b, Hyper-Multi (P=1, C=1).
-                    assert_eq!(buf[off + 2], 0x0B);
+                    // MMC-6 Table 113 Ver 0001b, P0 — C=1 when media present and random_writable.
+                    // feat_hdr(1, false, true) = (1 << 2) | 0 | 1 = 0x05.
+                    assert_eq!(buf[off + 2], 0x05);
                     assert_eq!(add_len, 12);
                     assert_eq!(&buf[off + 4..off + 8], &0x1234u32.to_be_bytes());
                     assert_eq!(&buf[off + 8..off + 12], &2048u32.to_be_bytes());
                     assert_eq!(&buf[off + 12..off + 14], &1u16.to_be_bytes());
-                }
-                0x0012 => {
-                    saw_dvdram = true;
-                    assert_eq!(add_len, 0);
                 }
                 0x001F => {
                     // DVD Read present for the DVD-RAM profile.
@@ -1586,7 +1720,6 @@ mod tests {
             off += 4 + add_len;
         }
         assert!(saw_rw, "Random Writable feature must be present");
-        assert!(saw_dvdram, "DVD-RAM feature must be present");
     }
     #[test]
     fn dvd_ram_mandatory_features_table212() {
@@ -1629,8 +1762,8 @@ mod tests {
             match code {
                 0x0002 => {
                     saw_0002 = true;
-                    // MMC-6 Table 96 Ver 0001b + P + C = 0x0B
-                    assert_eq!(ver_pers_cur, 0x0B, "Morphing Ver 0001b + P+C");
+                    // MMC-6 Table 96 Ver 0001b, mechanism-level P=1 C=1: feat_hdr(1,true,true) = 0x07.
+                    assert_eq!(ver_pers_cur, 0x07, "Morphing Ver 0001b P1 C1");
                     assert_eq!(add_len, 0x04);
                     assert_eq!(check[off + 4], 0x02, "OCEvent=1");
                 }
@@ -1639,8 +1772,9 @@ mod tests {
                     saw_0024_len = Some(add_len);
                     saw_0024_ssa = Some(check[off + 4]);
                     assert_eq!(add_len, 0x04);
-                    // MMC-6 Table 123 Ver 0001b, Hyper-Multi = 0x0B
-                    assert_eq!(ver_pers_cur, 0x0B, "0024 Ver 0001b + P + C");
+                    // MMC-6 Table 123 Ver 0001b, P0 — C=1 when defect_management is true.
+                    // feat_hdr(1, false, true) = (1 << 2) | 0 | 1 = 0x05.
+                    assert_eq!(ver_pers_cur, 0x05, "0024 Ver 0001b P0 C1");
                     assert_eq!(check[off + 4] & 0x80, 0x00, "SSA=0");
                 }
                 0x0100 => {
@@ -1651,14 +1785,14 @@ mod tests {
                 }
                 0x0105 => {
                     saw_0105 = true;
-                    // MMC-6 §5.3.x Ver 0001b + P + C = 0x0B
-                    assert_eq!(ver_pers_cur, 0x0B);
+                    // MMC-6 §5.3.37 Ver 0001b, mechanism-level P=1 C=1: feat_hdr(1,true,true) = 0x07.
+                    assert_eq!(ver_pers_cur, 0x07);
                     assert_eq!(add_len, 0x04);
                 }
                 0x0107 => {
                     saw_0107 = true;
-                    // MMC-6 Table 190 Ver 0101b + P + C = 0x2B
-                    assert_eq!(ver_pers_cur, 0x2B);
+                    // MMC-6 Table 190 Ver 0101b, mechanism-level P=1 C=1: feat_hdr(5,true,true) = 0x17.
+                    assert_eq!(ver_pers_cur, 0x17);
                     assert_eq!(add_len, 0x04);
                 }
                 0x0008 => panic!("old defect code 0x0008 must not be emitted, should be 0x0024"),
@@ -1681,13 +1815,12 @@ mod tests {
         assert!(saw_0100, "Power Management 0100 missing");
         assert!(saw_0105, "Timeout 0105 missing");
         assert!(saw_0107, "Real-Time Streaming 0107 missing");
-        // Hyper-Multi: all features report P=1, C=1 regardless of media state.
-        assert_eq!(saw_0024_ver, Some(0x0B));
+        // P0 for media-dependent features: C=1 when media state matches.
+        assert_eq!(saw_0024_ver, Some(0x05));
         assert_eq!(saw_0024_len, Some(0x04));
         assert_eq!(saw_0024_ssa, Some(0x00));
         assert!(codes.contains(&0x0024));
-        // Hyper-Multi: even when defect_management media state is false,
-        // the feature still reports P=1, C=1.
+        // When defect_management is false, P0 C0: feat_hdr(1, false, false) = 0x04.
         let media_off = MediaState {
             defect_management: false,
             ..media
@@ -1716,8 +1849,8 @@ mod tests {
         }
         assert_eq!(
             ver_off,
-            Some(0x0B),
-            "Hyper-Multi: defect_management false still reports P=1, C=1"
+            Some(0x04),
+            "P0: defect_management false => C0 (feat_hdr(1,false,false)=0x04)"
         );
     }
 }
