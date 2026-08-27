@@ -431,12 +431,9 @@ impl IscsiSession {
                         if write_all(conn, &work[..len]).is_err() {
                             return StepResult::Closed;
                         }
-                        // Only final responses carry StatSN and advance it.
-                        // Intermediate Data-In (state stays DataIn) and R2T
-                        // (state → R2tCollect) are not final.
-                        if matches!(self.state, IscsiState::RecvPdu | IscsiState::Closed) {
-                            self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-                        }
+                        // StatSN is already advanced inside `poll` for final
+                        // `NeedSend` (state `RecvPdu`/`Closed`); intermediate
+                        // Data-In/R2T keep the current StatSN.
                     }
                     SessionStep::NeedRecv => return StepResult::Idle,
                     SessionStep::Closed => return StepResult::Closed,
@@ -545,7 +542,7 @@ impl IscsiSession {
                                     if write_all(conn, &work[..len]).is_err() {
                                         return StepResult::Closed;
                                     }
-                                    self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+                                    // StatSN already advanced inside `poll`.
                                 }
                                 SessionStep::NeedRecv => continue,
                                 SessionStep::Closed => return StepResult::Closed,
@@ -683,13 +680,20 @@ impl IscsiSession {
         bhs.set_flags(flag::F_BIT);
         bhs.set_itt(itt);
         bhs.set_ttt(TTT);
+        bhs.set_lun(lun as u8);
         bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_r2t_sn(r2t_sn);
         bhs.set_buffer_offset(received as u32);
         bhs.set_desired_data_len(burst as u32);
-        crate::trace!("R2T: R2TSN={} BO={} DesiredLen={}", r2t_sn, received, burst);
+        crate::trace!(
+            "R2T: R2TSN={} BO={} DesiredLen={} LUN={}",
+            r2t_sn,
+            received,
+            burst,
+            lun
+        );
 
         work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let pad = pdu_pad_len(0) as usize;
@@ -942,7 +946,10 @@ impl IscsiSession {
     ) -> SessionStep<'a> {
         let st = self.state;
         let IscsiState::ParamCollect {
-            expected, received, ..
+            expected,
+            received,
+            lun,
+            ..
         } = st
         else {
             return SessionStep::Error(TargetError::Internal);
@@ -953,6 +960,7 @@ impl IscsiSession {
         bhs.set_flags(flag::F_BIT);
         bhs.set_itt(itt);
         bhs.set_ttt(TTT);
+        bhs.set_lun(lun as u8);
         bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
@@ -975,6 +983,40 @@ impl IscsiSession {
 
     fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
         let req = &pdu.bhs;
+        // Login C bit (byte1 bit6, RFC 3720 §10.12.1) — continuation not
+        // supported; reject if set (M10).
+        if req.as_bytes()[1] & 0x40 != 0 {
+            return self.reject(work, reject::PROTOCOL_ERROR, req);
+        }
+        // Version range check (RFC 3720 §10.13.5): we support 0x00 only.
+        // If initiator's [min,max] does not include 0, return 02/05.
+        let req_min = req.version_min();
+        if req_min > 0x00 {
+            let mut resp = Bhs::new();
+            resp.set_opcode(op::LOGIN_RESP);
+            resp.set_itt(req.itt());
+            resp.set_flags(req.csg() << flag::CSG_SHIFT);
+            resp.as_mut_bytes()[2] = 0x00; // Version-max
+            resp.as_mut_bytes()[3] = 0x00; // Version-active
+            resp.as_mut_bytes()[8..14].copy_from_slice(&req.as_bytes()[8..14]);
+            if req.tsih() == 0 {
+                resp.as_mut_bytes()[15] = 1;
+            } else {
+                resp.as_mut_bytes()[14..16].copy_from_slice(&req.as_bytes()[14..16]);
+            }
+            resp.set_data_segment_len(0);
+            resp.set_stat_sn(self.stat_sn.get());
+            resp.set_exp_cmd_sn(req.cmd_sn());
+            resp.set_max_cmd_sn(req.cmd_sn());
+            resp.as_mut_bytes()[36] = 0x02; // Initiator Error
+            resp.as_mut_bytes()[37] = 0x05; // Version not supported
+            work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+            let pad = pdu_pad_len(0) as usize;
+            work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+            self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+            self.state = IscsiState::Closed;
+            return SessionStep::NeedSend(&work[..BHS_SIZE + pad]);
+        }
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
 
@@ -1021,7 +1063,9 @@ impl IscsiSession {
         resp.set_opcode(op::LOGIN_RESP);
         resp.set_itt(req.itt());
         resp.set_flags((if t { flag::T_BIT } else { 0 }) | (req_csg << flag::CSG_SHIFT) | nsg);
-        // ISID echo (bytes 8-13, RFC 3720 §10.12).
+        resp.as_mut_bytes()[2] = 0x00; // Version-max (RFC 3720 §10.13.2)
+        resp.as_mut_bytes()[3] = 0x00; // Version-active
+                                       // ISID echo (bytes 8-13, RFC 3720 §10.12).
         resp.as_mut_bytes()[8..14].copy_from_slice(&req.as_bytes()[8..14]);
         // TSIH: non-zero for a new session's final response (§10.13.3).
         if req.tsih() == 0 {
@@ -1039,7 +1083,7 @@ impl IscsiSession {
         let total = BHS_SIZE + resp_len;
         let pad = pdu_pad_len(resp_len as u32) as usize;
         work[total..total + pad].fill(0);
-        // stat_sn incremented by step() after sending.
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
 
         if t {
             self.stage = LoginStage::from_csg(nsg).unwrap_or(LoginStage::FullFeature);
@@ -1318,6 +1362,7 @@ impl IscsiSession {
                     dib.set_data_segment_len(chunk as u32);
                     work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
                     self.state = IscsiState::RecvPdu;
+                    self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
                 } else {
                     // Multi-chunk: first chunk is intermediate (F=0, S=0).
                     let mut dib = Bhs::new();
@@ -1532,6 +1577,7 @@ impl IscsiSession {
         work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
@@ -1576,6 +1622,7 @@ impl IscsiSession {
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..total + pad])
     }
 
@@ -1592,6 +1639,7 @@ impl IscsiSession {
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
         self.state = IscsiState::Closed;
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..BHS_SIZE + pad])
     }
 
@@ -1663,6 +1711,7 @@ impl IscsiSession {
         let pad = pdu_pad_len(dlen) as usize;
         work[total..total + pad].fill(0);
         self.state = IscsiState::RecvPdu;
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..total + pad])
     }
 
@@ -1698,6 +1747,7 @@ impl IscsiSession {
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..total + pad])
     }
 
@@ -1728,6 +1778,7 @@ impl IscsiSession {
         let total = BHS_SIZE + data_len;
         let pad = pdu_pad_len(data_len as u32) as usize;
         work[total..total + pad].fill(0);
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..total + pad])
     }
 
@@ -1756,6 +1807,7 @@ impl IscsiSession {
         let pad = pdu_pad_len(BHS_SIZE as u32) as usize;
         work[total..total + pad].fill(0);
         self.state = IscsiState::Closed;
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         SessionStep::NeedSend(&work[..total + pad])
     }
 }
