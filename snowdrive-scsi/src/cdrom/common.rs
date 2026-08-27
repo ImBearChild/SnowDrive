@@ -17,13 +17,14 @@ use crate::scsi::device::CommandOutcome;
 use crate::scsi::spc::DeviceIdentity;
 /// CD-ROM logical block size (Mode 1: 2048 data bytes per sector).
 pub const SECTOR_SIZE: u32 = 2048;
-/// INQUIRY identity for CD-ROM devices: SCSI family, with
-/// SPC-4 and MMC-6 version descriptors.
+/// INQUIRY identity for CD-ROM devices: SCSI family; MMC is not
+/// claimed via INQUIRY descriptors (mimics real hardware: SPC-4/SBC-3 only,
+/// MMC via GET CONFIGURATION).
 pub const CDROM_IDENTITY: DeviceIdentity = DeviceIdentity {
     vendor: *b"SnowSCSI",
     product: *b"HyperMulti DVD  ",
     revision: *b"0100",
-    version_descriptors: [0x00A0, 0x0960, 0x0460, 0x05C0], /* SAM-5, iSCSI, SPC-4, MMC-6 */
+    version_descriptors: [0x00A0, 0x0960, 0x0460, 0x04C0], /* SAM-5, iSCSI, SPC-4, SBC-3 (no MMC) */
 };
 /// Current Profile code for GET CONFIGURATION (MMC-6 §5.4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

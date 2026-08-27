@@ -1616,8 +1616,7 @@ impl IscsiSession {
         // Minimal SendTargets: static target only, no TargetAddress, no continuation.
         // RFC 3720 Appendix D: All / <iqn> / <empty> for discovery vs operational.
         // Lenient: serve on both session types (discovery MUST).
-        let should_return =
-            value == b"All" || value.is_empty() || value == TARGET_NAME.as_bytes();
+        let should_return = value == b"All" || value.is_empty() || value == TARGET_NAME.as_bytes();
         let mut resp = Bhs::new();
         resp.set_opcode(op::TEXT_RESP);
         resp.set_flags(flag::F_BIT);
