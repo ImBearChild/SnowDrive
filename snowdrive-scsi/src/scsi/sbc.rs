@@ -62,6 +62,11 @@ pub enum SbcCommand {
         alloc: u32,
     },
     SynchronizeCache,
+    /// FORMAT UNIT (04h, SBC-3 §5.3). Minimal direct-access profile:
+    /// `FMTDATA=0` (no parameter list) is the mandatory simple format.
+    FormatUnit {
+        cdb1: u8,
+    },
     Spc(SpcCommand),
 }
 
@@ -128,6 +133,7 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
                 | u32::from(cdb[13]),
         }),
         op::SYNCHRONIZE_CACHE_10 => Some(SbcCommand::SynchronizeCache),
+        op::FORMAT_UNIT => Some(SbcCommand::FormatUnit { cdb1: cdb[1] }),
         _ => None,
     }
 }
@@ -167,6 +173,7 @@ pub(crate) fn execute_sbc<D: FlatData>(
             let _ = dev.sync_backend();
             CommandOutcome::Status
         }
+        SbcCommand::FormatUnit { cdb1 } => dev.format_unit_cmd(cdb1),
         SbcCommand::Spc(spc) => execute_spc(dev, spc, data),
     }
 }

@@ -456,6 +456,27 @@ impl<D: FlatData> BlockDevice<D> {
         data[0..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
     }
+
+    pub(crate) fn format_unit_cmd(&mut self, cdb1: u8) -> CommandOutcome {
+        // SBC-3 §5.3 Table 27: byte1 = FMTPINFO(7:6) | LONGLIST(5) | FMTDATA(4) |
+        // CMPLST(3) | DEFECT LIST FORMAT(2:0). Simplest form is FMTDATA=0
+        // (no parameter list, vendor-specific formatting, M per Table 25).
+        let fmt_data = cdb1 & 0x10 != 0;
+        let fmtpinfo = (cdb1 >> 6) & 0x03;
+        if !fmt_data {
+            // SBC-3 §5.3.1: FMTDATA=0 + FMTPINFO!=0 => INVALID FIELD IN CDB.
+            if fmtpinfo != 0 {
+                return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+            }
+            // CMPLST/LONGLIST are ignored when FMTDATA=0 (§5.3.1).
+            // No-op format is sufficient for the block profile (RAM disk);
+            // real hardware would zero or certify, but GOOD is compliant.
+            return CommandOutcome::Status;
+        }
+        // FMTDATA=1 requires a parameter list; this minimal profile does not
+        // implement defect lists / protection provisioning — report INVALID FIELD.
+        self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+    }
 }
 
 impl<D: WritableFlatData> BlockDevice<D> {
