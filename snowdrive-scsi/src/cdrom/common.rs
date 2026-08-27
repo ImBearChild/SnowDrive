@@ -102,9 +102,9 @@ impl MediaState {
     }
 }
 // ── CD-ROM MODE SENSE pages ─────────────────────────────────────────
-/// Caching page (0x08, SPC-4 ): WCE=0, RCD=0, DRA=1.
+/// Caching page (0x08, SPC-4 ): WCE=0, RCD=0, DRA=1, PS=0 (not savable).
 const CACHING_PAGE: [u8; 20] = [
-    0x88, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0,
+    0x08, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0,
 ];
 /// Vendor-specific page (0x00).
 const VENDOR_PAGE: [u8; 4] = [0x00, 2, 0x00, 0x08];

@@ -60,6 +60,8 @@ pub mod asc {
     pub const INVALID_FIELD_IN_PARAMETER_LIST: u8 = 0x26;
     pub const LOGICAL_UNIT_NOT_SUPPORTED: u8 = 0x25;
     pub const WRITE_PROTECTED: u8 = 0x27;
+    /// ASC 39h — SAVING PARAMETERS NOT SUPPORTED (SPC-3 §6.9 PC=11b).
+    pub const SAVING_PARAMETERS_NOT_SUPPORTED: u8 = 0x39;
     /// ASC 29h — POWER ON, RESET, OR BUS DEVICE RESET OCCURRED (SPC-4
     /// §4.5.6), injected as a unit attention after a device reset.
     pub const POWER_ON_RESET: u8 = 0x29;

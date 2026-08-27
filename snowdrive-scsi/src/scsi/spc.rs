@@ -39,10 +39,10 @@ pub const BLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
 };
 
 /// Mode pages for the block device (SPC-4 §7.4): the caching page
-/// (PS=1, page 0x08, WCE=0, RCD=0, DRA=1) followed by the vendor-specific
-/// page 0x00.
+/// (PS=0, page 0x08, WCE=0, RCD=0, DRA=1) followed by the vendor-specific
+/// page 0x00. PS=0 because the page is never savable (no SP=1 support).
 pub const ALL_MODE_PAGES: [u8; 24] = [
-    0x88, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, /* caching */
+    0x08, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, /* caching PS=0 */
     0x00, 2, 0x00, 0x08, /* vendor page 0x00 */
 ];
 
@@ -83,6 +83,7 @@ pub enum SpcCommand {
     ModeSense {
         long: bool,
         page: u8,
+        pc: u8,
         alloc: u16,
     },
     ModeSelect {
@@ -129,11 +130,13 @@ pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
         op::MODE_SENSE_6 => Some(SpcCommand::ModeSense {
             long: false,
             page: cdb[2] & 0x3F,
+            pc: (cdb[2] >> 6) & 0x03,
             alloc: u16::from(cdb[4]),
         }),
         op::MODE_SENSE_10 => Some(SpcCommand::ModeSense {
             long: true,
             page: cdb[2] & 0x3F,
+            pc: (cdb[2] >> 6) & 0x03,
             alloc: (u16::from(cdb[7]) << 8) | u16::from(cdb[8]),
         }),
         op::MODE_SELECT_6 => Some(SpcCommand::ModeSelect {
@@ -191,6 +194,10 @@ pub trait SpcDevice {
     fn set_sense(&mut self, sense: Sense);
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect;
     fn set_prevent(&mut self, prevent: bool);
+    /// Whether the medium is write-protected for MODE SENSE WP bit (SPC-3 §7.4.3).
+    fn is_write_protected(&self) -> bool {
+        false
+    }
 }
 
 /// Execute one parsed SPC command against `dev`. Synthesized responses are
@@ -211,15 +218,28 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
 
         SpcCommand::Inquiry { evpd, page, alloc } => inquiry(dev, evpd, page, alloc, data),
 
-        SpcCommand::ModeSense { long, page, alloc } => {
+        SpcCommand::ModeSense {
+            long,
+            page,
+            pc,
+            alloc,
+            ..
+        } => {
+            // SPC-3 §6.9 PC field (byte2 bits7:6): 00b current, 01b changeable,
+            // 10b default, 11b saved. Saved not supported (SP=0 only).
+            if pc == 0b11 {
+                return cc(
+                    dev,
+                    SenseKey::IllegalRequest,
+                    asc::SAVING_PARAMETERS_NOT_SUPPORTED,
+                );
+            }
             let Some(page_bytes) = dev.mode_page(page) else {
                 return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD);
             };
             let header_len = if long { 8 } else { 4 };
             let total = header_len + page_bytes.len();
             let mode_len = if long { total - 2 } else { total - 1 };
-            // Large enough for the CD-ROM all-pages (0x3F) response:
-            // 8-byte header + 142 bytes of pages = 150 (with 0x01/0x1A/0x1D).
             let mut buf = [0u8; 256];
             if long {
                 buf[0] = (mode_len >> 8) as u8;
@@ -229,10 +249,28 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             }
             if long {
                 buf[2] = dev.medium_type();
+                buf[3] = if dev.is_write_protected() { 0x80 } else { 0x00 };
             } else {
                 buf[1] = dev.medium_type();
+                buf[2] = if dev.is_write_protected() { 0x80 } else { 0x00 };
             }
-            buf[header_len..total].copy_from_slice(page_bytes);
+            if pc == 0b01 {
+                // Changeable mask: our pages have no changeable fields (all 0).
+                // Preserve page code/length, zero the rest.
+                let mut tmp = [0u8; 256];
+                tmp[..page_bytes.len()].copy_from_slice(page_bytes);
+                let mut p = 0usize;
+                while p + 2 <= page_bytes.len() {
+                    let len = tmp[p + 1] as usize;
+                    for b in &mut tmp[p + 2..p + 2 + len] {
+                        *b = 0;
+                    }
+                    p += 2 + len;
+                }
+                buf[header_len..total].copy_from_slice(&tmp[..page_bytes.len()]);
+            } else {
+                buf[header_len..total].copy_from_slice(page_bytes);
+            }
             let n = total.min(alloc as usize);
             data[0..n].copy_from_slice(&buf[..n]);
             CommandOutcome::OutInline { len: n }
@@ -527,7 +565,8 @@ mod tests {
             Some(SpcCommand::ModeSense {
                 long: true,
                 page: 0x3F,
-                alloc: 32
+                pc: 0,
+                alloc: 32,
             })
         );
 
@@ -714,7 +753,7 @@ mod tests {
         let n = run_data(&mut dev, &cdb, &mut buf);
         assert_eq!(n, 24);
         assert_eq!(buf[0], 23); /* mode data length */
-        assert_eq!(buf[4], 0x88);
+        assert_eq!(buf[4], 0x08); /* PS=0 */
         assert_eq!(buf[5], 18);
         assert_eq!(buf[16], 0x20); /* DRA=1 */
     }
@@ -744,7 +783,7 @@ mod tests {
         run_data(&mut dev, &cdb, &mut buf);
         let mode_len = (u16::from(buf[0]) << 8) | u16::from(buf[1]);
         assert_eq!(mode_len, 26);
-        assert_eq!(buf[8], 0x88);
+        assert_eq!(buf[8], 0x08); /* PS=0 */
         assert_eq!(buf[9], 18);
     }
 

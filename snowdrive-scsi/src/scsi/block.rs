@@ -625,6 +625,10 @@ impl<D: FlatData> SpcDevice for BlockDevice<D> {
     fn set_prevent(&mut self, prevent: bool) {
         self.prevent_removal = prevent;
     }
+
+    fn is_write_protected(&self) -> bool {
+        !matches!(self.write_path, WritePath::Open(_))
+    }
 }
 
 impl<D: FlatData> ScsiDevice for BlockDevice<D> {
@@ -652,8 +656,42 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
         self.pdt
     }
 
-    fn complete_param(&mut self, _cdb: &[u8], _data: &[u8]) -> CommandOutcome {
-        // Both profiles accept any MODE SELECT parameter (no-op).
+    fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
+        // Minimal MODE SELECT validation per SPC-3 §6.7: header + block
+        // descriptor + page length must be consistent, otherwise 05/26 or
+        // 05/24. We support caching 0x08 (18) and vendor 0x00 (2) only.
+        let long = cdb[0] == 0x55;
+        let header_len = if long { 8 } else { 4 };
+        if data.len() < header_len {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let block_len = if long {
+            u16::from_be_bytes([data[6], data[7]]) as usize
+        } else {
+            data[3] as usize
+        };
+        if header_len + block_len > data.len() {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let page_start = header_len + block_len;
+        if page_start == data.len() {
+            return CommandOutcome::Status;
+        }
+        if page_start + 2 > data.len() {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let page_code = data[page_start] & 0x3F;
+        let page_len = data[page_start + 1] as usize;
+        if page_start + 2 + page_len != data.len() {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        if page_code != 0x08 && page_code != 0x00 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let expected = if page_code == 0x08 { 18 } else { 2 };
+        if page_len != expected {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
         CommandOutcome::Status
     }
 

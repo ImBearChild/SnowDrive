@@ -489,6 +489,7 @@ impl<'a> CdromDrive<'a> {
         if let Some(SpcCommand::ModeSense {
             long,
             page: 0x05,
+            pc: _,
             alloc,
         }) = spc
         {
@@ -1406,6 +1407,10 @@ impl SpcDevice for CdromDrive<'_> {
 
     fn set_prevent(&mut self, prevent: bool) {
         self.prevent_removal = prevent;
+    }
+
+    fn is_write_protected(&self) -> bool {
+        !self.is_random_writable()
     }
 }
 
