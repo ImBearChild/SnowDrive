@@ -746,6 +746,59 @@ mod tests {
         assert_eq!(bhs[2], reject::COMMAND_NOT_SUPPORTED);
     }
 
+    #[test]
+    fn sendtargets_all_on_discovery_returns_target_name() {
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        // Login with Discovery
+        let text = b"InitiatorName=iqn.test\0SessionType=Discovery\0TargetName=iqn.1970-01.local.snowscsi:target\0";
+        let bhs = {
+            let mut bhs = [0u8; 48];
+            bhs[0] = op::LOGIN_REQ | 0x40;
+            bhs[1] =
+                flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
+            let dsl = text.len() as u32;
+            bhs[5] = (dsl >> 16) as u8;
+            bhs[6] = (dsl >> 8) as u8;
+            bhs[7] = dsl as u8;
+            bhs
+        };
+        conn.feed_padded(&bhs, text);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        conn.take_pdu().unwrap();
+
+        // SendTargets=All
+        let payload = b"SendTargets=All\0";
+        let mut txt = [0u8; 48];
+        txt[0] = op::TEXT_REQ;
+        txt[1] = flag::F_BIT;
+        txt[5] = (payload.len() >> 16) as u8;
+        txt[6] = (payload.len() >> 8) as u8;
+        txt[7] = payload.len() as u8;
+        txt[16..20].copy_from_slice(&be32(0x5555));
+        txt[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
+        txt[24..28].copy_from_slice(&be32(1));
+        conn.feed_padded(&txt, payload);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::TEXT_RESP);
+        assert_eq!(bhs[1] & flag::F_BIT, flag::F_BIT);
+        assert_eq!(&bhs[16..20], &be32(0x5555));
+        assert_eq!(&bhs[20..24], &be32(0xFFFF_FFFF));
+        assert!(data.windows(11).any(|w| w == b"TargetName="));
+        assert!(data.windows(8).any(|w| w == b"snowscsi"));
+    }
+
     // ── AHS defense: TotalAHSLength > 0 → Reject 0x04 ──────────────
 
     #[test]

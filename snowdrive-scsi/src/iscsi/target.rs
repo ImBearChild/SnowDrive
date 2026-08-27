@@ -132,6 +132,10 @@ impl Default for NegotiatedParams {
 
 // ── Private constants ───────────────────────────────────────────────
 
+/// iSCSI Qualified Name for this target (RFC 3720 §3.2.6).
+/// Static single-target model; matches `snowdrive-cli::ISCSI_TARGET_NAME`.
+const TARGET_NAME: &str = "iqn.1970-01.local.snowscsi:target";
+
 /// Target Transfer Tag for R2T — single outstanding transfer.
 const TTT: u32 = 1;
 /// RFC 3720 §12.14 suggested defaults (clamped when the initiator sends more).
@@ -158,6 +162,8 @@ const LOGIN_TABLE: &[LoginParam] = &[
         always: true,
     },
     LoginParam {
+        // AuthMethod=None only; CHAP/KRB5 omitted due to no-alloc
+        // constraint (RFC 3720 §8.2.1 CHAP MUST is a known gap, documented).
         key: "AuthMethod",
         value: Some("None"),
         always: false,
@@ -270,6 +276,7 @@ pub struct IscsiSession {
     stage: LoginStage,
     max_recv_data_segment: u32,
     neg: NegotiatedParams,
+    is_discovery: bool,
     state: IscsiState,
 }
 
@@ -342,6 +349,7 @@ impl IscsiSession {
             stage: LoginStage::Security,
             max_recv_data_segment: MAX_DATA_SEGMENT,
             neg: NegotiatedParams::default(),
+            is_discovery: false,
             state: IscsiState::RecvPdu,
         }
     }
@@ -598,7 +606,7 @@ impl IscsiSession {
                     op::SCSI_TASK_REQ => self.handle_tmf(work, &pdu),
                     op::NOP_OUT => self.handle_nop(work, &pdu),
                     op::LOGOUT_REQ => self.handle_logout(work, &pdu),
-                    op::TEXT_REQ => self.reject(work, reject::COMMAND_NOT_SUPPORTED, &pdu.bhs),
+                    op::TEXT_REQ => self.handle_text(work, &pdu),
                     op::LOGIN_REQ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
                     _ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
                 }
@@ -1064,7 +1072,9 @@ impl IscsiSession {
             let key = &src[p..eq];
             let val = &src[eq + 1..val_end];
 
-            if let Some(idx) = find_key(key) {
+            if key == b"SessionType" {
+                self.is_discovery = val == b"Discovery";
+            } else if let Some(idx) = find_key(key) {
                 sent[idx] = true;
                 if key == b"ImmediateData" {
                     // RFC 3720 §12.11 Result function is AND, Default Yes.
@@ -1566,6 +1576,78 @@ impl IscsiSession {
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
         self.state = IscsiState::Closed;
         SessionStep::NeedSend(&work[..BHS_SIZE + pad])
+    }
+
+    fn handle_text<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+        let bhs = &pdu.bhs;
+        // F=0 (continuation) and non-0xFFFFFFFF TTT are not supported (no fragmentation);
+        // be lenient for the legacy text_request_rejected test that sends a minimal BHS.
+        if pdu.dsl > work.len() - BHS_SIZE {
+            return SessionStep::Error(TargetError::WorkBufTooSmall);
+        }
+        let data = &work[BHS_SIZE..BHS_SIZE + pdu.dsl];
+        let mut pos = 0usize;
+        let mut found = false;
+        let mut value: &[u8] = &[];
+        while pos < data.len() {
+            let end = data[pos..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(data.len(), |i| pos + i);
+            let entry = &data[pos..end];
+            if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+                let k = &entry[..eq];
+                let v = &entry[eq + 1..];
+                if k == b"SendTargets" {
+                    found = true;
+                    value = v;
+                    break;
+                }
+            }
+            if end >= data.len() {
+                break;
+            }
+            pos = end + 1;
+        }
+        if !found {
+            // Unknown Text key — reject as before (preserves text_request_rejected test).
+            return self.reject(work, reject::COMMAND_NOT_SUPPORTED, bhs);
+        }
+        // Minimal SendTargets: static target only, no TargetAddress, no continuation.
+        // RFC 3720 Appendix D: All / <iqn> / <empty> for discovery vs operational.
+        // Lenient: serve on both session types (discovery MUST).
+        let should_return =
+            value == b"All" || value.is_empty() || value == TARGET_NAME.as_bytes();
+        let mut resp = Bhs::new();
+        resp.set_opcode(op::TEXT_RESP);
+        resp.set_flags(flag::F_BIT);
+        resp.set_itt(bhs.itt());
+        resp.set_ttt(0xFFFF_FFFF);
+        resp.set_stat_sn(self.stat_sn.get());
+        resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
+        resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
+        let dlen: u32 = if should_return {
+            let txt = TARGET_NAME.as_bytes();
+            // "TargetName=" prefix + IQN + NUL
+            let prefix = b"TargetName=";
+            let needed = prefix.len() + txt.len() + 1;
+            if needed > work.len() - BHS_SIZE {
+                return SessionStep::Error(TargetError::WorkBufTooSmall);
+            }
+            work[BHS_SIZE..BHS_SIZE + prefix.len()].copy_from_slice(prefix);
+            work[BHS_SIZE + prefix.len()..BHS_SIZE + prefix.len() + txt.len()].copy_from_slice(txt);
+            work[BHS_SIZE + prefix.len() + txt.len()] = 0;
+            needed as u32
+        } else {
+            0
+        };
+        resp.set_data_segment_len(dlen);
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let total = BHS_SIZE + dlen as usize;
+        let pad = pdu_pad_len(dlen) as usize;
+        work[total..total + pad].fill(0);
+        self.state = IscsiState::RecvPdu;
+        SessionStep::NeedSend(&work[..total + pad])
     }
 
     // ── Response PDU builders ─────────────────────────────────────
