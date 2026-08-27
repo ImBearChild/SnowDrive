@@ -9,8 +9,8 @@
 use crate::scsi::device::{CommandOutcome, DeviceType};
 use crate::scsi::scsi::{asc, cdb_len_from_opcode, cdb_opcode, op, Sense, SenseKey};
 
-/// INQUIRY standard data length (additional length = 91 per SPC-3 (n-4)).
-const INQUIRY_STD_LEN: usize = 95;
+/// INQUIRY standard data length (96 bytes total per SPC-3 Table 81, byte0-95).
+const INQUIRY_STD_LEN: usize = 96;
 /// VPD 0x00 page list length (7 = 4 header + 3 supported pages).
 const VPD_PAGE_LIST_LEN: usize = 7;
 /// VPD 0x80 unit serial length (4 header + 16 serial).
@@ -307,9 +307,11 @@ fn inquiry<D: SpcDevice>(
     data: &mut [u8],
 ) -> CommandOutcome {
     if evpd {
+        let dt = dev.device_type();
         let data_out: &[u8] = match page {
             0x00 => {
                 let mut buf = [0u8; VPD_PAGE_LIST_LEN];
+                buf[0] = dt.pdt();
                 buf[3] = 3;
                 buf[4] = 0x00;
                 buf[5] = 0x80;
@@ -319,6 +321,7 @@ fn inquiry<D: SpcDevice>(
             }
             0x80 => {
                 let mut buf = [0u8; VPD_SERIAL_LEN];
+                buf[0] = dt.pdt();
                 buf[1] = 0x80;
                 buf[3] = 16;
                 let id = dev.id();
@@ -330,12 +333,13 @@ fn inquiry<D: SpcDevice>(
             }
             0x83 => {
                 let mut buf = [0u8; VPD_ID_LEN];
+                buf[0] = dt.pdt();
                 buf[1] = 0x83;
                 buf[3] = 12;
                 buf[4] = 0x01; /* CODE SET = binary */
                 buf[5] = 0x03; /* designator type = NAA */
                 buf[7] = 8;
-                let id = 0x3000_0000_0000_0000u64 | (dev.id() & 0x0FFF_FFFF_FFFF_FFFF);
+                let id = 0x5000_0000_0000_0000u64 | (dev.id() & 0x0FFF_FFFF_FFFF_FFFF);
                 buf[8..16].copy_from_slice(&id.to_be_bytes());
                 data[0..VPD_ID_LEN].copy_from_slice(&buf);
                 &data[0..VPD_ID_LEN]
@@ -357,7 +361,7 @@ fn inquiry<D: SpcDevice>(
         }
         buf[2] = 0x06; /* SPC-4 (分歧2, was 0x05) */
         buf[3] = 0x02; /* response data format */
-        buf[4] = (INQUIRY_STD_LEN as u8) - 4; /* additional length (n-4) */
+        buf[4] = (INQUIRY_STD_LEN as u8) - 5; /* additional length: bytes after byte 4 */
         buf[7] = 0x02; /* CmdQue */
         buf[8..16].copy_from_slice(&idn.vendor);
         buf[16..32].copy_from_slice(&idn.product);
@@ -619,11 +623,11 @@ mod tests {
         cdb[4] = 96;
         let mut buf = [0u8; 96];
         let n = run_data(&mut dev, &cdb, &mut buf);
-        assert_eq!(n, 95);
+        assert_eq!(n, 96);
         assert_eq!(buf[0], 0x00); /* PDT = disk */
         assert_eq!(buf[1], 0x00); /* not removable */
         assert_eq!(buf[2], 0x06); /* SPC-4 */
-        assert_eq!(buf[4], 91); /* additional length (n-4) */
+        assert_eq!(buf[4], 91); /* additional length: 96-5 = 91 */
         assert_eq!(buf[7], 0x02); /* CmdQue */
         assert_eq!(&buf[8..16], b"SnowSCSI");
         assert_eq!(&buf[16..32], b"Virtual Disk    ");
@@ -682,7 +686,7 @@ mod tests {
         assert_eq!(buf[1], 0x83);
         assert_eq!(buf[4], 0x01); /* CODE SET binary */
         assert_eq!(buf[5], 0x03); /* NAA */
-        assert_eq!(buf[8], 0x30); /* NAA-3 prefix */
+        assert_eq!(buf[8], 0x50); /* NAA-5 prefix (IEEE Registered) */
     }
 
     #[test]

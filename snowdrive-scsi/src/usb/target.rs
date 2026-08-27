@@ -1185,15 +1185,15 @@ mod tests {
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
         match step {
             SessionStep::NeedIn(bytes) => {
-                assert_eq!(bytes.len(), 95);
+                assert_eq!(bytes.len(), 96);
                 assert_eq!(bytes[0] & 0x1F, 0x00); // PDT = direct-access block
             }
             other => panic!("expected NeedIn with INQUIRY data, got {other:?}"),
         }
-        assert_eq!(s.need(), SessionNeed::NeedIn { len: 95 });
+        assert_eq!(s.need(), SessionNeed::NeedIn { len: 96 });
 
-        // Data sent → CSW pending (tag echo, Passed; residue 1: host
-        // declared 96 but the INQUIRY response is 95 bytes).
+        // Data sent → CSW pending (tag echo, Passed; residue 0: host
+        // declared 96 and the INQUIRY response is 96 bytes).
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         match step {
             SessionStep::NeedIn(_) => {}
@@ -1201,7 +1201,7 @@ mod tests {
         }
         let (tag, residue, status) = read_csw(&mut s, &mut data);
         assert_eq!(tag, 0xAAAA_AAAA);
-        assert_eq!(residue, 1);
+        assert_eq!(residue, 0);
         assert_eq!(status, 0x00);
 
         // CSW sent → back to Command.
@@ -1574,7 +1574,7 @@ mod tests {
         let raw = raw_cbw(2, 96, 0x80, 0, &inquiry_cdb(96));
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
         match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
             other => panic!("expected INQUIRY data, got {other:?}"),
         }
     }
@@ -1764,11 +1764,11 @@ mod tests {
         let mut s = BotSession::new();
         let mut data = work();
 
-        // INQUIRY data is 95 bytes, but the host declared 192.
+        // INQUIRY data is 96 bytes, but the host declared 192.
         let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
         match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
             other => panic!("expected short INQUIRY packet, got {other:?}"),
         }
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
@@ -1777,7 +1777,7 @@ mod tests {
             other => panic!("expected CSW, got {other:?}"),
         }
         let (_, residue, status) = read_csw(&mut s, &mut data);
-        assert_eq!(residue, 192 - 95); // short packet + residue, no STALL
+        assert_eq!(residue, 192 - 96); // short packet + residue, no STALL
         assert_eq!(status, 0x00);
     }
 
@@ -1844,7 +1844,7 @@ mod tests {
 
         // Sent: 96-byte INQUIRY response then the 13-byte CSW.
         let sent = io.sent.borrow();
-        assert_eq!(sent.len(), 95 + CSW_LEN);
+        assert_eq!(sent.len(), 96 + CSW_LEN);
         assert_eq!(sent[0] & 0x1F, 0x00);
         assert_eq!(
             &sent[sent.len() - CSW_LEN..sent.len() - CSW_LEN + 4],

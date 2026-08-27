@@ -112,9 +112,11 @@ impl Sense {
     /// Serialize fixed format sense data (response code 70h) into `buf`.
     ///
     /// Layout (SPC-4 §4.5.3, table 26): byte0=70h, byte2=sense key,
-    /// byte7=additional sense length (n-7), byte12=ASC, byte13=ASCQ,
-    /// all other bytes zero. Returns the number of bytes written
-    /// (min(18, buf.len())), clamped to the caller's buffer.
+    /// byte7=additional sense length (0x0A for 18-byte fixed format),
+    /// byte12=ASC, byte13=ASCQ, all other bytes zero. Returns the number of
+    /// bytes written (min(18, buf.len())), clamped to the caller's buffer.
+    /// ASL is always 0x0A per SPC-3 §6.27 ("shall not adjust ... to reflect
+    /// truncation").
     pub fn write_fixed(&self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(18);
         buf[..n].fill(0);
@@ -125,7 +127,7 @@ impl Sense {
             buf[2] = self.key as u8;
         }
         if n > 7 {
-            buf[7] = (n as u8).wrapping_sub(7);
+            buf[7] = 0x0A; // ADDITIONAL SENSE LENGTH = 10 (SPC-3 Table 26)
         }
         if n > 12 {
             buf[12] = self.asc;
@@ -509,7 +511,7 @@ mod tests {
         assert_eq!(n, 18);
         assert_eq!(buf[0], 0x70); /* response code */
         assert_eq!(buf[2], 0x05); /* ILLEGAL REQUEST */
-        assert_eq!(buf[7], 11); /* additional sense length (n-7) */
+        assert_eq!(buf[7], 10); /* additional sense length = 0x0A (SPC-3 Table 26) */
         assert_eq!(buf[12], asc::INVALID_COMMAND);
         assert_eq!(buf[13], 0);
 
