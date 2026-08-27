@@ -212,11 +212,11 @@ mod tests {
         assert_eq!(resp_value(&data, "InitialR2T"), Some(b"Yes".as_slice()));
         assert_eq!(
             resp_value(&data, "MaxBurstLength"),
-            Some(b"16776192".as_slice())
+            Some(b"262144".as_slice())
         );
         assert_eq!(
             resp_value(&data, "FirstBurstLength"),
-            Some(b"262144".as_slice())
+            Some(b"65536".as_slice())
         );
         assert_eq!(
             resp_value(&data, "MaxRecvDataSegmentLength"),

@@ -1066,14 +1066,55 @@ impl IscsiSession {
 
             if let Some(idx) = find_key(key) {
                 sent[idx] = true;
-                self.apply_neg(LOGIN_TABLE[idx].key, val);
-                if key == b"MaxRecvDataSegmentLength" {
+                if key == b"ImmediateData" {
+                    // RFC 3720 §12.11 Result function is AND, Default Yes.
+                    let initiator_yes = val == b"Yes";
+                    let result_yes = initiator_yes && true; // target offers Yes
+                    self.neg.immediate_data = result_yes;
+                    let out: &[u8] = if result_yes { b"Yes" } else { b"No" };
+                    if !append_kv(dst, &mut w, key, out) {
+                        return None;
+                    }
+                } else if key == b"InitialR2T" {
+                    // RFC 3720 §12.10 Result function is OR, Default Yes.
+                    let initiator_yes = val == b"Yes";
+                    let result_yes = initiator_yes || true; // target offers Yes
+                    self.neg.initial_r2t = result_yes;
+                    let out: &[u8] = if result_yes { b"Yes" } else { b"No" };
+                    if !append_kv(dst, &mut w, key, out) {
+                        return None;
+                    }
+                } else if key == b"MaxBurstLength" {
+                    // RFC 3720 §12.14 Result function is Minimum.
+                    if let Some(v) = parse_u32(val) {
+                        let negotiated = v.min(DEFAULT_MAX_BURST);
+                        self.neg.max_burst_len = negotiated;
+                        if !append_kv_u32(dst, &mut w, key, negotiated) {
+                            return None;
+                        }
+                    } else if !append_kv(dst, &mut w, key, val) {
+                        return None;
+                    }
+                } else if key == b"FirstBurstLength" {
+                    // RFC 3720 §12.13 Result function is Minimum.
+                    if let Some(v) = parse_u32(val) {
+                        let negotiated = v.min(DEFAULT_FIRST_BURST);
+                        self.neg.first_burst_len = negotiated;
+                        if !append_kv_u32(dst, &mut w, key, negotiated) {
+                            return None;
+                        }
+                    } else if !append_kv(dst, &mut w, key, val) {
+                        return None;
+                    }
+                } else if key == b"MaxRecvDataSegmentLength" {
                     // Advertise the negotiated (buffer-derived) value
                     // (§6.4.1), not the raw initiator figure.
+                    self.apply_neg(LOGIN_TABLE[idx].key, val);
                     if !append_kv_u32(dst, &mut w, key, self.max_recv_data_segment) {
                         return None;
                     }
                 } else {
+                    self.apply_neg(LOGIN_TABLE[idx].key, val);
                     let out_val: &[u8] = match LOGIN_TABLE[idx].value {
                         Some(v) => v.as_bytes(),
                         None => val,
