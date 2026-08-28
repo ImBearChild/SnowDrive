@@ -349,6 +349,30 @@ impl<D: FlatData> BlockDevice<D> {
                 }
             }
         }
+        // L-f reserved-bit validation for the block profile (protection
+        // type 0). SBC-3 §4.21 (3404/3376): with protection information
+        // disabled a non-zero RDPROTECT/WRPROTECT field (byte1 bits 6:4 of
+        // the 10/12/16-byte access commands) may be rejected 05/24 — we
+        // reject. READ(6)/WRITE(6) byte1 bits 7:5 are Reserved (Tables
+        // 54/96). DPO/FUA/FUA_NV bits are below the mask and unaffected.
+        match cdb.first().copied() {
+            Some(crate::scsi::scsi::op::READ_6 | crate::scsi::scsi::op::WRITE_6)
+                if cdb.len() >= 6 && cdb[1] & 0xE0 != 0 =>
+            {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
+            }
+            Some(
+                crate::scsi::scsi::op::READ_10
+                | crate::scsi::scsi::op::READ_12
+                | crate::scsi::scsi::op::READ_16
+                | crate::scsi::scsi::op::WRITE_10
+                | crate::scsi::scsi::op::WRITE_12
+                | crate::scsi::scsi::op::WRITE_16,
+            ) if cdb.get(1).is_some_and(|&b| b & 0x70 != 0) => {
+                return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD));
+            }
+            _ => {}
+        }
         let Some(cmd) = parse_sbc(cdb) else {
             return Ok(self.cc(SenseKey::IllegalRequest, asc::INVALID_COMMAND));
         };
@@ -1117,6 +1141,50 @@ mod tests {
         assert_eq!(outcome, CommandOutcome::CheckCondition);
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn block_rdprotect_wrprotect_and_read6_reserved_rejected() {
+        // L-f: type-0-protection block profile rejects non-zero
+        // RDPROTECT/WRPROTECT (SBC-3 §4.21) and READ(6) reserved bits 7:5.
+        let mut ram = [0u8; 1024 * 1024];
+        let mut dev = ram_dev(&mut ram);
+        let mut w = work();
+
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[1] = 0x10; /* RDPROTECT = 001b */
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::WRITE_10;
+        cdb[1] = 0x10; /* WRPROTECT = 001b */
+        cdb[8] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::READ_6;
+        cdb[1] = 0x80; /* reserved bit 7 set */
+        cdb[4] = 1;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+
+        // DPO|FUA (byte1 bits 3..0) stay legal — mask covers 6:4 only.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[1] = 0x0C; /* DPO | FUA */
+        cdb[8] = 1;
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::OutXfer { len: 512 }
+        );
     }
 
     #[test]
