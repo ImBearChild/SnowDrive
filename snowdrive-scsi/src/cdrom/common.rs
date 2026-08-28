@@ -729,7 +729,20 @@ pub fn build_get_config_features_for_media(
                 CurrentProfile::DvdRom | CurrentProfile::DvdRam
             ),
         );
-        off += 4;
+        // Table 111: Additional Length 04h — MULTI110 (byte 4 bit 0) and
+        // Dual-RW / Dual-R (byte 6). Real drives always emit this 4-byte
+        // payload; omitting it shortens the descriptor (4 vs 8 bytes) that
+        // probing Windows apps parse, so keep the full table layout.
+        buf[off + 3] = 0x04;
+        buf[off + 4] = 0x01; // MULTI110: DVD Multi read-only compliant
+        buf[off + 5] = 0x00;
+        buf[off + 6] = if caps.dual_layer {
+            0x03 // Dual-RW | Dual-R
+        } else {
+            0x00
+        };
+        buf[off + 7] = 0x00;
+        off += 8;
     }
     // Random Writable (0x0020) — MMC-6 Table 113 Ver 0001b, P0.
     if caps.random_writable && include(0x0020) {
@@ -739,7 +752,10 @@ pub fn build_get_config_features_for_media(
         buf[off + 3] = 0x0C; // additional length
         buf[off + 4..off + 8].copy_from_slice(&last_lba.to_be_bytes());
         buf[off + 8..off + 12].copy_from_slice(&SECTOR_SIZE.to_be_bytes());
-        buf[off + 12..off + 14].copy_from_slice(&1u16.to_be_bytes()); // blocking
+        // Table 113: Blocking = logical blocks per writable unit; for DVD
+        // media this is 10h (16 = one 32 KiB ECC block). We surface a DVD
+        // medium whenever Random Writable is current (UDF-RW / DVD-RAM).
+        buf[off + 12..off + 14].copy_from_slice(&16u16.to_be_bytes()); // blocking
         buf[off + 14] = 0x00; // PP: no error recovery page
         buf[off + 15] = 0x00;
         off += 16;
@@ -1623,6 +1639,33 @@ mod tests {
         assert_eq!(buf[9], 0x00); // Profile List feature code 0000h
     }
     #[test]
+    fn cdrom_get_config_rt_10b_dvd_read_full_descriptor() {
+        let mut w = work();
+        // RT=10b, start 0x001F → the DVD Read descriptor alone. Windows
+        // probing apps (capture usbms-29) re-query with alloc = data_len + 4
+        // and parse the full Table 111 layout (AddLen 04h): the descriptor
+        // must be 8 bytes, not the 4-byte header-only form we used to emit.
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::DvdRom,
+            &UDFRW_CAPS,
+            0x02,
+            0x001F,
+            255,
+            0,
+            true,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &w, &mut buf);
+        // Header (8) + DVD Read descriptor (4 + 4) = 16 bytes.
+        assert_eq!(n, 16);
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 12);
+        assert_eq!(&buf[8..10], &[0x00, 0x1F]);
+        assert_eq!(buf[11], 0x04); // Additional Length = 04h
+        assert_eq!(buf[12], 0x01); // MULTI110
+        assert_eq!(buf[14], 0x03); // dual-layer: Dual-RW | Dual-R
+    }
+    #[test]
     fn cdrom_get_config_rt_01b_returns_only_current_features() {
         let mut w = work();
         // Empty tray (media_current=false): media-dependent features have
@@ -1865,11 +1908,15 @@ mod tests {
                     assert_eq!(add_len, 12);
                     assert_eq!(&buf[off + 4..off + 8], &0x1234u32.to_be_bytes());
                     assert_eq!(&buf[off + 8..off + 12], &2048u32.to_be_bytes());
-                    assert_eq!(&buf[off + 12..off + 14], &1u16.to_be_bytes());
+                    // Table 113: Blocking = 16 (10h) for DVD media.
+                    assert_eq!(&buf[off + 12..off + 14], &16u16.to_be_bytes());
                 }
                 0x001F => {
                     // DVD Read present for the DVD-RAM profile.
-                    assert_eq!(add_len, 0);
+                    // Table 111: AddLen 04h — MULTI110 + Dual-RW/Dual-R.
+                    assert_eq!(add_len, 4);
+                    assert_eq!(buf[off + 4], 0x01); // MULTI110
+                    assert_eq!(buf[off + 6], 0x03); // dual-layer caps: Dual-RW | Dual-R
                 }
                 _ => {}
             }
