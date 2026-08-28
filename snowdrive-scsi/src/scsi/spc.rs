@@ -91,7 +91,8 @@ pub enum SpcCommand {
         alloc: u16,
     },
     PreventAllow {
-        prevent: bool,
+        /// Raw 2-bit PREVENT field (SPC-3 Table 119, MMC-6 Table 329).
+        prevent: u8,
     },
     StartStop {
         loej: bool,
@@ -104,6 +105,8 @@ pub enum SpcCommand {
         param_list_len: u16,
     },
     ReceiveDiagnosticResults {
+        pcv: bool,
+        page: u8,
         alloc: u16,
     },
 }
@@ -148,7 +151,7 @@ pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
             alloc: (u16::from(cdb[7]) << 8) | u16::from(cdb[8]),
         }),
         op::PREVENT_ALLOW => Some(SpcCommand::PreventAllow {
-            prevent: cdb[4] & 0x03 != 0,
+            prevent: cdb[4] & 0x03,
         }),
         op::START_STOP_UNIT => Some(SpcCommand::StartStop {
             loej: cdb[4] & 0x02 != 0,
@@ -163,6 +166,8 @@ pub fn parse_spc(cdb: &[u8]) -> Option<SpcCommand> {
             param_list_len: (u16::from(cdb[3]) << 8) | u16::from(cdb[4]),
         }),
         op::RECEIVE_DIAGNOSTIC => Some(SpcCommand::ReceiveDiagnosticResults {
+            pcv: cdb[1] & 0x01 != 0,
+            page: cdb[2],
             alloc: (u16::from(cdb[3]) << 8) | u16::from(cdb[4]),
         }),
         _ => None,
@@ -194,6 +199,15 @@ pub trait SpcDevice {
     fn set_sense(&mut self, sense: Sense);
     fn start_stop(&mut self, loej: bool, load: bool) -> SpcEffect;
     fn set_prevent(&mut self, prevent: bool);
+    /// Whether the logical unit accepts PREVENT values 10b/11b (persistent
+    /// prevention). SPC-3 Table 119 note (a): those values are valid only
+    /// when both RMB=1 and MCHNGR=1 in the standard INQUIRY data; all other
+    /// devices shall terminate with CHECK CONDITION / INVALID FIELD IN CDB.
+    /// MMC drives override this to `true`: MMC-6 §6.13 defines its own
+    /// Persistent/Prevent bits ([SPC-3] "does not apply to MM devices").
+    fn persistent_prevent_supported(&self) -> bool {
+        false
+    }
     /// Whether the medium is write-protected for MODE SENSE WP bit (SPC-3 §7.4.3).
     fn is_write_protected(&self) -> bool {
         false
@@ -287,7 +301,15 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
         }
 
         SpcCommand::PreventAllow { prevent } => {
-            dev.set_prevent(prevent);
+            // SPC-3 Table 119 note (a): PREVENT 10b/11b are valid only for
+            // RMB=1 AND MCHNGR=1 devices. Our disks are neither removable
+            // nor changers → reject; MMC drives opt in with their own bits.
+            if prevent & 0x02 != 0 && !dev.persistent_prevent_supported() {
+                return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD);
+            }
+            // Removal is prevented for PREVENT fields 01b and 11b only
+            // (SPC-3 §6.13; MMC-6 Table 329: Prevent bit set → Locked).
+            dev.set_prevent(prevent & 0x01 != 0);
             CommandOutcome::Status
         }
 
@@ -328,9 +350,24 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
             }
         }
 
-        SpcCommand::ReceiveDiagnosticResults { alloc } => {
-            let n = 4.min(alloc as usize);
-            data[0..n].fill(0);
+        SpcCommand::ReceiveDiagnosticResults { pcv, page, alloc } => {
+            if !pcv {
+                // Vendor-specific: no diagnostic parameter data buffered from
+                // SEND DIAGNOSTIC (SPC-3 §6.18). Return a zero header.
+                let n = 4.min(alloc as usize);
+                data[0..n].fill(0);
+                return CommandOutcome::OutInline { len: n };
+            }
+            if page != 0 {
+                // Only page 00h (Supported Diagnostic Pages) is implemented
+                // (SPC-3 §7.1, Table 196).
+                return cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD);
+            }
+            // Supported pages list: page 00h first, ascending (Table 196).
+            // Page length = 1 (only page 00h). Total 5 bytes.
+            const SUPPORTED: [u8; 5] = [0x00, 0x00, 0x00, 0x01, 0x00];
+            let n = SUPPORTED.len().min(alloc as usize);
+            data[0..n].copy_from_slice(&SUPPORTED[..n]);
             CommandOutcome::OutInline { len: n }
         }
     }
@@ -587,7 +624,7 @@ mod tests {
         cdb[4] = 0x02;
         assert_eq!(
             parse_spc(&cdb),
-            Some(SpcCommand::PreventAllow { prevent: true })
+            Some(SpcCommand::PreventAllow { prevent: 0x02 })
         );
 
         let mut cdb = [0u8; 6];
@@ -618,10 +655,16 @@ mod tests {
 
         let mut cdb = [0u8; 6];
         cdb[0] = op::RECEIVE_DIAGNOSTIC;
+        cdb[1] = 0x01; /* PCV=1 */
+        cdb[2] = 0x00; /* page 00h */
         cdb[4] = 16;
         assert_eq!(
             parse_spc(&cdb),
-            Some(SpcCommand::ReceiveDiagnosticResults { alloc: 16 })
+            Some(SpcCommand::ReceiveDiagnosticResults {
+                pcv: true,
+                page: 0x00,
+                alloc: 16
+            })
         );
     }
 
@@ -819,6 +862,28 @@ mod tests {
         cdb[4] = 0x01;
         assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
         assert!(dev.prevent);
+        // Clear with 00b.
+        cdb[4] = 0x00;
+        assert_eq!(run_static(&mut dev, &cdb), CommandOutcome::Status);
+        assert!(!dev.prevent);
+    }
+
+    #[test]
+    fn execute_prevent_persistent_values_rejected_on_plain_devices() {
+        // SPC-3 Table 119 note (a): PREVENT 10b/11b are valid only when
+        // RMB=1 AND MCHNGR=1 — plain disks (RMB=0) must reject them.
+        let mut dev = TestDev::new();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::PREVENT_ALLOW;
+        for prevent in [0x02u8, 0x03] {
+            cdb[4] = prevent;
+            let outcome = run_static(&mut dev, &cdb);
+            assert_eq!(outcome, CommandOutcome::CheckCondition);
+            assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+            assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
+        }
+        // Latch must be untouched.
+        assert!(!dev.prevent);
     }
 
     #[test]
@@ -885,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_receive_diagnostic_returns_empty_supported_list() {
+    fn execute_receive_diagnostic_pcv0_returns_empty() {
         let mut dev = TestDev::new();
         let mut cdb = [0u8; 6];
         cdb[0] = op::RECEIVE_DIAGNOSTIC;
@@ -894,5 +959,33 @@ mod tests {
         let n = run_data(&mut dev, &cdb, &mut buf);
         assert_eq!(n, 4);
         assert_eq!(buf, [0u8; 4]);
+    }
+
+    #[test]
+    fn execute_receive_diagnostic_supported_pages() {
+        // PCV=1, page 00h → Supported Diagnostic Pages (SPC-3 Table 196).
+        let mut dev = TestDev::new();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::RECEIVE_DIAGNOSTIC;
+        cdb[1] = 0x01; /* PCV=1 */
+        cdb[4] = 16;
+        let mut buf = [0u8; 5];
+        let n = run_data(&mut dev, &cdb, &mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(buf, [0x00, 0x00, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn execute_receive_diagnostic_unknown_page_rejected() {
+        let mut dev = TestDev::new();
+        let mut cdb = [0u8; 6];
+        cdb[0] = op::RECEIVE_DIAGNOSTIC;
+        cdb[1] = 0x01; /* PCV=1 */
+        cdb[2] = 0xFF;
+        cdb[4] = 16;
+        let outcome = run_static(&mut dev, &cdb);
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.sense.key, SenseKey::IllegalRequest);
+        assert_eq!(dev.sense.asc, asc::INVALID_FIELD);
     }
 }

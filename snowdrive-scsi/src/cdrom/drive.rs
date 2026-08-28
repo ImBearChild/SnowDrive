@@ -1440,6 +1440,13 @@ impl SpcDevice for CdromDrive<'_> {
         self.prevent_removal = prevent;
     }
 
+    // MMC-6 §6.13: [SPC-3]'s PREVENT description does not apply to MM
+    // devices — the Persistent/Prevent bits (Table 329) are both valid, so
+    // the SPC-3 Table 119 note (a) 05/24 rejection must not trigger here.
+    fn persistent_prevent_supported(&self) -> bool {
+        true
+    }
+
     fn is_write_protected(&self) -> bool {
         !self.is_random_writable()
     }
