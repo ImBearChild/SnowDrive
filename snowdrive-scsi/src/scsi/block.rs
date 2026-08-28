@@ -510,6 +510,33 @@ impl<D: FlatData> BlockDevice<D> {
         }
     }
 
+    pub(crate) fn synchronize_cache16_cmd(
+        &mut self,
+        lba: u64,
+        num_blocks: u32,
+        immed: bool,
+        _sync_nv: bool,
+    ) -> CommandOutcome {
+        // SBC-3 §5.25: same semantics as (10), with a 64-bit LBA and a
+        // 32-bit block count (Table 84). IMMED=1 is unsupported; SYNC_NV is
+        // ignored (no non-volatile cache on the RAM plane).
+        if immed {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let max_lba = self.max_lba();
+        if num_blocks == 0 {
+            if lba > max_lba {
+                return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
+            }
+        } else if lba > max_lba || lba + u64::from(num_blocks) > max_lba + 1 {
+            return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
+        }
+        match self.sync_backend() {
+            Ok(()) => CommandOutcome::Status,
+            Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
+        }
+    }
+
     pub(crate) fn format_unit_cmd(&mut self, cdb1: u8) -> CommandOutcome {
         // SBC-3 §5.3 Table 27: byte1 = FMTPINFO(7:6) | LONGLIST(5) | FMTDATA(4) |
         // CMPLST(3) | DEFECT LIST FORMAT(2:0). Simplest form is FMTDATA=0
@@ -1060,6 +1087,36 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::SYNCHRONIZE_CACHE_10;
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+    }
+
+    #[test]
+    fn block_synchronize_cache_16() {
+        let mut ram = [0u8; 1024 * 1024];
+        let mut dev = ram_dev(&mut ram);
+        let mut w = work();
+
+        // Full-range sync → GOOD (SBC-3 §5.25).
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SYNCHRONIZE_CACHE_16;
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+
+        // IMMED=1 → 05/24 (the RAM plane has no async flush).
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SYNCHRONIZE_CACHE_16;
+        cdb[1] = 0x02;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+
+        // Out-of-range 64-bit LBA → 05/21.
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SYNCHRONIZE_CACHE_16;
+        cdb[5] = 0x01; /* LBA = 1 << 32, far beyond the 2047-block RAM disk */
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::LBA_OUT_OF_RANGE);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod op {
     pub const SEND_OPC_INFORMATION: u8 = 0x54;
     pub const WRITE_10: u8 = 0x2A;
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const SYNCHRONIZE_CACHE_16: u8 = 0x91;
     pub const MODE_SELECT_10: u8 = 0x55;
     pub const MODE_SENSE_10: u8 = 0x5A;
     pub const CLOSE_TRACK: u8 = 0x5B;
@@ -329,6 +330,7 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         op::MODE_SELECT_6 => "MODE_SELECT_6",
         op::MODE_SELECT_10 => "MODE_SELECT_10",
         op::SYNCHRONIZE_CACHE_10 => "SYNCHRONIZE_CACHE_10",
+        op::SYNCHRONIZE_CACHE_16 => "SYNCHRONIZE_CACHE_16",
         op::CLOSE_TRACK => "CLOSE_TRACK",
         op::SEND_DIAGNOSTIC => "SEND_DIAGNOSTIC",
         op::RECEIVE_DIAGNOSTIC => "RECEIVE_DIAGNOSTIC",

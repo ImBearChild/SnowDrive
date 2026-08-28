@@ -69,6 +69,14 @@ pub enum SbcCommand {
         immed: bool,
         sync_nv: bool,
     },
+    /// SYNCHRONIZE CACHE (16) (SBC-3 §5.25) — 64-bit LBA variant for
+    /// >2 TiB address space.
+    SynchronizeCache16 {
+        lba: u64,
+        num_blocks: u32,
+        immed: bool,
+        sync_nv: bool,
+    },
     /// FORMAT UNIT (04h, SBC-3 §5.3). Minimal direct-access profile:
     /// `FMTDATA=0` (no parameter list) is the mandatory simple format.
     FormatUnit {
@@ -157,6 +165,24 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
             immed: cdb[1] & 0x02 != 0,
             sync_nv: cdb[1] & 0x04 != 0,
         }),
+        op::SYNCHRONIZE_CACHE_16 => Some(SbcCommand::SynchronizeCache16 {
+            // SBC-3 Table 84: byte1 = Reserved | SYNC_NV(2) | IMMED(1) |
+            // Reserved(0); LBA 64-bit at bytes 2-9, NUM u32 at bytes 10-13.
+            lba: (u64::from(cdb[2]) << 56)
+                | (u64::from(cdb[3]) << 48)
+                | (u64::from(cdb[4]) << 40)
+                | (u64::from(cdb[5]) << 32)
+                | (u64::from(cdb[6]) << 24)
+                | (u64::from(cdb[7]) << 16)
+                | (u64::from(cdb[8]) << 8)
+                | u64::from(cdb[9]),
+            num_blocks: (u32::from(cdb[10]) << 24)
+                | (u32::from(cdb[11]) << 16)
+                | (u32::from(cdb[12]) << 8)
+                | u32::from(cdb[13]),
+            immed: cdb[1] & 0x02 != 0,
+            sync_nv: cdb[1] & 0x04 != 0,
+        }),
         op::FORMAT_UNIT => Some(SbcCommand::FormatUnit { cdb1: cdb[1] }),
         _ => None,
     }
@@ -204,6 +230,12 @@ pub(crate) fn execute_sbc<D: FlatData>(
             immed,
             sync_nv,
         } => dev.synchronize_cache_cmd(lba, num_blocks, immed, sync_nv),
+        SbcCommand::SynchronizeCache16 {
+            lba,
+            num_blocks,
+            immed,
+            sync_nv,
+        } => dev.synchronize_cache16_cmd(lba, num_blocks, immed, sync_nv),
         SbcCommand::FormatUnit { cdb1 } => dev.format_unit_cmd(cdb1),
         SbcCommand::Spc(spc) => execute_spc(dev, spc, data),
     }
@@ -411,6 +443,24 @@ mod tests {
                 num_blocks: 0,
                 immed: false,
                 sync_nv: false
+            })
+        );
+    }
+
+    #[test]
+    fn parse_synchronize_cache_16() {
+        let mut cdb = [0u8; 16];
+        cdb[0] = op::SYNCHRONIZE_CACHE_16;
+        cdb[1] = 0x06; /* SYNC_NV | IMMED */
+        cdb[9] = 0x2A; /* LBA = 0x2A (64-bit, LSB byte) */
+        cdb[13] = 0x40; /* 64 blocks */
+        assert_eq!(
+            parse_sbc(&cdb),
+            Some(SbcCommand::SynchronizeCache16 {
+                lba: 0x2A,
+                num_blocks: 64,
+                immed: true,
+                sync_nv: true,
             })
         );
     }
