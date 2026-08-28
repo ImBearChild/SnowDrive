@@ -661,18 +661,47 @@ impl<'a> CdromDrive<'a> {
                 op::SET_CD_SPEED => CommandOutcome::Status,
 
                 // ── SEND OPC (0x54) ──────────────────────────────
+                // MMC-6 §6.38: DoOpc=1 → GOOD (OPC values computed, the
+                // Parameter List is ignored). DoOpc=0 → receive the declared
+                // Parameter List (Table 614); PLL must be an integral
+                // multiple of 8 (§6.38.2.4) or 05/24.
                 op::SEND_OPC_INFORMATION => {
-                    if cdb[1] & 0x01 != 0 || cdb[7] == 0 && cdb[8] == 0 {
+                    let pll = u16::from_be_bytes([cdb[7], cdb[8]]);
+                    if cdb[1] & 0x01 != 0 || pll == 0 {
                         CommandOutcome::Status
+                    } else if !pll.is_multiple_of(8) {
+                        self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
                     } else {
-                        CommandOutcome::InXfer { len: 0 }
+                        CommandOutcome::InParam {
+                            expected_len: pll as usize,
+                        }
                     }
                 }
 
                 // ── SET STREAMING (0xB6) ─────────────────────────
-                op::SET_STREAMING => CommandOutcome::InXfer { len: 0 },
+                // MMC-6 §6.41: only Type=0 (performance descriptor) is
+                // supported — no Enhanced Defect Reporting / DBI cache model,
+                // so other Types are 05/24 (§6.41.2.2). Receive the declared
+                // Parameter List (Table 625) and discard it.
+                op::SET_STREAMING => {
+                    if cdb[8] != 0 {
+                        self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
+                    } else {
+                        let pll = u16::from_be_bytes([cdb[9], cdb[10]]);
+                        if pll == 0 {
+                            CommandOutcome::Status
+                        } else {
+                            CommandOutcome::InParam {
+                                expected_len: pll as usize,
+                            }
+                        }
+                    }
+                }
 
                 // ── CLOSE TRACK (0x5B) ───────────────────────────
+                // MMC-6 Table 234: CDB-only (Immed / Close Function /
+                // Logical Track Number) — no parameter list. Our
+                // finalized single-track model has nothing to close: GOOD.
                 op::CLOSE_TRACK => CommandOutcome::Status,
 
                 // ── BLANK (0xA1) — for DVD-RAM alias to FORMAT (BurnAware clear)
@@ -1527,6 +1556,11 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
                 self.complete_mode_select(true, alloc, data)
             }
             Some(op::FORMAT_UNIT) => self.complete_format_unit(cdb, data),
+            // L-e: SEND OPC / SET STREAMING parameter lists are received
+            // and discarded (OPC values are not cached and READ DISC
+            // INFORMATION reports no OPC tables; streaming performance
+            // is not enforced on the virtual medium).
+            Some(op::SEND_OPC_INFORMATION | op::SET_STREAMING) => CommandOutcome::Status,
             _ => self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD),
         }
     }
@@ -1720,6 +1754,69 @@ mod tests {
         let s = dev.peek_sense().unwrap();
         assert_eq!(s.asc, asc::MEDIUM_NOT_PRESENT);
         assert_eq!(s.ascq, asc::MEDIUM_NOT_PRESENT_TRAY_CLOSED);
+    }
+
+    #[test]
+    fn drive_send_opc_and_set_streaming_parameter_lists() {
+        // L-e: SEND OPC / SET STREAMING must honor the declared parameter
+        // list phase (MMC-6 §6.38 / §6.41) instead of swallowing it with a
+        // zero-length Data-Out.
+        let mut dev = CdromDrive::new();
+        let mut w = work();
+
+        // SEND OPC: DoOpc=1 → GOOD, list ignored (§6.38.2.2).
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SEND_OPC_INFORMATION;
+        cdb[1] = 0x01; /* DoOpc */
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+
+        // SEND OPC: DoOpc=0, PLL=0 → GOOD, no operation (§6.38.2.4).
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SEND_OPC_INFORMATION;
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+
+        // SEND OPC: DoOpc=0, PLL=16 → InParam, list discarded on complete.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SEND_OPC_INFORMATION;
+        cdb[8] = 16;
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::InParam { expected_len: 16 }
+        );
+        assert_eq!(dev.complete_param(&cdb, &w[..16]), CommandOutcome::Status);
+
+        // SEND OPC: PLL not an integral multiple of 8 → 05/24 (§6.38.2.4).
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::SEND_OPC_INFORMATION;
+        cdb[8] = 12;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
+
+        // SET STREAMING: Type=0, PLL=0 → GOOD (§6.41.2.3).
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::SET_STREAMING;
+        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+
+        // SET STREAMING: Type=0, PLL=28 → InParam, descriptor discarded.
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::SET_STREAMING;
+        cdb[10] = 28;
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::InParam { expected_len: 28 }
+        );
+        assert_eq!(dev.complete_param(&cdb, &w[..28]), CommandOutcome::Status);
+
+        // SET STREAMING: Type=1 (reserved) → 05/24 (§6.41.2.2).
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::SET_STREAMING;
+        cdb[8] = 0x01;
+        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
+        assert_eq!(outcome, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
     }
 
     #[test]
