@@ -400,7 +400,8 @@ fn inquiry<D: SpcDevice>(
         buf[2] = 0x06; /* SPC-4 (分歧2, was 0x05) */
         buf[3] = 0x02; /* response data format */
         buf[4] = (INQUIRY_STD_LEN as u8) - 5; /* additional length: bytes after byte 4 */
-        buf[7] = 0x00; /* CmdQue=0 (no task mgmt, depth 1) */
+        buf[6] = 0x80; /* BQue=1 (Basic task mgmt, CmdQue=0) */
+        buf[7] = 0x00; /* CmdQue=0 */
         buf[8..16].copy_from_slice(&idn.vendor);
         buf[16..32].copy_from_slice(&idn.product);
         buf[32..36].copy_from_slice(&idn.revision);
@@ -667,6 +668,7 @@ mod tests {
         assert_eq!(buf[1], 0x00); /* not removable */
         assert_eq!(buf[2], 0x06); /* SPC-4 */
         assert_eq!(buf[4], 91); /* additional length: 96-5 = 91 */
+        assert_eq!(buf[6], 0x80); /* BQue=1 (Basic) */
         assert_eq!(buf[7], 0x00); /* CmdQue=0 */
         assert_eq!(&buf[8..16], b"SnowSCSI");
         assert_eq!(&buf[16..32], b"Virtual Disk    ");
