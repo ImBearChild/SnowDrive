@@ -104,7 +104,7 @@ fn win_single_cmds_diag() {
         (
             "GESN class=00",
             vec![0x4A, 1, 0, 0, 0x00, 0, 0, 0, 0x08, 0],
-            "inline8",
+            "inline4", // NEA=1 → header only (MMC-6 Table 265)
         ),
         (
             "GESN class=10",
@@ -135,6 +135,7 @@ fn win_single_cmds_diag() {
         let mut w = [0u8; crate::MIN_DATA_LEN];
         let out = dev.do_cmd(&cdb, &mut w).unwrap();
         match (expect, &out) {
+            ("inline4", CommandOutcome::OutInline { len }) => assert_eq!(*len, 4),
             ("inline8", CommandOutcome::OutInline { len }) => assert_eq!(*len, 8),
             ("cc20", CommandOutcome::CheckCondition) => {
                 let s = dev.peek_sense().unwrap();
@@ -482,8 +483,14 @@ mod enumeration_sequence {
 
         // Polling resumes cleanly; medium now empty.
         let gesn = run!(true, 8, [0x4Au8, 1, 0, 0, 0x10, 0, 0, 0, 0x08, 0], &[]);
-        assert_eq!(gesn[2], 0x84); // NEA=0, notification class = Media
+        assert_eq!(
+            &gesn[0..2],
+            &[0x00, 0x06],
+            "Event Descriptor Length = 2 + 4"
+        );
+        assert_eq!(gesn[2], 0x04); // NEA=0, Notification Class = Media
         assert_eq!(gesn[3], 0x10); // supported classes
+        assert_eq!(gesn[4], 0x00); // Event Code 0 = NoChg
         assert_eq!(gesn[5], 0x02); // media present
         let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
         assert_eq!(disc[2] & 0x03, 0, "formatted → empty until host writes FS");

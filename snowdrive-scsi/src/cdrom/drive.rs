@@ -1067,18 +1067,26 @@ impl<'a> CdromDrive<'a> {
         let class = cdb[4];
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
         let mut buf = [0u8; 8];
-        buf[0..2].copy_from_slice(&4u16.to_be_bytes());
-        if class & 0x10 != 0 {
-            buf[2] = 0x80 | 0x04; // NEA=0, Notification Class = Media (100b)
-            buf[3] = 0x10; // Supported Event Class = Media (MMC-6 Table 265)
+        let resp_len = if class & 0x10 != 0 {
+            // Media class requested: NEA=0, Notification Class = Media (100b),
+            // followed by the 4-byte Media Event Descriptor (Table 278).
+            // Event Descriptor Length = 2 (NEA/class + supported) + 4 = 6.
+            buf[0..2].copy_from_slice(&6u16.to_be_bytes());
+            buf[2] = 0x04; // NEA=0, Notification Class = Media
+            buf[3] = 0x10; // Supported Event Class = Media (Table 265)
+            buf[4] = 0x00; // Event Code 0 = NoChg (Table 279)
+            buf[5] = (u8::from(self.loaded()) << 1) | u8::from(self.tray_open); // Table 280
+            8
         } else {
+            // No requested class supported: NEA=1, Notification Class 000b and
+            // only the Event Header is returned (Table 265). Supported Event
+            // Class still advertises Media (the drive does support it).
+            buf[0..2].copy_from_slice(&2u16.to_be_bytes());
             buf[2] = 0x80; // NEA=1
-            buf[3] = 0x10; // Supported Event Class still reports Media
-        }
-        // Event Code 0 (NoChg), byte5 bit1=Media Present, bit0=Door/Tray open (Table 280).
-        buf[4] = 0x00;
-        buf[5] = (u8::from(self.loaded()) << 1) | u8::from(self.tray_open);
-        let n = buf.len().min(alloc as usize).min(data.len());
+            buf[3] = 0x10; // Supported Event Class = Media
+            4
+        };
+        let n = resp_len.min(alloc as usize).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
     }
@@ -1697,6 +1705,40 @@ mod tests {
         // Empty tray → profile 0000h.
         assert_eq!(buf[6], 0x00);
         assert_eq!(buf[7], 0x00);
+    }
+
+    #[test]
+    fn drive_gesn_media_event_format() {
+        let mut dev = CdromDrive::new();
+        let mut w = work();
+        let mut buf = [0u8; 8];
+        // Polled, Media class request: Event Header + Media Event Descriptor.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::GET_EVENT_STATUS_NOTIFICATION;
+        cdb[1] = 0x01; // Polled
+        cdb[4] = 0x10; // Notification Class Request = Media
+        cdb[8] = 0x08; // alloc
+        let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
+        assert_eq!(n, 8);
+        // Event Descriptor Length = 2 (header rest) + 4 (media descriptor).
+        assert_eq!(&buf[0..2], &[0x00, 0x06]);
+        assert_eq!(buf[2], 0x04); // NEA=0, Notification Class = Media (100b)
+        assert_eq!(buf[3], 0x10); // Supported Event Class = Media
+        assert_eq!(buf[4], 0x00); // Event Code 0 = NoChg (Table 279)
+        assert_eq!(buf[5], 0x00); // Media Status: no media, tray closed
+        assert_eq!(&buf[6..8], &[0x00, 0x00]); // Start/End slot
+
+        // Media class NOT requested: NEA=1, header only (Table 265).
+        let mut cdb2 = [0u8; 10];
+        cdb2[0] = op::GET_EVENT_STATUS_NOTIFICATION;
+        cdb2[1] = 0x01;
+        cdb2[4] = 0x00;
+        cdb2[8] = 0x08;
+        let n = data_in(dev.do_cmd(&cdb2, &mut w).unwrap(), &w, &mut buf);
+        assert_eq!(n, 4);
+        assert_eq!(&buf[0..2], &[0x00, 0x02]);
+        assert_eq!(buf[2], 0x80); // NEA=1
+        assert_eq!(buf[3], 0x10); // Supported Event Class still advertises Media
     }
 
     #[test]
