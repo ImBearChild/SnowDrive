@@ -1276,21 +1276,44 @@ impl<'a> CdromDrive<'a> {
     }
 
     fn get_performance_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> CommandOutcome {
-        // MMC-6 §6.7 GET PERFORMANCE minimal empty table (Type 00h).
-        // CDB is 12 bytes; alloc at bytes 8-9 (or 10-11 for 12-byte variant).
-        let alloc = if cdb.len() >= 12 {
-            let a10 = u16::from_be_bytes([cdb[10], cdb[11]]) as usize;
-            let a8 = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
-            a10.max(a8)
-        } else if cdb.len() >= 9 {
-            u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+        // MMC-6 §6.7 GET PERFORMANCE. Only Type 00h (performance data,
+        // required by the Real-time Streaming feature we advertise) is
+        // supported for this medium; other Type values (unusable area,
+        // defect status, write speed, DBI) return 05/24 per §6.7.2.5.
+        if cdb.len() < 12 || cdb[11] != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        // Data Type (byte 1 bits 4:0): Tolerance(4:3) | Write(2) | Except(1:0).
+        // Only nominal tables (Except=0) are provided.
+        let data_type = cdb[1] & 0x1F;
+        if data_type & 0x03 != 0 {
+            return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
+        }
+        let write = (data_type >> 2) & 1 != 0;
+        // Maximum Number of Descriptors (bytes 8-9): zero → header only
+        // (§6.7.2.4). We surface one nominal descriptor.
+        let max_desc = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
+        // Nominal read/write performance (Table 295): a single extent from
+        // block 0 to the last addressable block at the drive's rated speed,
+        // reported in 1000 bytes/s for 2048-byte sectors (non-CD media).
+        let speed = (if write {
+            self.caps.max_write_speed
         } else {
-            0
-        };
-        // Header: Data Length (4 bytes) = 0, no descriptors. Host's alloc may
-        // be larger, but Data Length indicates valid bytes.
-        let buf = [0u8; 8];
-        let n = buf.len().min(alloc).min(data.len());
+            self.caps.max_read_speed
+        }) as u32;
+        let last = self.max_lba().min(u32::MAX as u64) as u32;
+        let mut buf = [0u8; 24]; // header (8) + one descriptor (16)
+                                 // Performance Data Length = bytes following the length field
+                                 // (header tail 4 + 16 per descriptor); not reduced when max_desc
+                                 // truncates the transfer (§6.7.3.1).
+        buf[0..4].copy_from_slice(&20u32.to_be_bytes());
+        buf[4] = if write { 0x04 } else { 0x00 }; // Write / Except=0
+        buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // Start LBA
+        buf[12..16].copy_from_slice(&speed.to_be_bytes()); // Start Performance
+        buf[16..20].copy_from_slice(&last.to_be_bytes()); // End LBA
+        buf[20..24].copy_from_slice(&speed.to_be_bytes()); // End Performance
+        let resp = 8 + if max_desc > 0 { 16 } else { 0 };
+        let n = resp.min(buf.len()).min(data.len());
         data[..n].copy_from_slice(&buf[..n]);
         CommandOutcome::OutInline { len: n }
     }
@@ -1739,6 +1762,67 @@ mod tests {
         assert_eq!(&buf[0..2], &[0x00, 0x02]);
         assert_eq!(buf[2], 0x80); // NEA=1
         assert_eq!(buf[3], 0x10); // Supported Event Class still advertises Media
+    }
+
+    #[test]
+    fn drive_get_performance_nominal_descriptor() {
+        let mut img = vec![0u8; 2048 * 204800];
+        let mut scratch = [0u8; 256];
+        let mut dev = CdromDrive::new();
+        let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+        #[cfg(feature = "udf_void")]
+        {
+            let media = crate::cdrom::udfrw::UdfRwMedia::materialize(
+                RwRef::new(&mut bb),
+                "TEST",
+                &mut scratch,
+            )
+            .unwrap();
+            dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
+        }
+        #[cfg(not(feature = "udf_void"))]
+        dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
+        let last = dev.max_lba().min(u32::MAX as u64) as u32;
+
+        let mut w = work();
+        let mut buf = [0u8; 32];
+        // Type 00h, Data Type 0 (read, nominal), max 1 descriptor.
+        let mut cdb = [0u8; 12];
+        cdb[0] = op::GET_PERFORMANCE;
+        cdb[8] = 0x00;
+        cdb[9] = 0x01;
+        let n = data_in(dev.do_cmd(&cdb, &mut w).unwrap(), &w, &mut buf);
+        assert_eq!(n, 24); // header (8) + one nominal descriptor (16)
+                           // Performance Data Length = 4 (header tail) + 16 = 20.
+        assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), 20);
+        assert_eq!(buf[4], 0x00); // Write=0, Except=0 (read nominal)
+        assert_eq!(&buf[8..12], &0u32.to_be_bytes()); // Start LBA
+        assert_eq!(&buf[12..16], &22160u32.to_be_bytes()); // Start Perf (KB/s)
+        assert_eq!(&buf[16..20], &last.to_be_bytes()); // End LBA
+        assert_eq!(&buf[20..24], &22160u32.to_be_bytes()); // End Perf
+
+        // max descriptors = 0 → header only (§6.7.2.4).
+        let mut cdb0 = [0u8; 12];
+        cdb0[0] = op::GET_PERFORMANCE;
+        let n = data_in(dev.do_cmd(&cdb0, &mut w).unwrap(), &w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), 20);
+
+        // Write bit → write nominal table.
+        let mut cdw = [0u8; 12];
+        cdw[0] = op::GET_PERFORMANCE;
+        cdw[1] = 0x04; // Write=1
+        cdw[9] = 0x01;
+        let n = data_in(dev.do_cmd(&cdw, &mut w).unwrap(), &w, &mut buf);
+        assert_eq!(buf[4], 0x04);
+
+        // Unsupported Type (write speed) → 05/24.
+        let mut cdt = [0u8; 12];
+        cdt[0] = op::GET_PERFORMANCE;
+        cdt[11] = 0x03;
+        let out = dev.do_cmd(&cdt, &mut w).unwrap();
+        assert_eq!(out, CommandOutcome::CheckCondition);
+        assert_eq!(dev.peek_sense().map(|s| s.asc), Some(asc::INVALID_FIELD));
     }
 
     #[test]
