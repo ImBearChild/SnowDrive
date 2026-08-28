@@ -15,8 +15,10 @@
 //! Design invariants (§4 / §3.7 / §3.8):
 //! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled
 //!   in an internal buffer; the caller's `data` area holds only SCSI data.
-//! - STALL is used only for invalid CBWs; data-phase errors are expressed
-//!   as short packets + CSW status/residue (never STALL, never ZLP).
+//! - STALL is used only for invalid CBWs; Data-In shortfall (BOT §6.7.2) is
+//!   padded with fill zeros to declared length (alternative to STALL) + CSW
+//!   residue; a shortfall whose length is a multiple of MPS is padded, not
+//!   terminated with a ZLP+STALL.
 //! - Data-Out host overrun is drained to a short packet so leftover bytes
 //!   never corrupt the next CBW.
 //! - After a reset the session injects a UNIT ATTENTION: delivered on the
@@ -166,6 +168,16 @@ enum BotState {
     /// first (a shortfall whose length is a multiple of the bulk MPS,
     /// including zero bytes — see [`finish_data_in`]).
     CswZlp,
+    /// Data-In pad: send fill zeros to reach declared length (BOT §6.7.2
+    /// alternative to STALL for shortfall).
+    DataInPad {
+        expected: u64,
+        transfer_len: u64,
+        sent: u64,
+        tag: u32,
+        status: CswStatus,
+        chunk: usize,
+    },
     /// Frozen after an invalid CBW; only `reset()` unfreezes.
     Stalled,
 }
@@ -218,6 +230,7 @@ impl BotSession {
                 probe: false,
             },
             BotState::DataIn { chunk, .. } => SessionNeed::NeedIn { len: chunk },
+            BotState::DataInPad { chunk, .. } => SessionNeed::NeedIn { len: chunk },
             BotState::DataOut { chunk, .. } => SessionNeed::NeedOut {
                 len: chunk,
                 probe: false,
@@ -242,6 +255,7 @@ impl BotSession {
         match self.state {
             BotState::Csw => &self.csw[..],
             BotState::DataIn { chunk, .. } => &data[..chunk],
+            BotState::DataInPad { chunk, .. } => &data[..chunk],
             _ => &[],
         }
     }
@@ -296,6 +310,7 @@ impl BotSession {
             BotState::Stalled => SessionStep::Done(BotStepResult::Stalled),
             BotState::Command { got } => self.poll_command(ev, data, devs, got),
             BotState::DataIn { .. } => self.poll_data_in(ev, data, devs),
+            BotState::DataInPad { .. } => self.poll_data_in_pad(ev, data),
             BotState::DataOut { .. } => self.poll_data_out(ev, data, devs),
             BotState::ParamOut { .. } => self.poll_param_out(ev, data, devs),
             BotState::DataOutOverrun { .. } => self.poll_overrun(ev),
@@ -764,11 +779,40 @@ impl BotSession {
         match ev {
             SessionEvent::InSent => {
                 if sent >= transfer_len {
-                    // Whole transfer sent: short/full packet + residue.
+                    // Whole transfer sent: pad shortfall to declared (BOT §6.7.2 alternative to STALL).
+                    if transfer_len < expected {
+                        let remaining = expected - sent;
+                        let chunk = (remaining as usize).min(data.len());
+                        data[..chunk].fill(0);
+                        self.state = BotState::DataInPad {
+                            expected,
+                            transfer_len,
+                            sent: sent + chunk as u64,
+                            tag,
+                            status: CswStatus::Passed,
+                            chunk,
+                        };
+                        return SessionStep::NeedIn(&data[..chunk]);
+                    }
                     return self.finish_data_in(tag, expected, transfer_len, CswStatus::Passed);
                 }
                 let next = ((transfer_len - sent) as usize).min(data.len());
                 if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
+                    // On xfer error, pad the remainder if shortfall (alternative to STALL).
+                    if sent < expected {
+                        let remaining = expected - sent;
+                        let chunk = (remaining as usize).min(data.len());
+                        data[..chunk].fill(0);
+                        self.state = BotState::DataInPad {
+                            expected,
+                            transfer_len: sent,
+                            sent: sent + chunk as u64,
+                            tag,
+                            status: CswStatus::Failed,
+                            chunk,
+                        };
+                        return SessionStep::NeedIn(&data[..chunk]);
+                    }
                     return self.finish_data_in(tag, expected, sent, CswStatus::Failed);
                 }
                 self.state = BotState::DataIn {
@@ -783,6 +827,48 @@ impl BotSession {
             }
             SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
                 // No-op: still need to send the pending chunk.
+                SessionStep::NeedIn(&data[..chunk])
+            }
+        }
+    }
+
+    fn poll_data_in_pad<'a>(
+        &'a mut self,
+        ev: SessionEvent<'_>,
+        data: &'a mut [u8],
+    ) -> SessionStep<'a> {
+        let BotState::DataInPad {
+            expected,
+            transfer_len,
+            sent,
+            tag,
+            status,
+            chunk,
+        } = self.state
+        else {
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+        };
+        match ev {
+            SessionEvent::InSent => {
+                if sent >= expected {
+                    // Pad complete: residue = declared - actual relevant.
+                    let residue = expected - transfer_len;
+                    return self.finish_csw_bot(tag, residue, status);
+                }
+                let remaining = expected - sent;
+                let next = (remaining as usize).min(data.len());
+                data[..next].fill(0);
+                self.state = BotState::DataInPad {
+                    expected,
+                    transfer_len,
+                    sent: sent + next as u64,
+                    tag,
+                    status,
+                    chunk: next,
+                };
+                SessionStep::NeedIn(&data[..next])
+            }
+            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
                 SessionStep::NeedIn(&data[..chunk])
             }
         }
@@ -1483,9 +1569,8 @@ mod tests {
         let mut s = BotSession::new();
         let mut data = work();
 
-        // READ(10) count 1 → 512 data bytes (one full-MPS packet), while
-        // the CBW declared 1024. The total ends on a full-MPS packet, which
-        // is not a short packet, so a ZLP must terminate the phase.
+        // READ(10) count 1 → 512 data bytes, while CBW declared 1024.
+        // Shortfall is padded with fill zeros (BOT §6.7.2 alternative to STALL).
         let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x21, 1024, 0x80, 0, &cdb);
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
@@ -1493,13 +1578,14 @@ mod tests {
             SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
             other => panic!("expected 512-byte chunk, got {other:?}"),
         }
+        // Pad 512 zeros.
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         match step {
             SessionStep::NeedIn(bytes) => {
-                assert!(bytes.is_empty());
-                assert_eq!(s.need(), SessionNeed::NeedIn { len: 0 });
+                assert_eq!(bytes.len(), 512);
+                assert!(bytes.iter().all(|&b| b == 0));
             }
-            other => panic!("expected empty ZLP need, got {other:?}"),
+            other => panic!("expected pad, got {other:?}"),
         }
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         match step {
@@ -1790,11 +1876,21 @@ mod tests {
         let mut data = work();
 
         // INQUIRY data is 96 bytes, but the host declared 192.
+        // BOT §6.7.2 Hi>Di: shortfall is now padded with fill zeros (alternative to STALL).
         let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
         match step {
             SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
             other => panic!("expected short INQUIRY packet, got {other:?}"),
+        }
+        // Pad 96 zeros to reach declared 192.
+        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
+        match step {
+            SessionStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 96);
+                assert!(bytes.iter().all(|&b| b == 0));
+            }
+            other => panic!("expected pad, got {other:?}"),
         }
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         match step {
@@ -1802,7 +1898,7 @@ mod tests {
             other => panic!("expected CSW, got {other:?}"),
         }
         let (_, residue, status) = read_csw(&mut s, &mut data);
-        assert_eq!(residue, 192 - 96); // short packet + residue, no STALL
+        assert_eq!(residue, 192 - 96); // fill + residue
         assert_eq!(status, 0x00);
     }
 
