@@ -488,6 +488,10 @@ impl BotSession {
             }
             CommandOutcome::OutInline { len } => {
                 if declared == 0 {
+                    // BOT §6.7.1 Case (2) Hn<Di: Di with Hn => PhaseError.
+                    if len > 0 {
+                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    }
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataIn {
@@ -513,6 +517,10 @@ impl BotSession {
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
                 if declared == 0 {
+                    // BOT §6.7.1 Case (2) Hn<Di.
+                    if transfer_len > 0 {
+                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    }
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataIn {
@@ -541,6 +549,10 @@ impl BotSession {
             }
             CommandOutcome::InXfer { len: transfer_len } => {
                 if declared == 0 {
+                    // BOT §6.7.1 Case (3) Hn<Do.
+                    if transfer_len > 0 {
+                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    }
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataOut {
@@ -570,6 +582,10 @@ impl BotSession {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 if cbw.dir != BotDir::DataOut {
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                }
+                // BOT §6.7.3 Case (13) Ho<Do: Ho < Do => PhaseError.
+                if declared < expected {
                     return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
                 }
                 if declared != expected {
@@ -607,6 +623,10 @@ impl BotSession {
         available: u64,
     ) -> SessionStep<'a> {
         let declared = u64::from(cbw.data_len);
+        if declared == 0 && available > 0 {
+            // BOT §6.7.1 Case (2) Hn<Di (synthesized REPORT LUNS/sense).
+            return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+        }
         let actual = available.min(declared);
         if actual == 0 {
             return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
