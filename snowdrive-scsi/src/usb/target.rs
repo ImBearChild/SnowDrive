@@ -36,10 +36,13 @@ use crate::usb::{CBW_LEN, CSW_LEN};
 /// Data-Out overrun drain wait (mirrors the PC driver's 50ms ctrl poll).
 const STEP_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// USB bulk endpoint max packet size (high-speed, 512 B). A Data-In phase
-/// that ends on a full-MPS packet is not a short packet, so a shortfall
-/// whose length is a multiple of the MPS — including zero bytes — must be
-/// closed with a zero-length packet before the CSW (BOT §6.7 Case (4)/(5)).
+/// USB bulk endpoint max packet size (high-speed, 512 B; full-speed is 64 B,
+/// but FunctionFS high-speed enumeration is the only tested path — the 512
+/// value is hard-wired and documented here for that transport).
+/// A Data-In phase that ends on a full-MPS packet is not a short packet, so a
+/// shortfall whose length is a multiple of the MPS — including zero bytes —
+/// must be closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)), or padded
+/// (our H9-c choice).
 const BOT_BULK_MPS: u64 = 512;
 
 /// One bulk I/O completion fed from the driver to the core.
@@ -394,6 +397,12 @@ impl BotSession {
                 probe: false,
             },
             SessionEvent::OutRecv { data: chunk } => {
+                if chunk.len() > CBW_LEN - got {
+                    crate::warn!(
+                        "bot: CBW packet tail {} bytes discarded (single-packet CBW is 31B)",
+                        chunk.len() - (CBW_LEN - got)
+                    );
+                }
                 let add = chunk.len().min(CBW_LEN - got);
                 self.cbw[got..got + add].copy_from_slice(&chunk[..add]);
                 let got = got + add;
@@ -665,9 +674,15 @@ impl BotSession {
         residue: u64,
         status: CswStatus,
     ) -> SessionStep<'a> {
+        // BOT §5.2: dCSWDataResidue is 32-bit; CBW dCBWDataTransferLength is 32-bit,
+        // so residue <= declared <= u32::MAX in practice. Clamp with warn if larger.
+        let residue_u32 = u32::try_from(residue).unwrap_or_else(|_| {
+            crate::warn!("bot: residue {} truncated to u32::MAX", residue);
+            u32::MAX
+        });
         let csw = Csw {
             tag,
-            residue: residue as u32,
+            residue: residue_u32,
             status,
         };
         csw.write(&mut self.csw);
@@ -676,12 +691,10 @@ impl BotSession {
     }
 
     /// End a Data-In (or no-data) phase with the CSW. If fewer than
-    /// `declared` bytes were produced, the phase must be terminated with a
-    /// short packet before the CSW (BOT §6.7 Case (4)/(5)); a shortfall
-    /// whose length is a multiple of the bulk MPS — including zero bytes —
-    /// cannot close on its own (a full-MPS packet is not a short packet),
-    /// so a zero-length packet is sent first via the [`BotState::CswZlp`]
-    /// state.
+    /// `declared` bytes were produced, the phase is padded to declared (H9-c)
+    /// via `DataInPad` instead of STALL; a direct shortfall without a DataIn
+    /// phase still uses ZLP+CSW. Residue is 32-bit (BOT §5.2); truncation is
+    /// guarded (declared is 32-bit).
     fn finish_data_in<'a>(
         &'a mut self,
         tag: u32,
@@ -696,9 +709,13 @@ impl BotSession {
             declared - actual,
             status
         );
+        let residue_u32 = u32::try_from(declared - actual).unwrap_or_else(|_| {
+            crate::warn!("bot: residue {} truncated", declared - actual);
+            u32::MAX
+        });
         let csw = Csw {
             tag,
-            residue: (declared - actual) as u32,
+            residue: residue_u32,
             status,
         };
         csw.write(&mut self.csw);

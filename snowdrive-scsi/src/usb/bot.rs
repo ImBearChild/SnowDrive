@@ -52,6 +52,11 @@ impl Cbw {
         if cdb_len == 0 || cdb_len > 16 {
             return None;
         }
+        let lun_raw = raw[13];
+        // BOT §5.1: bCBWLUN is 4 bits (0..15), high nibble reserved (must be 0).
+        if lun_raw & 0xF0 != 0 {
+            return None;
+        }
         let mut cdb = [0u8; 16];
         cdb.copy_from_slice(&raw[15..15 + 16]);
         Some(Cbw {
@@ -62,7 +67,7 @@ impl Cbw {
             } else {
                 BotDir::DataOut
             },
-            lun: raw[13],
+            lun: lun_raw & 0x0F,
             cdb,
             cdb_len,
         })
