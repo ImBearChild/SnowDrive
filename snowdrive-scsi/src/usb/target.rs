@@ -447,7 +447,18 @@ impl BotSession {
 
         // REPORT LUNS is served for any addressed LUN (§5.3).
         if cdb.first() == Some(&scsi_op::REPORT_LUNS) {
-            let n = write_report_luns(data, devs.len());
+            // SPC-3 Table 148: SELECT REPORT 00h/02h report the full
+            // inventory here (all LUNs are peripheral/flat); 01h reports
+            // well-known logical units only (none implemented → empty list);
+            // 03h-FFh are reserved → CHECK CONDITION / INVALID FIELD IN CDB.
+            let select = cdb.get(2).copied().unwrap_or(0);
+            if select > 0x02 {
+                if let Some(dev) = devs.get_mut(cbw.lun as usize) {
+                    dev.set_sense(Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0));
+                }
+                return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+            }
+            let n = write_report_luns(data, if select == 0x01 { 0 } else { devs.len() });
             return self.synthesize_data_in(cbw, data, n as u64);
         }
 
@@ -1862,6 +1873,86 @@ mod tests {
         }
         let (_, _, status) = read_csw(&mut s, &mut data);
         assert_eq!(status, 0x00); // Passed
+    }
+
+    #[test]
+    fn report_luns_select_report_semantics() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new();
+        let mut data = work();
+
+        // 01h → empty inventory (no well-known logical units implemented).
+        let raw = raw_cbw(21, 16, 0x80, 0, &[0xA0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
+        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        let p1 = match step {
+            SessionStep::NeedIn(bytes) => bytes.to_vec(),
+            other => panic!("expected REPORT LUNS data, got {other:?}"),
+        };
+        assert_eq!(u32::from_be_bytes([p1[0], p1[1], p1[2], p1[3]]), 0);
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, st1) = read_csw(&mut s, &mut data);
+        assert_eq!(st1, 0x00);
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::Done(BotStepResult::Processed)
+        );
+
+        // 02h → full inventory (same as 00h for peripheral-only arrays).
+        let raw = raw_cbw(22, 16, 0x80, 0, &[0xA0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
+        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        let p2 = match step {
+            SessionStep::NeedIn(bytes) => bytes.to_vec(),
+            other => panic!("expected REPORT LUNS data, got {other:?}"),
+        };
+        assert_eq!(u32::from_be_bytes([p2[0], p2[1], p2[2], p2[3]]), 8);
+        assert_eq!(p2[8], 0x00); // address method 00b
+        assert_eq!(p2[9], 0x00); // LUN 0
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, st2) = read_csw(&mut s, &mut data);
+        assert_eq!(st2, 0x00);
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::Done(BotStepResult::Processed)
+        );
+
+        // 03h (reserved) → Failed CSW; 05/24 sense stored on the device.
+        // actual=0 < declared=16 → ZLP, then CSW (BOT §6.7.2 short packet).
+        let raw = raw_cbw(23, 16, 0x80, 0, &[0xA0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
+        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 0), // ZLP
+            other => panic!("expected ZLP, got {other:?}"),
+        }
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, _, st3) = read_csw(&mut s, &mut data);
+        assert_eq!(st3, 0x01); // Failed
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::Done(BotStepResult::Processed)
+        );
+
+        // REQUEST SENSE → INVALID FIELD IN CDB (0x24).
+        let mut rs = [0u8; 6];
+        rs[0] = scsi_op::REQUEST_SENSE;
+        rs[4] = 18;
+        let raw = raw_cbw(24, 18, 0x80, 0, &rs);
+        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        match step {
+            SessionStep::NeedIn(bytes) => {
+                assert_eq!(bytes[12], 0x24);
+            }
+            other => panic!("expected sense data, got {other:?}"),
+        }
     }
 
     #[test]

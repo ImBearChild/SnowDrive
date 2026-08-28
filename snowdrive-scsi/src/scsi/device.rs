@@ -299,6 +299,11 @@ pub trait ScsiDevice {
     /// so the next non-bypass command reports `CHECK CONDITION` once.
     /// Default no-op for compute LUNs; storage/optical devices override.
     fn inject_unit_attention(&mut self, _asc: u8, _ascq: u8) {}
+
+    /// Replace the pending sense (transport-side synthetic CHECK CONDITION,
+    /// e.g. a well-known command rejected before device dispatch).
+    /// Default no-op for stateless LUNs that synthesize sense themselves.
+    fn set_sense(&mut self, _sense: Sense) {}
 }
 
 /// Heterogeneous LUN arrays: `[&mut dyn ScsiDevice]` elements satisfy
@@ -339,6 +344,10 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
 
     fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
         (**self).inject_unit_attention(asc, ascq)
+    }
+
+    fn set_sense(&mut self, sense: Sense) {
+        (**self).set_sense(sense)
     }
 }
 

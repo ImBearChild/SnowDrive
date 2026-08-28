@@ -702,6 +702,10 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
     fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
         self.sense = Some(Sense::new(SenseKey::UnitAttention, asc, ascq));
     }
+
+    fn set_sense(&mut self, sense: Sense) {
+        self.sense = Some(sense);
+    }
 }
 
 #[cfg(test)]

@@ -952,6 +952,83 @@ mod tests {
         assert_eq!(&data[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
+    // ── SELECT REPORT field (SPC-3 §6.21/Table 148) ──────────────
+    // 01h = well-known LUs only (→ empty list), 02h = all LUs (→ full
+    // list), 03h-FFh reserved → CHECK CONDITION / 05/24.
+
+    fn report_luns_bhs_select(lun: u8, itt: u32, cmd_sn: u32, select: u8) -> [u8; 48] {
+        let mut bhs = report_luns_bhs(lun, itt, cmd_sn);
+        bhs[34] = select; // CDB byte 2
+        bhs
+    }
+
+    #[test]
+    fn report_luns_select_01_well_known_only_empty() {
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024];
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs_select(0, 0xA2, 0, 0x01), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(&data[..4], &[0, 0, 0, 0]); // LUN LIST LENGTH = 0
+    }
+
+    #[test]
+    fn report_luns_select_02_returns_full_list() {
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024];
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs_select(0, 0xA3, 0, 0x02), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(&data[..4], &[0, 0, 0, 8]);
+        assert_eq!(&data[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn report_luns_reserved_select_rejected() {
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        let mut ram = vec![0u8; 16 * 1024];
+        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs = [dev];
+        login(&mut conn, &mut session, &mut work, &mut devs);
+
+        conn.feed(&report_luns_bhs_select(0, 0xA4, 0, 0x03), &[]);
+        assert_eq!(
+            session.step(&mut conn, &mut work, &mut devs),
+            StepResult::Processed
+        );
+        let (bhs, data) = conn.take_pdu().unwrap();
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(bhs[3], status::CHECK_CONDITION);
+        // Autosense data segment: 2-byte SenseLength + fixed sense.
+        assert_eq!(&data[0..2], &[0x00, 18]);
+        assert_eq!(data[2], 0x70);
+        assert_eq!(data[4], 0x05); // ILLEGAL REQUEST
+        assert_eq!(data[14], 0x24); // ASC = INVALID FIELD IN CDB
+    }
+
     // ── Linux kernel REPORT LUNS scanner compatibility ─────────────
     // Regression: the prior layout packed the first LUN entry at offset 4,
     // but Linux's `scsi_report_lun_scan` iterates `lun_data[1..=num_luns]`

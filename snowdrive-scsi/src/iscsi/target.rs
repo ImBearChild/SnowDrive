@@ -1252,7 +1252,8 @@ impl IscsiSession {
         // REPORT LUNS is a well-known command (SPC-3) and must be served
         // from any LUN, even an unsupported one.
         if scsi_opcode == scsi_op::REPORT_LUNS {
-            return self.handle_report_luns(work, itt, devs.len());
+            let select = cdb.get(2).copied().unwrap_or(0);
+            return self.handle_report_luns(work, itt, devs.len(), select);
         }
 
         let lun = bhs.lun() as usize;
@@ -1506,8 +1507,18 @@ impl IscsiSession {
         work: &'a mut [u8],
         itt: u32,
         num_luns: usize,
+        select_report: u8,
     ) -> SessionStep<'a> {
-        let list_len = u32::try_from(num_luns)
+        // SPC-3 §6.21/Table 148: ONLY 00h (all non well-known), 01h
+        // (well-known only) and 02h (all) are defined; the rest are reserved
+        // → CHECK CONDITION / INVALID FIELD IN CDB (autosense-in-response).
+        if select_report > 0x02 {
+            let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
+            return self.send_scsi_response(work, itt, status::CHECK_CONDITION, Some(&sense));
+        }
+        // 01h = well-known logical units only; this device has none.
+        let entries = if select_report == 0x01 { 0 } else { num_luns };
+        let list_len = u32::try_from(entries)
             .ok()
             .and_then(|n| n.checked_mul(8))
             .unwrap_or(u32::MAX);
@@ -1519,7 +1530,7 @@ impl IscsiSession {
         for b in &mut work[BHS_SIZE + 4..BHS_SIZE + 8] {
             *b = 0;
         }
-        for i in 0..num_luns {
+        for i in 0..entries {
             let off = BHS_SIZE + 8 + i * 8;
             work[off] = 0x00;
             work[off + 1] = i as u8;
@@ -1527,7 +1538,11 @@ impl IscsiSession {
                 *b = 0;
             }
         }
-        crate::debug!("  -> REPORT LUNS: {} LUN(s)", num_luns);
+        crate::debug!(
+            "  -> REPORT LUNS: {} LUN(s) (select={})",
+            entries,
+            select_report
+        );
         self.send_data_in_final(work, itt, total, 0, 0, status::GOOD)
     }
 
