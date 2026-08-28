@@ -796,8 +796,11 @@ impl BotSession {
         match ev {
             SessionEvent::InSent => {
                 if sent >= transfer_len {
-                    // Whole transfer sent: pad shortfall to declared (BOT §6.7.2 alternative to STALL).
-                    if transfer_len < expected {
+                    // Whole transfer sent: for data blocks (≥512B) pad shortfall
+                    // to declared (BOT §6.7.2 alternative to STALL); for small
+                    // control transfers (INQUIRY/VPD/MODE SENSE ≤96B) keep short
+                    // packet without STALL/pad — disc bad must not reset drive.
+                    if transfer_len < expected && transfer_len >= 512 {
                         let remaining = expected - sent;
                         let chunk = (remaining as usize).min(data.len());
                         data[..chunk].fill(0);
@@ -815,8 +818,9 @@ impl BotSession {
                 }
                 let next = ((transfer_len - sent) as usize).min(data.len());
                 if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
-                    // On xfer error, pad the remainder if shortfall (alternative to STALL).
-                    if sent < expected {
+                    // On xfer error, pad only for data blocks; small control
+                    // transfers keep short packet.
+                    if sent < expected && sent >= 512 {
                         let remaining = expected - sent;
                         let chunk = (remaining as usize).min(data.len());
                         data[..chunk].fill(0);
@@ -1893,21 +1897,11 @@ mod tests {
         let mut data = work();
 
         // INQUIRY data is 96 bytes, but the host declared 192.
-        // BOT §6.7.2 Hi>Di: shortfall is now padded with fill zeros (alternative to STALL).
         let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
         let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
         match step {
             SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
             other => panic!("expected short INQUIRY packet, got {other:?}"),
-        }
-        // Pad 96 zeros to reach declared 192.
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
-                assert_eq!(bytes.len(), 96);
-                assert!(bytes.iter().all(|&b| b == 0));
-            }
-            other => panic!("expected pad, got {other:?}"),
         }
         let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
         match step {
@@ -1915,7 +1909,7 @@ mod tests {
             other => panic!("expected CSW, got {other:?}"),
         }
         let (_, residue, status) = read_csw(&mut s, &mut data);
-        assert_eq!(residue, 192 - 96); // fill + residue
+        assert_eq!(residue, 192 - 96); // short packet + residue, no STALL
         assert_eq!(status, 0x00);
     }
 

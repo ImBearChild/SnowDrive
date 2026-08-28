@@ -347,7 +347,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
-    // MODE SENSE(6) 0x3F, alloc 192 → 28 bytes, host declared 192 → padded.
+    // MODE SENSE(6) 0x3F, alloc 192 → 4-byte header + 24 bytes of pages.
     let cdb = [0x1A, 0, 0x3F, 0, 192, 0];
     let r = run_command(
         &mut s,
@@ -360,9 +360,8 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 192 + CSW_LEN);
+    assert_eq!(sent.len(), 28 + CSW_LEN);
     assert_eq!(csw_fields(&sent), (7, 192 - 28, 0x00));
-    assert!(sent[28..192].iter().all(|&b| b == 0));
 
     // Out-of-range READ(10) → CHECK CONDITION → ZLP-terminated phase, then
     // Failed CSW with residue = declared (512 - 0 = 512).
@@ -446,13 +445,9 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 192 + CSW_LEN);
+    assert_eq!(sent.len(), 95 + CSW_LEN);
     assert_eq!(csw_fields(&sent), (1, 192 - 95, 0x00));
-    assert!(
-        sent[95..192].iter().all(|&b| b == 0),
-        "pad must be zero fill"
-    );
-    assert_eq!(io.stall_count, 0, "padded shortfall must not STALL");
+    assert_eq!(io.stall_count, 0, "short packet must not STALL");
 }
 
 // ── 3. Phase error / invalid LUN ────────────────────────────────────
@@ -958,7 +953,7 @@ fn mode_sense_10_and_prevent_allow() {
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
-    // MODE SENSE(10) 0x3F alloc 192 → 32 bytes, host declared 192 → padded.
+    // MODE SENSE(10) 0x3F alloc 192 → 8-byte header + 24 pages.
     let cdb = [0x5A, 0, 0x3F, 0, 0, 0, 0, 0, 192, 0];
     let r = run_command(
         &mut s,
@@ -971,9 +966,8 @@ fn mode_sense_10_and_prevent_allow() {
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 192 + CSW_LEN);
+    assert_eq!(sent.len(), 32 + CSW_LEN);
     assert_eq!(csw_fields(&sent), (1, 192 - 32, 0x00));
-    assert!(sent[32..192].iter().all(|&b| b == 0));
     assert_eq!(io.stall_count, 0);
 
     // PREVENT ALLOW MEDIUM REMOVAL (prevent) → no data, Passed.
@@ -1023,7 +1017,7 @@ fn request_sense_with_large_allocation_is_short_packet() {
     assert_eq!(r, BotStepResult::Processed);
     io.take_sent();
 
-    // REQUEST SENSE alloc 64 → 18-byte sense, host declared 64 → padded (no STALL).
+    // REQUEST SENSE alloc 64 → 18-byte sense + residue, no STALL.
     let cdb = [0x03, 0, 0, 0, 64, 0];
     let r = run_command(
         &mut s,
@@ -1036,9 +1030,8 @@ fn request_sense_with_large_allocation_is_short_packet() {
     );
     assert_eq!(r, BotStepResult::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 64 + CSW_LEN);
+    assert_eq!(sent.len(), 18 + CSW_LEN);
     assert_eq!(csw_fields(&sent), (2, 64 - 18, 0x00));
-    assert!(sent[18..64].iter().all(|&b| b == 0));
     assert_eq!(io.stall_count, 0);
 }
 
