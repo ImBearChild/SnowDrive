@@ -337,7 +337,7 @@ impl Bhs {
         &self.0[32..32 + len]
     }
 
-    // ── SCSI Response: status / sense length ─────────────────────
+    // ── SCSI Response: status / response ─────────────────────
 
     /// SCSI status, byte 3 (RFC 3720 §10.4.2).
     pub fn status(&self) -> u8 {
@@ -348,9 +348,16 @@ impl Bhs {
         self.0[3] = status;
     }
 
-    /// SenseLength, byte 2 (RFC 3720 §10.4.7.1).
-    pub fn set_sense_len(&mut self, len: u8) {
-        self.0[2] = len;
+    /// Response, byte 2 (RFC 3720 §10.4.7). The high-level iSCSI response
+    /// for a SCSI Response PDU — 0 = "Command completed at target" (the
+    /// only value we emit; Sense data travels in the Data Segment, not
+    /// here). Previously mislabeled `set_sense_len`.
+    pub fn response(&self) -> u8 {
+        self.0[2]
+    }
+
+    pub fn set_response(&mut self, response: u8) {
+        self.0[2] = response;
     }
 
     // ── Data-In / Data-Out / R2T: DataSN, Buffer Offset ──────────
@@ -693,10 +700,14 @@ mod tests {
     }
 
     #[test]
-    fn sense_len_at_byte_2() {
+    fn response_field_at_byte_2() {
         let mut b = bhs();
-        b.set_sense_len(18);
-        assert_eq!(b.0[2], 18);
+        // Byte 2 is the iSCSI Response field, not a sense length — sense
+        // data lives in the Data Segment. Regression for the old
+        // misleading `set_sense_len` API.
+        assert_eq!(b.response(), 0); // Command completed at target
+        b.set_response(0);
+        assert_eq!(b.0[2], 0);
     }
 
     #[test]

@@ -1623,6 +1623,11 @@ impl IscsiSession {
         resp.set_opcode(op::NOP_IN);
         resp.set_flags(flag::F_BIT);
         resp.set_itt(itt);
+        // RFC 3720 §10.18.1: Target Transfer Tag is copied from the NOP-Out
+        // ("shall be copied"), so it is echoed — for the open-iscsi keepalive
+        // NOP-Out it is 0xFFFFFFFF, but a data-transfer-terminating NOP-Out
+        // legitimately carries a real TTT. Eagerly overwriting to 0xFFFFFFFF
+        // (as suggested by an earlier review) would be a spec violation.
         resp.set_ttt(bhs.ttt());
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
