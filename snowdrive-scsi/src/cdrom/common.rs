@@ -555,22 +555,28 @@ pub fn build_get_config_features_for_media(
     mut off: usize,
     profile: CurrentProfile,
     caps: &CdromCapabilities,
-    _rt: u8,
+    rt: u8,
     start_feature: u16,
     last_lba: u32,
     media: &MediaState,
 ) -> usize {
+    let start_off = off;
     // The kernel's cdrom_is_random_writable() (and cdrom_is_mrw(), which
     // gracefully finds no MRW feature here) issue GET CONFIGURATION with
     // RT=0 (current) plus a starting feature (0x0020 / 0x0028) and read
-    // the FIRST descriptor expecting the requested feature — the same
-    // behavior real drives exhibit (they honor Starting Feature Number for
-    // every RT). So always start the response at the requested feature;
-    // RT=0 + start 0 yields everything.
-    let include = |code: u16| code >= start_feature;
-    // Profile List (0x0000) is required in EVERY GET CONFIGURATION response
-    // per MMC-6 §5.4.2. It identifies the profiles supported by the drive;
-    // the mounted profile is marked current (or 0000h when no media).
+    // the FIRST descriptor expecting the requested feature — real drives
+    // honor Starting Feature Number the same way. Per MMC-6 §6.5.1.3,
+    // RT=00b/01b return every supported feature at or above the Starting
+    // Feature Number; RT=10b (Table 257) returns only the descriptor
+    // identified by it — or just the Feature Header when the drive does
+    // not support that feature. RT=11b is rejected upstream (drive layer).
+    let include = |code: u16| match rt & 0x03 {
+        0b10 => code == start_feature,
+        _ => code >= start_feature,
+    };
+    // Profile List (0x0000) identifies the profiles the drive supports; the
+    // mounted profile is marked current (or 0000h when no media). Per
+    // §6.5.2.3 it is always current, so it also survives the RT=01b filter.
     if include(0x0000) {
         // Build profile list from caps in descending numerical order
         // per MMC-6 §6.5.2.3.
@@ -1016,6 +1022,26 @@ pub fn build_get_config_features_for_media(
         buf[off + 4..off + 20].copy_from_slice(&fw[..16]);
         off += 20;
     }
+    // RT=01b: return only descriptors whose Current bit (byte2 bit 0) is
+    // set (MMC-6 Table 257). The Profile List (0x0000) is always current
+    // (§6.5.2.3), so it stays. Every descriptor is 4 + additional_length
+    // bytes and all additional lengths here are multiples of four, so the
+    // in-place compaction keeps each descriptor 4-byte aligned.
+    if rt & 0x03 == 0b01 {
+        let mut rd = start_off;
+        let mut wr = start_off;
+        while rd < off {
+            let len = 4 + usize::from(buf[rd + 3]);
+            if buf[rd + 2] & 0x01 != 0 {
+                if wr != rd {
+                    buf.copy_within(rd..rd + len, wr);
+                }
+                wr += len;
+            }
+            rd += len;
+        }
+        off = wr;
+    }
     off
 }
 
@@ -1446,7 +1472,7 @@ mod tests {
             &mut w,
             profile,
             &UDFRW_CAPS,
-            0x02,
+            0x00,
             0x0000,
             255,
             0x2800,
@@ -1481,7 +1507,7 @@ mod tests {
             &mut w,
             profile,
             &UDFRW_CAPS,
-            0x02,
+            0x00,
             0x0000,
             255,
             0x2800,
@@ -1510,12 +1536,13 @@ mod tests {
     fn cdrom_get_config_starting_feature_filters() {
         let mut w = work();
         let profile = CurrentProfile::CdRom;
-        // RT=10b, start 0x0010 → Random Readable + Multi-Read + CD Read
+        // RT=00b, start 0x0010 → every feature at/above Random Readable:
+        // Random Readable + Multi-Read + CD Read.
         let outcome = build_get_config_response(
             &mut w,
             profile,
             &READ_ONLY_CDROM_CAPS,
-            0x02,
+            0x00,
             0x0010,
             255,
             0,
@@ -1528,6 +1555,114 @@ mod tests {
         // First feature should be Random Readable (0x0010) at header+0
         assert_eq!(buf[8], 0x00);
         assert_eq!(buf[9], 0x10);
+    }
+    #[test]
+    fn cdrom_get_config_rt_10b_returns_only_starting_feature() {
+        let mut w = work();
+        // RT=10b, start 0x0010 → only the Random Readable descriptor
+        // (header 8 + descriptor 12), nothing else (MMC-6 Table 257).
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::CdRom,
+            &READ_ONLY_CDROM_CAPS,
+            0x02,
+            0x0010,
+            255,
+            0,
+            true,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &w, &mut buf);
+        assert_eq!(n, 8 + 12);
+        // Data Length = bytes following the 4-byte field itself = 20 - 4.
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 16);
+        assert_eq!(buf[8], 0x00);
+        assert_eq!(buf[9], 0x10);
+    }
+    #[test]
+    fn cdrom_get_config_rt_10b_unsupported_returns_header_only() {
+        let mut w = work();
+        // RT=10b, start 0x0028 (MRW) — deliberately unsupported → the
+        // Feature Header alone (MMC-6 Table 257).
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::CdRom,
+            &READ_ONLY_CDROM_CAPS,
+            0x02,
+            0x0028,
+            255,
+            0,
+            true,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &w, &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 4);
+        assert_eq!(buf[7], 0x08); // current profile still reported
+    }
+    #[test]
+    fn cdrom_get_config_rt_10b_profile_list_only() {
+        let mut w = work();
+        // RT=10b, start 0x0000 → only the Profile List descriptor.
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::CdRom,
+            &READ_ONLY_CDROM_CAPS,
+            0x02,
+            0x0000,
+            255,
+            0,
+            true,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &w, &mut buf);
+        // READ_ONLY_CDROM_CAPS advertises two profiles (0002h, 0008h):
+        // header 8 + (4 + 2*4) = 20 bytes.
+        assert_eq!(n, 20);
+        assert_eq!(buf[8], 0x00);
+        assert_eq!(buf[9], 0x00); // Profile List feature code 0000h
+    }
+    #[test]
+    fn cdrom_get_config_rt_01b_returns_only_current_features() {
+        let mut w = work();
+        // Empty tray (media_current=false): media-dependent features have
+        // Current=0 and must be omitted; mechanism-level features stay.
+        let outcome = build_get_config_response(
+            &mut w,
+            CurrentProfile::CdRom,
+            &UDFRW_CAPS,
+            0x01,
+            0x0000,
+            255,
+            0,
+            false,
+        );
+        let mut buf = [0u8; 256];
+        let n = data_in(outcome, &w, &mut buf);
+        let mut off = 8usize;
+        let mut saw_core = false;
+        let mut saw_random = false;
+        let mut saw_cd_read = false;
+        while off + 4 <= n {
+            let code = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let add_len = buf[off + 3] as usize;
+            // Every descriptor returned under RT=01b has Current=1.
+            assert_eq!(
+                buf[off + 2] & 0x01,
+                0x01,
+                "feature {code:04X} returned but not current"
+            );
+            saw_core |= code == 0x0001;
+            saw_random |= code == 0x0010;
+            saw_cd_read |= code == 0x001E;
+            off += 4 + add_len;
+        }
+        assert!(saw_core, "Core must be current");
+        assert!(
+            !saw_random,
+            "Random Readable must not be current without media"
+        );
+        assert!(!saw_cd_read, "CD Read must not be current without media");
     }
     #[test]
     fn cdrom_get_config_alloc_clamp() {
