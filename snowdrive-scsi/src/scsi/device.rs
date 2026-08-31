@@ -227,6 +227,13 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// # let _ = lun.do_cmd(&[0x12, 0, 0, 0, 36, 0], &mut vec![0u8; 8192][..]);
 /// ```
 ///
+/// Custom commands are not limited to synthesized replies. A host→device
+/// parameter-list command returns `InParam { expected_len }` and the
+/// wrapper overrides [`ScsiDevice::complete_param`]; a chunked custom
+/// transfer returns `OutXfer`/`InXfer` and the wrapper keeps its own
+/// pending-transfer state, serving `xfer_out`/`xfer_in` as the transport
+/// drives offsets against it (see the loop below).
+///
 /// # Canonical transport loop
 ///
 /// ```text
