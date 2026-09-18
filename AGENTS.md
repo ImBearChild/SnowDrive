@@ -64,7 +64,7 @@ making changes. Crate names at a glance:
 | `snowdrive-scsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine, BSD `TcpStream` transport behind `std`. Recent fixes: StatSN/DataSN/BufferOffset sequencing and the R2T/Data-In state machine. |
 | `snowdrive-scsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (non-blocking `BotSession::poll`). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowdrive-cli` under `cfg(target_os = "linux")`. |
 | `snowdrive-scsi::udf_void` | Done (feature `udf_void`) — pure UDF 2.01 volume skeleton (`gen_sector`/`compute_layout`/CRC helpers) plus `cdrom::udfrw::UdfRwMedia`, a random-writable DVD-RAM over any `BlockStorage`: materialize/format (`mkfs=true`) and byte-plane read/write. Exposed via CLI `--cdrom udfrw=`. |
-| `snowdrive-cli` | Done — `serve` (`--disk`/`--cdrom` planes + `--iscsi`/`--usb` transports, mutually exclusive; `--iscsi auto` open-iscsi loopback auto-config) and `mkisofs` (directory → ISO image). |
+| `snowdrive-cli` | Done — `serve` (`--block`/`--cdrom` planes + `--iscsi`/`--usb` transports, mutually exclusive; `--iscsi auto` open-iscsi loopback auto-config) and `mkisofs` (directory → ISO image). |
 | `snowdrive-tests` | Done — mock + libiscsi whitebox (`has_libiscsi` gated) + ISO cross-validation. |
 | `snowdrive::capi` | **Removed** — the `capi`/`cbindgen` feature and module no longer exist anywhere in the tree (no C ABI). |
 | `snow9660` | Removed — folded into `snowdrive-cli` as `mkisofs` (the disc crate *generates* ISOs; it does not parse them). |

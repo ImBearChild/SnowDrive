@@ -95,7 +95,7 @@ fn no_subcommand_fails() {
 
 #[test]
 fn serve_requires_iscsi() {
-    let out = run(&["serve", "--disk", "ram=1M"]);
+    let out = run(&["serve", "--block", "ram=1M"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--iscsi"));
@@ -106,12 +106,12 @@ fn serve_requires_block() {
     let out = run(&["serve", "--iscsi", "127.0.0.1:3260"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--disk"));
+    assert!(err.contains("--block"));
 }
 
 #[test]
 fn serve_rejects_invalid_ram_size() {
-    let out = run(&["serve", "--disk", "ram=bogus", "--iscsi", "127.0.0.1:3260"]);
+    let out = run(&["serve", "--block", "ram=bogus", "--iscsi", "127.0.0.1:3260"]);
     assert!(!out.status.success());
 }
 
@@ -119,7 +119,7 @@ fn serve_rejects_invalid_ram_size() {
 fn serve_rejects_missing_file() {
     let out = run(&[
         "serve",
-        "--disk",
+        "--block",
         "img=/nonexistent/snowdrive-missing.img",
         "--iscsi",
         "127.0.0.1:3260",
@@ -131,7 +131,7 @@ fn serve_rejects_missing_file() {
 
 #[test]
 fn serve_rejects_invalid_address() {
-    let out = run(&["serve", "--disk", "ram=1M", "--iscsi", "not-an-address"]);
+    let out = run(&["serve", "--block", "ram=1M", "--iscsi", "not-an-address"]);
     assert!(!out.status.success());
 }
 
@@ -145,7 +145,7 @@ fn serve_rejects_unknown_option() {
 fn serve_rejects_work_buf_too_small() {
     let out = run(&[
         "serve",
-        "--disk",
+        "--block",
         "ram=1M",
         "--iscsi",
         "127.0.0.1:3260",
@@ -165,7 +165,7 @@ fn serve_exits_cleanly_on_sigint() {
     use std::time::Duration;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
-        .args(["serve", "--disk", "ram=1M", "--iscsi", "127.0.0.1:0"])
+        .args(["serve", "--block", "ram=1M", "--iscsi", "127.0.0.1:0"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -211,7 +211,7 @@ fn serve_exits_cleanly_on_sigint() {
     assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 }
 
-/// The same file path on two `--disk` LUNs emits a dual-mount warning on
+/// The same file path on two `--block` LUNs emits a dual-mount warning on
 /// stderr while the server still starts and exits 0 after SIGINT.
 #[cfg(unix)]
 #[test]
@@ -228,10 +228,10 @@ fn serve_warns_on_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
-            "--disk",
-            &path,
-            "--disk",
-            &path,
+            "--block",
+            &format!("img={path}"),
+            "--block",
+            &format!("img={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -293,9 +293,9 @@ fn serve_warns_on_dual_mount() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// `serve --disk cd=<iso>` starts with a lazy CD-ROM LUN, announces
-/// 'listening' and exits 0 after SIGINT (graceful shutdown syncs the
-/// read-only backend).
+/// `serve --block img=<iso>,profile=cd` starts with a lazy CD-ROM LUN,
+/// announces 'listening' and exits 0 after SIGINT (graceful shutdown syncs
+/// the read-only backend).
 #[cfg(unix)]
 #[test]
 fn serve_starts_with_cdblock() {
@@ -314,8 +314,8 @@ fn serve_starts_with_cdblock() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
-            "--disk",
-            &format!("cd={path}"),
+            "--block",
+            &format!("img={path},profile=cd"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -364,7 +364,7 @@ fn serve_starts_with_cdblock() {
     let _ = std::fs::remove_file(&iso);
 }
 
-/// `serve --cdrom <iso>` starts a flat CD-ROM LUN (full MMC), announces
+/// `serve --cdrom img=<iso>` starts a flat CD-ROM LUN (full MMC), announces
 /// 'listening' and exits 0 after SIGINT.
 #[cfg(unix)]
 #[test]
@@ -381,7 +381,13 @@ fn serve_starts_with_cdrom_flat() {
     let path = iso.to_string_lossy().to_string();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
-        .args(["serve", "--cdrom", &path, "--iscsi", "127.0.0.1:0"])
+        .args([
+            "serve",
+            "--cdrom",
+            &format!("img={path}"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -495,17 +501,19 @@ fn serve_starts_with_cdrom_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `--cdrom bundle=<dir>` (bundle mode) is rejected with "not yet
-/// supported" before the server binds.
+/// An `imgdir=` backing is block-only: `--cdrom imgdir=<dir>` is rejected.
 #[test]
-fn serve_rejects_bundle_cdrom() {
-    let out = run(&["serve", "--cdrom", "bundle=/tmp", "--iscsi", "127.0.0.1:0"]);
+fn serve_rejects_imgdir_cdrom() {
+    let out = run(&["serve", "--cdrom", "imgdir=/tmp", "--iscsi", "127.0.0.1:0"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not yet supported"));
+    assert!(
+        err.contains("imgdir") && err.contains("--cdrom"),
+        "expected an imgdir/--cdrom error, got: {err}"
+    );
 }
 
-/// A fresh `--disk bundle=<dir>` without `size=` is rejected: creating a new
+/// A fresh `--block imgdir=<dir>` without `size=` is rejected: creating a new
 /// bundle needs a virtual size.
 #[cfg(feature = "bundle")]
 #[test]
@@ -517,8 +525,8 @@ fn serve_rejects_bundle_without_size() {
 
     let out = run(&[
         "serve",
-        "--disk",
-        &format!("bundle={path}"),
+        "--block",
+        &format!("imgdir={path}"),
         "--iscsi",
         "127.0.0.1:0",
     ]);
@@ -531,7 +539,7 @@ fn serve_rejects_bundle_without_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `serve --disk bundle=<dir>,size=8M` creates a directory-chunked disk,
+/// `serve --block imgdir=<dir>,size=8M` creates a directory-chunked disk,
 /// announces 'listening' and exits 0 after SIGINT; the BUNDLE header and the
 /// first chunk appear on disk.
 #[cfg(all(unix, feature = "bundle"))]
@@ -548,8 +556,8 @@ fn serve_starts_with_bundle_disk() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
-            "--disk",
-            &format!("bundle={path},size=8M"),
+            "--block",
+            &format!("imgdir={path},size=8M"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -616,7 +624,7 @@ fn serve_starts_with_bundle_disk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `--disk img=<file>,ro` opens the plane read-only: on a read-only file the
+/// `--block img=<file>,ro` opens the plane read-only: on a read-only file the
 /// old `r+b` open would fail outright, so `listening` proves the fix. Skipped
 /// when running as root (permissions are not enforced for root).
 #[cfg(unix)]
@@ -633,13 +641,13 @@ fn serve_starts_with_read_only_img() {
     std::fs::set_permissions(&img, std::fs::Permissions::from_mode(0o444)).unwrap();
     let spec = format!("img={},ro", img.to_string_lossy());
 
-    run_serve_until_ready_then_sigint(&["serve", "--disk", &spec, "--iscsi", "127.0.0.1:0"]);
+    run_serve_until_ready_then_sigint(&["serve", "--block", &spec, "--iscsi", "127.0.0.1:0"]);
 
     let _ = std::fs::set_permissions(&img, std::fs::Permissions::from_mode(0o644));
     let _ = std::fs::remove_file(&img);
 }
 
-/// `--disk bundle=<dir>,ro` opens the plane read-only so it works on a
+/// `--block imgdir=<dir>,ro` opens the plane read-only so it works on a
 /// read-only directory (simulated here). Skipped when running as root.
 #[cfg(all(unix, feature = "bundle"))]
 #[test]
@@ -655,16 +663,16 @@ fn serve_starts_with_read_only_bundle() {
     let path = dir.to_string_lossy().to_string();
 
     // Materialize the bundle + header with a writable run.
-    let rw = format!("bundle={path},size=8M");
-    run_serve_until_ready_then_sigint(&["serve", "--disk", &rw, "--iscsi", "127.0.0.1:0"]);
+    let rw = format!("imgdir={path},size=8M");
+    run_serve_until_ready_then_sigint(&["serve", "--block", &rw, "--iscsi", "127.0.0.1:0"]);
     assert!(dir.join("BUNDLE").is_file());
 
     // Simulate read-only media.
     std::fs::set_permissions(dir.join("BUNDLE"), std::fs::Permissions::from_mode(0o444)).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let ro = format!("bundle={path},ro");
-    run_serve_until_ready_then_sigint(&["serve", "--disk", &ro, "--iscsi", "127.0.0.1:0"]);
+    let ro = format!("imgdir={path},ro");
+    run_serve_until_ready_then_sigint(&["serve", "--block", &ro, "--iscsi", "127.0.0.1:0"]);
 
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     let _ = std::fs::remove_dir_all(&dir);
@@ -969,7 +977,7 @@ fn serve_udfrw_mkfs_forced_rewrite() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// The same file path as both `--disk` and `--cdrom` emits a dual-mount
+/// The same file path as both `--block` and `--cdrom` emits a dual-mount
 /// warning on stderr before the server starts.
 #[cfg(unix)]
 #[test]
@@ -987,10 +995,10 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
-            "--disk",
+            "--block",
             &format!("img={path}"),
             "--cdrom",
-            &path,
+            &format!("img={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -1050,8 +1058,9 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// The same file path as both `--disk img=` and `--disk cd=` emits a
-/// dual-mount warning on stderr before the server starts.
+/// The same file path as both `--block img=` and
+/// `--block img=…,profile=cd` emits a dual-mount warning on stderr before the
+/// server starts.
 #[cfg(unix)]
 #[test]
 fn serve_warns_on_block_and_cdblock_dual_mount() {
@@ -1067,10 +1076,10 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
         .args([
             "serve",
-            "--disk",
+            "--block",
             &format!("img={path}"),
-            "--disk",
-            &format!("cd={path}"),
+            "--block",
+            &format!("img={path},profile=cd"),
             "--iscsi",
             "127.0.0.1:0",
         ])

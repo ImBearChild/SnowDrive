@@ -59,7 +59,7 @@ class IscsiLoopbackTest(unittest.TestCase):
             stop_iscsid()
 
     def setUp(self):
-        self.server = ServerHandle("--disk", f"ram={RAM_SIZE}")
+        self.server = ServerHandle("--block", f"ram={RAM_SIZE}")
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)
         self.mount = None

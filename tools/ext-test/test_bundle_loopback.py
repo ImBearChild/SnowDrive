@@ -3,14 +3,14 @@
 
 Same initiator stack as `test_iscsi_loopback.py` (`iscsiadm` + `iscsi_tcp`,
 manual login through `harness.IscsiSession`), but the served LUN is a
-**directory-chunked FlatBundle** (`--disk bundle=<dir>,size=32M`) instead of
+**directory-chunked FlatBundle** (`--block imgdir=<dir>,size=32M`) instead of
 a RAM disk. On top of the usual login/format/mount/write/read/fsck checklist
 it asserts the FlatBundle side effects:
 
 - the `BUNDLE` header is written when the server creates the disk;
 - chunk files materialize on demand (`000000.img` after the first write and
   more chunks once the whole device has been written);
-- the directory is re-openable (the same `bundle=` spec reloads geometry).
+- the directory is re-openable (the same `imgdir=` spec reloads geometry).
 
 The device is detected by the `/sys/class/block` snapshot diff in
 `harness.wait_new_sd`, so a stale device from a previous run can never be
@@ -64,7 +64,7 @@ class BundleLoopbackTest(unittest.TestCase):
     def setUp(self):
         self.bundle_dir = tempfile.mkdtemp(prefix="snowdrive-bundle-")
         self.server = ServerHandle(
-            "--disk", f"bundle={self.bundle_dir},size={SIZE},chunk={CHUNK}"
+            "--block", f"imgdir={self.bundle_dir},size={SIZE},chunk={CHUNK}"
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)
@@ -149,7 +149,7 @@ class BundleLoopbackTest(unittest.TestCase):
         # Restart the server on the same bundle directory (no size= needed:
         # the BUNDLE header already exists).
         self.server = ServerHandle(
-            "--disk", f"bundle={self.bundle_dir},chunk={CHUNK}"
+            "--block", f"imgdir={self.bundle_dir},chunk={CHUNK}"
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)

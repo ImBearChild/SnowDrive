@@ -128,7 +128,7 @@ impl<D: FlatData> BlockDevice<D> {
     ///   (PDT 0x05) that answers SBC/SPC over any [`FlatData`] plane.
     ///   Use it when you just want to hand the host an image without
     ///   dragging in the full MMC machinery (embedded targets, quick
-    ///   `--disk cd=` mounts).
+    ///   `--block img=…,profile=cd` mounts).
     /// - **`crate::cdrom::CdromDrive`** (feature `cdrom`) — a *complete*
     ///   MMC optical drive (READ TOC, GET CONFIGURATION, tray/medium
     ///   events, runtime media exchange via `load`/`eject`). Use it when

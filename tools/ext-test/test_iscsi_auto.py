@@ -54,7 +54,7 @@ class IscsiAutoTest(unittest.TestCase):
         purge_target_sessions()
         self.before = sd_snapshot()
         self.server = ServerHandle(
-            "--disk", f"ram={RAM_SIZE}", iscsi_auto=True
+            "--block", f"ram={RAM_SIZE}", iscsi_auto=True
         )
         self.server.__enter__()
         self.device = None

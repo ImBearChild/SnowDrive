@@ -33,13 +33,13 @@ cargo test --workspace
 ### Block device (iSCSI)
 
 ```bash
-snowdrive serve --disk disk.img --iscsi 0.0.0.0:3260
+snowdrive serve --block img=disk.img --iscsi 0.0.0.0:3260
 ```
 
 ### Multi-LUN
 
 ```bash
-snowdrive serve --disk disk.img --disk ram=16M --iscsi 0.0.0.0:3260
+snowdrive serve --block img=disk.img --block ram=16M --iscsi 0.0.0.0:3260
 ```
 
 ### USB Mass Storage gadget (Linux, `dummy_hcd` or real UDC)
@@ -52,7 +52,7 @@ aio) — with `dummy_hcd` loaded this needs no USB hardware:
 
 ```bash
 # as root: expose a 16 MiB RAM disk as /dev/sdX
-sudo snowdrive serve --usb --disk ram=16M
+sudo snowdrive serve --usb --block ram=16M
 
 # expose a read-only ISO as a USB CD-ROM
 sudo snowdrive serve --usb --cdrom img=out.iso
@@ -81,7 +81,7 @@ login/logout itself.)
 ## Project Status
 
 - [x] `snowdrive-scsi` lib: SCSI core + block/CD-ROM devices (SBC/SPC/MMC) + iSCSI target + USB MSC (BOT) core + UDF volume skeleton
-- [x] `snowdrive-cli serve`: `--disk` / `--cdrom` device planes + multi-LUN + graceful shutdown
+- [x] `snowdrive-cli serve`: `--block` / `--cdrom` device planes + multi-LUN + graceful shutdown
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
 - [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udf_void`): random-writable UDF-backed medium

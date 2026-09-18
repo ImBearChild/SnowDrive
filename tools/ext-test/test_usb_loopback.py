@@ -195,7 +195,7 @@ class UsbServer:
         self.log_path = tempfile.mktemp(prefix="snowdrive-usb-log-")
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
-            [find_binary(), "serve", "--usb", "--disk", spec],
+            [find_binary(), "serve", "--usb", "--block", spec],
             stdout=subprocess.DEVNULL,
             stderr=self.log,
             text=True,

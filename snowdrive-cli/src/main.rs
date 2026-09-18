@@ -7,30 +7,29 @@
 //! - `mkisofs`: generate an ISO9660/Joliet image from a host directory
 //!   (the live-generation algorithm, dumped sector-by-sector to a file)
 //!
-//! Device flags come in two planes (QEMU-style `[key=]value[,option...]`
-//! specs). `--disk` is the block plane; `--cdrom` is the CD plane.
+//! Devices are declared with two repeatable flags sharing one grammar
+//! (`<backing>[=<value>][,<option>...]`): `--block` and `--cdrom`.
 //!
-//! - `--disk` (block plane): `ram=<size>` (K/M/G suffixes), `cd=<path>`
-//!   (read-only ISO as a lazy CD-ROM, PDT=0x05), or `[img=]<path>[,ro]`
-//!   (file, default key `img=`); `bundle=<dir>[,chunk=…][,size=…][,sector=…]`
-//!   (directory-chunked disk, `bundle` feature).
-//! - `--cdrom` (CD plane): `img=<iso>` (flat full MMC), `live=<dir>` (live
-//!   ISO9660 over a directory); bare `.iso` maps to `img=`. Other bare
-//!   values are rejected (no auto-typing by suffix). `bundle=` (not yet implemented)
-//!   and `ram=` (not yet implemented) are reserved.
-//! - `--cdrom udfrw=<path>[,size=…][,mkfs=true]` or `--cdrom udfrw=ram:<size>`:
-//!   a random-writable DVD+RW (empty UDF 2.01 volume). `size=` creates a new
-//!   file (K/M/G suffixes) and writes the volume structure; `mkfs=true`
-//!   forces a fresh UDF volume (destructive); `ram:<size>` uses memory.
-//!   Without `mkfs=true`, the backend is opened as-is (no UDF detection).
+//! - `--block` drives `BlockDevice`: `img=<file>[,ro]`,
+//!   `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
+//!   disk, `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
+//!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
+//! - `--cdrom` drives `CdromDrive` (full MMC): `img=<iso>`, `live=<dir>`
+//!   (live ISO9660 over a directory), or
+//!   `udfrw=<path|ram:<size>>[,size=…][,mkfs]` (random-writable DVD-RAM;
+//!   `size=` creates a new file and writes the volume structure, `mkfs`
+//!   forces a fresh UDF volume).
 //!
-//! LUN numbering: all `--disk` devices first, then all `--cdrom` devices
-//! (the two planes cannot interleave). The same file path may appear on
-//! several LUNs; each is an independent SCSI device with its own LBA
-//! semantics, so a dual-mount warning is printed to stderr. SIGINT / SIGTERM
-//! trigger a graceful shutdown: the blocking `accept()` is woken by a probe
-//! connection, `serve()` returns, and every backend is `sync()`ed before
-//! exit.
+//! All backing keys are explicit — there is no bare-value or suffix
+//! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
+//! all `--block` devices first, then all `--cdrom` devices (the two planes
+//! cannot interleave). The same host path may appear on several LUNs; each
+//! is an independent SCSI device with its own LBA semantics, so a dual-mount
+//! warning is printed to stderr. SIGINT / SIGTERM trigger a graceful
+//! shutdown: the blocking `accept()` is woken by a probe connection,
+//! `serve()` returns, and every backend is `sync()`ed before exit.
+
+mod spec;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -57,6 +56,7 @@ use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::ScsiDevice;
 use snowdrive_scsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowdrive_scsi::MIN_DATA_LEN;
+use spec::{Backing, DeviceRole, DeviceSpec};
 
 #[cfg(target_os = "linux")]
 use snowdrive_scsi::usb::{
@@ -109,17 +109,16 @@ enum Cli {
 #[derive(Args, Debug)]
 #[command(group = clap::ArgGroup::new("transport").required(true).multiple(false))]
 struct ServeArgs {
-    /// Block plane device: `[img=]<path>[,ro]` (file, `img=` default),
-    /// `ram=<size>` (K/M/G suffixes), `cd=<path>` (read-only ISO as a
-    /// lazy CD-ROM), or `bundle=<dir>[,chunk=…][,size=…][,sector=…]`
-    /// (directory-chunked disk). Repeatable; `--disk` LUNs come first in order.
-    #[arg(long = "disk", value_name = "SPEC")]
-    disk: Vec<String>,
+    /// Block device (`BlockDevice`): `img=<file>[,ro]`, `ram=<size>`,
+    /// `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
+    /// disk), or `img=<file>,profile=cd` (read-only optical profile).
+    /// Repeatable; `--block` LUNs come first in declaration order.
+    #[arg(long = "block", value_name = "SPEC")]
+    block: Vec<String>,
 
-    /// CD-ROM device: `img=<path>.iso` (flat, full MMC) or `live=<dir>`
-    /// (live ISO9660); a bare `.iso` also maps to `img=`. `bundle=` (Phase
-    /// 3) and `ram=` (not yet implemented) are reserved. Repeatable; these LUNs follow
-    /// the `--disk` LUNs.
+    /// CD-ROM device (`CdromDrive`, full MMC): `img=<iso>`, `live=<dir>`
+    /// (live ISO9660 over a directory), or `udfrw=<path|ram:<size>>[,size=…][,mkfs]`
+    /// (random-writable DVD-RAM). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -203,6 +202,13 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 
     // The device pipeline is shared by both transports: parse the specs,
     // validate sources, allocate RAM disks and build the LUN list.
+    let specs = match spec::parse_all(&args.block, &args.cdrom) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("snowdrive: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
@@ -210,7 +216,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let mut disks: Vec<BlockDevice<RwRef>> = Vec::new();
     let mut drives: Vec<CdromDrive> = Vec::new();
     if build_devices(
-        &args,
+        &specs,
         &mut ram_disks,
         &mut backends,
         &mut lives,
@@ -222,7 +228,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    // LUN array in protocol order: all --disk LUNs, then all --cdrom LUNs.
+    // LUN array in protocol order: all --block LUNs, then all --cdrom LUNs.
     let mut luns: Vec<&mut dyn ScsiDevice> = disks
         .iter_mut()
         .map(|d| d as &mut dyn ScsiDevice)
@@ -684,17 +690,17 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
     }
 }
 
-/// Shared device pipeline: parse the `--disk` / `--cdrom` specs, validate
-/// the sources, allocate the RAM disks and build the LUN list in order
-/// (all `--disk` devices first, then all `--cdrom` devices).
+/// Shared device pipeline: build every parsed [`DeviceSpec`] into a backing
+/// plane and a typed LUN, in order (all `--block` devices first, then all
+/// `--cdrom` devices).
 ///
 /// Ownership model: the caller owns every resource — RAM slots
-/// (`ram_disks`), CD-ROM plane backends (`cd_backends`) — and the two
-/// typed LUN vectors borrow from them; the caller then lends the LUNs to
-/// a transport as `&mut dyn ScsiDevice`. On failure prints the error and
-/// returns `Err(())`.
+/// (`ram_disks`), block/optical backends, live scanners and bundles — and
+/// the two typed LUN vectors borrow from them; the caller then lends the
+/// LUNs to a transport as `&mut dyn ScsiDevice`. On failure prints the
+/// error and returns `Err(())`.
 fn build_devices<'a>(
-    args: &ServeArgs,
+    specs: &[DeviceSpec],
     ram_disks: &'a mut Vec<Vec<u8>>,
     backends: &'a mut Vec<BlockBackend<'a>>,
     lives: &'a mut Vec<LiveData<StdFsBackend>>,
@@ -702,45 +708,14 @@ fn build_devices<'a>(
     disks: &mut Vec<BlockDevice<RwRef<'a>>>,
     drives: &mut Vec<CdromDrive<'a>>,
 ) -> Result<(), ()> {
-    enum AnySpec<'x> {
-        Disk(&'x DiskSpec),
-        Cdrom(&'x CdromSpec),
-    }
-
-    if args.disk.is_empty() && args.cdrom.is_empty() {
-        eprintln!("snowdrive: --disk or --cdrom is required (at least one device)");
+    if specs.is_empty() {
+        eprintln!("snowdrive: --block or --cdrom is required (at least one device)");
         return Err(());
     }
 
-    // Parsed specs in LUN order (--disk plane first, then --cdrom).
-    let mut disk_specs = Vec::with_capacity(args.disk.len());
-    for spec in &args.disk {
-        match parse_disk_spec(spec) {
-            Ok(p) => disk_specs.push(p),
-            Err(msg) => {
-                eprintln!("snowdrive: invalid --disk spec '{spec}': {msg}");
-                return Err(());
-            }
-        }
-    }
-    let mut cdrom_specs = Vec::with_capacity(args.cdrom.len());
-    for spec in &args.cdrom {
-        match parse_cdrom_spec(spec) {
-            Ok(p) => cdrom_specs.push(p),
-            Err(msg) => {
-                eprintln!("snowdrive: invalid --cdrom spec '{spec}': {msg}");
-                return Err(());
-            }
-        }
-    }
-    for w in check_dual_mount(&dual_mount_specs(&disk_specs, &cdrom_specs)) {
+    for w in spec::check_dual_mount(specs) {
         eprintln!("{w}");
     }
-    let any_specs: Vec<AnySpec> = disk_specs
-        .iter()
-        .map(AnySpec::Disk)
-        .chain(cdrom_specs.iter().map(AnySpec::Cdrom))
-        .collect();
 
     // ── Phase A: own every resource, in LUN order ──────────────────
     // Exactly one byte-plane backend per non-Live LUN; Live owns its
@@ -748,28 +723,21 @@ fn build_devices<'a>(
     // split cursor (no reallocation, disjoint borrows).
     ram_disks.clear();
     // Pre-allocate RAM slot vectors so the cursor below can split them.
-    for spec in &any_specs {
-        match spec {
-            AnySpec::Disk(DiskSpec::Ram(size)) => match usize::try_from(*size) {
+    for spec in specs {
+        let size = match &spec.backing {
+            Backing::Ram { size } => Some(*size),
+            #[cfg(feature = "udf_void")]
+            Backing::UdfRw { path: None } => spec.plane.size,
+            _ => None,
+        };
+        if let Some(size) = size {
+            match usize::try_from(size) {
                 Ok(n) => ram_disks.push(vec![0u8; n]),
                 Err(_) => {
                     eprintln!("snowdrive: RAM size {size} too large for this platform");
                     return Err(());
                 }
-            },
-            #[cfg(feature = "udf_void")]
-            AnySpec::Cdrom(CdromSpec::UdfRw {
-                path: None,
-                size: Some(size),
-                ..
-            }) => match usize::try_from(*size) {
-                Ok(n) => ram_disks.push(vec![0u8; n]),
-                Err(_) => {
-                    eprintln!("snowdrive: udfrw=ram: size {size} too large");
-                    return Err(());
-                }
-            },
-            _ => {}
+            }
         }
     }
     backends.clear();
@@ -777,18 +745,12 @@ fn build_devices<'a>(
     bundles.clear();
     let mut ram_cursor: &'a mut [Vec<u8>] = ram_disks;
 
-    for spec in &any_specs {
-        match spec {
+    for spec in specs {
+        match &spec.backing {
             #[cfg(feature = "bundle")]
-            AnySpec::Disk(DiskSpec::Bundle {
-                dir,
-                chunk_size,
-                virtual_size,
-                sector,
-                read_only,
-            }) => {
+            Backing::ImgDir { dir } => {
                 if !Path::new(dir).is_dir() {
-                    if *read_only {
+                    if spec.plane.read_only {
                         eprintln!("snowdrive: bundle: read-only directory not found: {dir}");
                         return Err(());
                     }
@@ -799,41 +761,56 @@ fn build_devices<'a>(
                     })?;
                 }
                 let mut fs = StdFsBackend::new(dir);
-                let bundle = if *read_only {
+                let bundle = if spec.plane.read_only {
                     // Data-plane RO (works on read-only media); never writes a
                     // header here.
-                    FlatBundle::open_read_only(fs, *chunk_size, *virtual_size, Some(*sector))
-                        .map_err(|e| {
-                            eprintln!("snowdrive: bundle: failed to open read-only {dir}: {e}")
-                        })?
+                    FlatBundle::open_read_only(
+                        fs,
+                        spec.plane.chunk,
+                        spec.plane.size,
+                        Some(spec.plane.sector),
+                    )
+                    .map_err(|e| {
+                        eprintln!("snowdrive: bundle: failed to open read-only {dir}: {e}")
+                    })?
                 } else {
                     // Headless directory (empty / chunk files only) → create a
                     // new bundle (writes the BUNDLE header); otherwise open +
                     // override.
                     let has_header = fs.open("BUNDLE", OpenOptions::read_only()).is_ok();
                     if !has_header {
-                        let sz = virtual_size.ok_or_else(|| {
+                        let sz = spec.plane.size.ok_or_else(|| {
                             eprintln!(
                                 "snowdrive: bundle: size= required to create a new bundle in {dir}"
                             );
                         })?;
                         FlatBundle::create(
                             fs,
-                            chunk_size
+                            spec.plane
+                                .chunk
                                 .unwrap_or(snowdrive_scsi::common::flat_bundle::DEFAULT_CHUNK_SIZE),
                             sz,
-                            *sector,
+                            spec.plane.sector,
                         )
                         .map_err(|e| eprintln!("snowdrive: bundle: failed to create {dir}: {e}"))?
                     } else {
-                        FlatBundle::open(fs, *chunk_size, *virtual_size, Some(*sector)).map_err(
-                            |e| eprintln!("snowdrive: bundle: failed to open {dir}: {e}"),
-                        )?
+                        FlatBundle::open(
+                            fs,
+                            spec.plane.chunk,
+                            spec.plane.size,
+                            Some(spec.plane.sector),
+                        )
+                        .map_err(|e| eprintln!("snowdrive: bundle: failed to open {dir}: {e}"))?
                     }
                 };
                 bundles.push(bundle);
             }
-            AnySpec::Disk(DiskSpec::Ram(size)) => {
+            #[cfg(not(feature = "bundle"))]
+            Backing::ImgDir { .. } => {
+                eprintln!("snowdrive: imgdir= requires the `bundle` feature");
+                return Err(());
+            }
+            Backing::Ram { size } => {
                 let bytes = usize::try_from(*size).map_err(|_| {
                     eprintln!("snowdrive: RAM size {size} too large for this platform");
                 })?;
@@ -842,7 +819,7 @@ fn build_devices<'a>(
                 slot.resize(bytes, 0);
                 backends.push(BlockBackend::Ram(RamBackend::new(slot)));
             }
-            AnySpec::Disk(DiskSpec::Img { path, read_only }) => {
+            Backing::Img { path } => {
                 if !Path::new(path).is_file() {
                     eprintln!("snowdrive: file not found: {path}");
                     return Err(());
@@ -850,30 +827,12 @@ fn build_devices<'a>(
                 // Read-only is enforced at BOTH layers: the plane is opened
                 // `rb` (so it works on read-only media; never `r+b`), and the
                 // LUN is locked below (`set_writable(false)`).
-                let b = FileBackend::open(path, !*read_only).map_err(|e| {
-                    eprintln!("snowdrive: failed to open file block device {path}: {e}")
-                })?;
+                let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
+                let b = FileBackend::open(path, writable)
+                    .map_err(|e| eprintln!("snowdrive: failed to open {path}: {e}"))?;
                 backends.push(BlockBackend::File(b));
             }
-            AnySpec::Disk(DiskSpec::Cdrom { path }) => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return Err(());
-                }
-                let b = FileBackend::open(path, false)
-                    .map_err(|e| eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}"))?;
-                backends.push(BlockBackend::File(b));
-            }
-            AnySpec::Cdrom(CdromSpec::Flat { path }) => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowdrive: file not found: {path}");
-                    return Err(());
-                }
-                let b = FileBackend::open(path, false)
-                    .map_err(|e| eprintln!("snowdrive: failed to open CD-ROM image {path}: {e}"))?;
-                backends.push(BlockBackend::File(b));
-            }
-            AnySpec::Cdrom(CdromSpec::Live { dir }) => {
+            Backing::Live { dir } => {
                 let fs = StdFsBackend::new(dir);
                 let label = Path::new(dir)
                     .file_name()
@@ -885,21 +844,21 @@ fn build_devices<'a>(
                 lives.push(live);
             }
             #[cfg(feature = "udf_void")]
-            AnySpec::Cdrom(CdromSpec::UdfRw { path, size, .. }) => match path.as_deref() {
+            Backing::UdfRw { path } => match path.as_deref() {
                 Some(path) => {
                     let existed = Path::new(path).exists();
-                    if existed && size.is_some() {
+                    if existed && spec.plane.size.is_some() {
                         eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
                         return Err(());
                     }
                     if !existed {
-                        let Some(sz) = size else {
+                        let Some(sz) = spec.plane.size else {
                             eprintln!(
                                 "snowdrive: udfrw: file not found, use size= to create it: {path}"
                             );
                             return Err(());
                         };
-                        create_sparse(path, *sz).map_err(|e| {
+                        create_sparse(path, sz).map_err(|e| {
                             eprintln!("snowdrive: udfrw: failed to create {path}: {e}");
                         })?;
                     }
@@ -909,7 +868,7 @@ fn build_devices<'a>(
                     backends.push(BlockBackend::File(b));
                 }
                 None => {
-                    let bytes = size.ok_or_else(|| {
+                    let bytes = spec.plane.size.ok_or_else(|| {
                         eprintln!("snowdrive: udfrw=ram: requires size=");
                     })?;
                     let bytes = usize::try_from(bytes).map_err(|_| {
@@ -921,6 +880,11 @@ fn build_devices<'a>(
                     backends.push(BlockBackend::Ram(RamBackend::new(slot)));
                 }
             },
+            #[cfg(not(feature = "udf_void"))]
+            Backing::UdfRw { .. } => {
+                eprintln!("snowdrive: udfrw= requires the `udf_void` feature");
+                return Err(());
+            }
         }
     }
 
@@ -931,62 +895,72 @@ fn build_devices<'a>(
     let mut live_iter = lives.iter_mut();
     #[cfg(feature = "bundle")]
     let mut bundle_iter = bundles.iter_mut();
-    for (lun, spec) in any_specs.iter().enumerate() {
-        match spec {
+    for (lun, spec) in specs.iter().enumerate() {
+        log::debug!("LUN {lun}: {}", spec.raw);
+        match (spec.role, &spec.backing) {
             #[cfg(feature = "bundle")]
-            AnySpec::Disk(DiskSpec::Bundle {
-                dir,
-                sector,
-                read_only,
-                ..
-            }) => {
+            (DeviceRole::BlockDisk, Backing::ImgDir { dir }) => {
                 let be = bundle_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: bundle pool exhausted"))?;
                 let cap = be.capacity();
-                let mut dev = BlockDevice::disk(RwRef::new(be), *sector).map_err(|e| {
-                    eprintln!("snowdrive: bundle: invalid geometry for {dir}: {e}");
-                })?;
-                if *read_only {
+                let mut dev = BlockDevice::disk(RwRef::new(be), spec.plane.sector)
+                    .map_err(|e| eprintln!("snowdrive: bundle: invalid geometry for {dir}: {e}"))?;
+                if spec.plane.read_only {
                     // Device layer RO (immediate DATA PROTECT); the plane is
                     // already read-only, so both layers agree.
                     dev.set_writable(false);
                 }
-                log::debug!("LUN {lun}: bundle block device ({cap} bytes, sector {sector})");
+                log::debug!(
+                    "LUN {lun}: bundle block device ({cap} bytes, sector {})",
+                    spec.plane.sector
+                );
                 disks.push(dev);
             }
-            AnySpec::Disk(ds) => {
+            #[cfg(feature = "bundle")]
+            (DeviceRole::BlockCd, Backing::ImgDir { dir }) => {
+                let be = bundle_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: bundle pool exhausted"))?;
+                let cap = be.capacity();
+                let dev = BlockDevice::cdrom(RwRef::new(be)).map_err(|e| {
+                    eprintln!("snowdrive: bundle: invalid CD geometry for {dir}: {e}")
+                })?;
+                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
+                disks.push(dev);
+            }
+            (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
-                let ro = matches!(
-                    ds,
-                    DiskSpec::Img {
-                        read_only: true,
-                        ..
-                    }
-                ) || matches!(ds, DiskSpec::Cdrom { .. });
-                let mut dev = match ds {
-                    // Optical image profile (PDT 0x05): writes rejected at
-                    // the profile level; the erased plane type stays uniform.
-                    DiskSpec::Cdrom { path } => {
-                        log::debug!("LUN {lun}: {path} CD-ROM image");
-                        BlockDevice::cdrom(RwRef::new(be)).expect("nonzero sectors")
-                    }
-                    _ => BlockDevice::disk(RwRef::new(be), SECTOR_SIZE)
-                        .expect("SECTOR_SIZE is nonzero"),
-                };
-                if ro {
+                let mut dev =
+                    BlockDevice::disk(RwRef::new(be), SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+                if spec.plane.read_only {
                     dev.set_writable(false);
                 }
                 log::debug!(
                     "LUN {lun}: block device ({cap} bytes{})",
-                    if ro { ", read-only" } else { "" }
+                    if spec.plane.read_only {
+                        ", read-only"
+                    } else {
+                        ""
+                    }
                 );
                 disks.push(dev);
             }
-            AnySpec::Cdrom(CdromSpec::Flat { path }) => {
+            (DeviceRole::BlockCd, Backing::Img { .. } | Backing::Ram { .. }) => {
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
+                let cap = be.capacity();
+                // Optical image profile (PDT 0x05): writes rejected at the
+                // profile level; the erased plane type stays uniform.
+                let dev = BlockDevice::cdrom(RwRef::new(be)).expect("nonzero sectors");
+                log::debug!("LUN {lun}: CD profile ({cap} bytes)");
+                disks.push(dev);
+            }
+            (DeviceRole::MmcCd, Backing::Img { path }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
@@ -996,7 +970,7 @@ fn build_devices<'a>(
                 log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
                 drives.push(drive);
             }
-            AnySpec::Cdrom(CdromSpec::Live { dir }) => {
+            (DeviceRole::MmcCd, Backing::Live { dir }) => {
                 let live = live_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: live pool exhausted"))?;
@@ -1007,7 +981,7 @@ fn build_devices<'a>(
                 drives.push(drive);
             }
             #[cfg(feature = "udf_void")]
-            AnySpec::Cdrom(CdromSpec::UdfRw { path, mkfs, .. }) => {
+            (DeviceRole::MmcCd, Backing::UdfRw { path }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
@@ -1018,7 +992,7 @@ fn build_devices<'a>(
                     .to_string();
                 let mut scratch = [0u8; 256];
                 let opts = UdfRwOptions {
-                    mode: if *mkfs {
+                    mode: if spec.plane.mkfs {
                         OpenMode::Materialize
                     } else {
                         OpenMode::AsIs
@@ -1033,6 +1007,13 @@ fn build_devices<'a>(
                     .build();
                 drive.load(CdMedia::Rw(media));
                 drives.push(drive);
+            }
+            _ => {
+                eprintln!(
+                    "snowdrive: internal: unsupported device spec '{}'",
+                    spec.raw
+                );
+                return Err(());
             }
         }
     }
@@ -1729,350 +1710,12 @@ fn init_logging(verbose: u8) {
     let _ = builder.try_init();
 }
 
-/// A parsed `--disk` spec (block plane).
-#[derive(Debug)]
-enum DiskSpec {
-    /// `ram=<size>` → RAM-backed block device.
-    Ram(u64),
-    /// `[img=]<path>[,ro]` → file-backed block device (`img=` is default).
-    Img { path: String, read_only: bool },
-    /// `cd=<path>` → lazy CD-ROM (PDT=0x05, 2048B sectors, read-only).
-    Cdrom { path: String },
-    /// `bundle=<dir>[,chunk=…][,size=…][,sector=…][,ro]` → directory-chunked
-    /// disk (`FlatBundle`). `size=` is required to create a new bundle; each
-    /// option overrides the `BUNDLE` header when present. `ro` opens the plane
-    /// read-only (works on read-only media) and locks the LUN.
-    #[cfg(feature = "bundle")]
-    Bundle {
-        dir: String,
-        chunk_size: Option<u64>,
-        virtual_size: Option<u64>,
-        sector: u32,
-        read_only: bool,
-    },
-}
-
-/// A parsed `--cdrom` spec (CD plane).
-#[derive(Debug)]
-enum CdromSpec {
-    /// `img=<iso>` → flat ISO9660, full MMC (`CdromDevice<FileBackend>`).
-    Flat { path: String },
-    /// `live=<dir>` → live ISO9660 over a directory
-    /// (`CdLiveFsDevice<StdFsBackend>`).
-    Live { dir: String },
-    /// `udfrw=<path>[,size=…][,mkfs=true]` or `udfrw=ram:<size>` → a
-    /// random-writable DVD+RW (`UdfRwDevice`). `path = None` means RAM.
-    #[cfg(feature = "udf_void")]
-    UdfRw {
-        path: Option<String>,
-        size: Option<u64>,
-        mkfs: bool,
-    },
-}
-
-/// How a path is exposed as a SCSI device (dual-mount detection).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceKind {
-    Block,
-    CdBlock,
-    Cdrom,
-}
-
-/// Collect the file-backed specs as `(kind, path)` pairs for dual-mount
-/// detection (RAM disks have no path). All slices live in the caller; the
-/// returned paths borrow from them.
-fn dual_mount_specs<'a>(
-    disk_specs: &'a [DiskSpec],
-    cdrom_specs: &'a [CdromSpec],
-) -> Vec<(DeviceKind, &'a str)> {
-    let mut out: Vec<(DeviceKind, &'a str)> = disk_specs
-        .iter()
-        .filter_map(|s| match s {
-            DiskSpec::Img { path, .. } => Some((DeviceKind::Block, path.as_str())),
-            DiskSpec::Cdrom { path } => Some((DeviceKind::CdBlock, path.as_str())),
-            DiskSpec::Ram(_) => None,
-            #[cfg(feature = "bundle")]
-            DiskSpec::Bundle { dir, .. } => Some((DeviceKind::Block, dir.as_str())),
-        })
-        .collect();
-    out.extend(cdrom_specs.iter().filter_map(|s| match s {
-        CdromSpec::Flat { path } => Some((DeviceKind::Cdrom, path.as_str())),
-        CdromSpec::Live { dir } => Some((DeviceKind::Cdrom, dir.as_str())),
-        #[cfg(feature = "udf_void")]
-        CdromSpec::UdfRw {
-            path: Some(path), ..
-        } => Some((DeviceKind::Cdrom, path.as_str())),
-        #[cfg(feature = "udf_void")]
-        CdromSpec::UdfRw { path: None, .. } => None, // RAM: no path
-    }));
-    out
-}
-
-/// Detect the same path mounted as multiple independent SCSI devices and
-/// return the stderr warning lines. A path appearing more than once in total
-/// (same or different device kinds) is warned: each occurrence is a distinct
-/// LUN with its own LBA semantics (e.g. `--disk cd=f.iso --cdrom img=f.iso`).
-fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
-    let mut seen: std::collections::HashMap<&str, Vec<DeviceKind>> =
-        std::collections::HashMap::new();
-    for (kind, path) in specs {
-        seen.entry(path).or_default().push(*kind);
-    }
-    let mut warnings = Vec::new();
-    for (path, kinds) in seen {
-        if kinds.len() > 1 {
-            warnings.push(format!(
-                "warning: path '{path}' is mounted as {kinds:?}; these are \
-                 independent SCSI devices with different LBA semantics"
-            ));
-        }
-    }
-    warnings
-}
-
-/// Parse a `--disk` spec: `ram=<size>`, `ram=<size>`/`<path>[,ro]`.
-///
-/// - `ram=<size>` → RAM disk.
-/// - `cd=<path>` → lazy CD-ROM image.
-/// - `img=<path>`, `[img=]<path>[,ro]` → file block device (`img=` default).
-///
-/// Unknown options are ignored with a warning (C behavior).
-fn parse_disk_spec(spec: &str) -> Result<DiskSpec, String> {
-    #[cfg(feature = "bundle")]
-    if let Some(rest) = spec.strip_prefix("bundle=") {
-        return parse_bundle_spec(rest);
-    }
-    if let Some(size) = spec.strip_prefix("ram=") {
-        return match parse_size(size) {
-            Some(n) => Ok(DiskSpec::Ram(n)),
-            None => Err(format!("invalid RAM size: {size}")),
-        };
-    }
-    if let Some(path) = spec.strip_prefix("cd=") {
-        if path.is_empty() {
-            return Err("empty `cd=` path".to_string());
-        }
-        return Ok(DiskSpec::Cdrom {
-            path: path.to_string(),
-        });
-    }
-    // Default key: `img=`. Strip it if present.
-    let rest = spec.strip_prefix("img=").unwrap_or(spec);
-    let (path, opt) = match rest.split_once(',') {
-        Some((p, o)) => (p, Some(o)),
-        None => (rest, None),
-    };
-    let read_only = match opt {
-        Some("ro") => true,
-        Some(o) => {
-            log::warn!("unknown disk option '{o}', ignoring");
-            false
-        }
-        None => false,
-    };
-    if path.is_empty() {
-        return Err("empty file path".to_string());
-    }
-    Ok(DiskSpec::Img {
-        path: path.to_string(),
-        read_only,
-    })
-}
-
-/// Parse the `bundle=` value: `<dir>[,chunk=…][,size=…][,sector=…][,ro]`.
-///
-/// `size=` is required to *create* a new bundle (no `BUNDLE` header) and
-/// always overrides a header value when present; `chunk=` / `sector=` override
-/// the header too. `ro` opens the plane read-only (the LUN is also locked).
-/// Unknown options are rejected (unlike the `img=` default-key path which
-/// warns and ignores).
-#[cfg(feature = "bundle")]
-fn parse_bundle_spec(spec: &str) -> Result<DiskSpec, String> {
-    let (dir, opts) = match spec.split_once(',') {
-        Some((d, o)) => (d, o),
-        None => (spec, ""),
-    };
-    if dir.is_empty() {
-        return Err("empty bundle directory".to_string());
-    }
-    let mut chunk_size = None;
-    let mut virtual_size = None;
-    let mut sector = 512u32;
-    let mut read_only = false;
-    for opt in opts.split(',') {
-        if opt.is_empty() {
-            continue;
-        }
-        if let Some(v) = opt.strip_prefix("chunk=") {
-            if chunk_size.is_some() {
-                return Err("duplicate chunk=".to_string());
-            }
-            chunk_size = Some(parse_byte_size(v)?);
-        } else if let Some(v) = opt.strip_prefix("size=") {
-            if virtual_size.is_some() {
-                return Err("duplicate size=".to_string());
-            }
-            virtual_size = Some(parse_byte_size(v)?);
-        } else if let Some(v) = opt.strip_prefix("sector=") {
-            let s: u32 = v.parse().map_err(|_| format!("invalid sector '{v}'"))?;
-            if s != 512 && s != 2048 {
-                return Err(format!("invalid sector size {s} (512 or 2048)"));
-            }
-            sector = s;
-        } else if opt == "ro" {
-            read_only = true;
-        } else {
-            return Err(format!("unknown bundle option '{opt}'"));
-        }
-    }
-    Ok(DiskSpec::Bundle {
-        dir: dir.to_string(),
-        chunk_size,
-        virtual_size,
-        sector,
-        read_only,
-    })
-}
-
-/// Parse a `--cdrom` spec (QEMU-style keyed value).
-///
-/// - `img=<iso>` → flat ISO9660 CD-ROM (full MMC).
-/// - `live=<dir>` → live ISO9660 CD-ROM over the directory.
-/// - `<path>.iso` → same as `img=<path>` (bare value: only `.iso` is
-///   auto-typed; anything else is rejected — no bundle auto-detection).
-/// - `bundle=` / `ram=` → reserved for  not yet implemented / not yet implemented.
-fn parse_cdrom_spec(spec: &str) -> Result<CdromSpec, String> {
-    if let Some(path) = spec.strip_prefix("bundle=") {
-        return Err(format!(
-            "{path}: bundle cdrom mode is not yet supported (not yet implemented)"
-        ));
-    }
-    if spec.starts_with("ram=") {
-        return Err("ram= cdrom mode is not yet supported (not yet implemented)".to_string());
-    }
-    if let Some(rest) = spec.strip_prefix("udfrw=") {
-        return parse_udfrw_spec(rest);
-    }
-    let (value, opts) = match spec.split_once(',') {
-        Some((v, o)) => (v, o),
-        None => (spec, ""),
-    };
-    let (path, live) = if let Some(p) = value.strip_prefix("live=") {
-        (p, true)
-    } else if let Some(p) = value.strip_prefix("img=") {
-        (p, false)
-    } else {
-        // Bare value: only `.iso` is auto-typed to `img=`; anything else is
-        // rejected rather than guessed (no live/bundle/ram by suffix).
-        (value, false)
-    };
-    if path.is_empty() {
-        return Err("empty path".to_string());
-    }
-    for opt in opts.split(',') {
-        if opt.starts_with("recovery=") {
-            return Err("bundle recovery mode is not yet supported".to_string());
-        }
-        if !opt.is_empty() {
-            log::warn!("unknown cdrom option '{opt}', ignoring");
-        }
-    }
-    if live {
-        return Ok(CdromSpec::Live {
-            dir: path.to_string(),
-        });
-    }
-    if value.starts_with("img=") {
-        return Ok(CdromSpec::Flat {
-            path: path.to_string(),
-        });
-    }
-    if path.to_ascii_lowercase().ends_with(".iso") {
-        return Ok(CdromSpec::Flat {
-            path: path.to_string(),
-        });
-    }
-    Err(format!(
-        "{path}: not a .iso file and no explicit cdrom key; use \
-         `--cdrom img=<iso>` / `--cdrom live=<dir>` / `--cdrom <file>.iso`"
-    ))
-}
-
-/// Parse the `udfrw=` value: `ram:<size>` (memory) or
-/// `<path>[,size=…][,mkfs=true]` (file). File semantics per
-///  `size=` creates a new file + structure, `mkfs`
-/// forces the structure into an existing blank file, both are exclusive.
-#[cfg(feature = "udf_void")]
-fn parse_udfrw_spec(spec: &str) -> Result<CdromSpec, String> {
-    if let Some(size) = spec.strip_prefix("ram:") {
-        if spec.contains(',') {
-            return Err("udfrw=ram:<size> takes no options".to_string());
-        }
-        let size = parse_byte_size(size)?;
-        return Ok(CdromSpec::UdfRw {
-            path: None,
-            size: Some(size),
-            mkfs: false,
-        });
-    }
-    let (path, opts) = match spec.split_once(',') {
-        Some((p, o)) => (p, o),
-        None => (spec, ""),
-    };
-    if path.is_empty() {
-        return Err("empty udfrw path".to_string());
-    }
-    let mut size = None;
-    let mut mkfs = false;
-    for opt in opts.split(',') {
-        if opt.is_empty() {
-            continue;
-        }
-        if let Some(v) = opt.strip_prefix("size=") {
-            if size.is_some() {
-                return Err("duplicate size=".to_string());
-            }
-            size = Some(parse_byte_size(v)?);
-        } else if opt == "mkfs=true" {
-            mkfs = true;
-        } else if opt == "mkfs=false" {
-            mkfs = false;
-        } else {
-            return Err(format!("unknown udfrw option '{opt}'"));
-        }
-    }
-    if size.is_some() && mkfs {
-        return Err("size= (new file) and mkfs=true (existing file) are exclusive".to_string());
-    }
-    Ok(CdromSpec::UdfRw {
-        path: Some(path.to_string()),
-        size,
-        mkfs,
-    })
-}
-
-/// Parse a byte size with an optional `K`/`M`/`G` suffix (QEMU-style).
-fn parse_byte_size(s: &str) -> Result<u64, String> {
-    if s.is_empty() {
-        return Err("empty size".to_string());
-    }
-    let (num, mult) = match s.as_bytes().last().copied() {
-        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1u64 << 10),
-        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1u64 << 20),
-        Some(b'g') | Some(b'G') => (&s[..s.len() - 1], 1u64 << 30),
-        _ => (s, 1),
-    };
-    let n: u64 = num.parse().map_err(|_| format!("invalid size '{s}'"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| format!("size '{s}' too large"))
-}
-
 /// Resolve the work buffer size (default 256K), validating it against
 /// [`MIN_DATA_LEN`].
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     let bytes = match s {
         None => DEFAULT_WORK_BUF_SIZE as u64,
-        Some(v) => parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
+        Some(v) => spec::parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
     };
     let n = usize::try_from(bytes).map_err(|_| format!("--work-buf-size {bytes} is too large"))?;
     if n < MIN_DATA_LEN {
@@ -2087,27 +1730,6 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
     let body = s.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(body, 16).map_err(|_| format!("invalid hex value: {s}"))
-}
-
-/// Parse a size with an optional K/M/G suffix (C `parse_size`).
-/// Returns `None` for empty, non-numeric, unsupported-suffix, zero, or
-/// overflowing input (C's convention: 0 == invalid).
-fn parse_size(s: &str) -> Option<u64> {
-    let digit_len = s.bytes().take_while(|b| b.is_ascii_digit()).count();
-    let digits = &s[..digit_len];
-    if digits.is_empty() {
-        return None;
-    }
-    let mut val: u64 = digits.parse().ok()?;
-    let suffix = &s[digit_len..];
-    match suffix {
-        "" => {}
-        "K" | "k" => val = val.checked_mul(1 << 10)?,
-        "M" | "m" => val = val.checked_mul(1 << 20)?,
-        "G" | "g" => val = val.checked_mul(1 << 30)?,
-        _ => return None,
-    }
-    (val != 0).then_some(val)
 }
 
 #[cfg(test)]
@@ -2134,258 +1756,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_size_plain_and_suffixes() {
-        assert_eq!(parse_size("512"), Some(512));
-        assert_eq!(parse_size("1K"), Some(1024));
-        assert_eq!(parse_size("1k"), Some(1024));
-        assert_eq!(parse_size("2M"), Some(2 * 1024 * 1024));
-        assert_eq!(parse_size("1G"), Some(1024 * 1024 * 1024));
-        assert_eq!(parse_size("256M"), Some(256 * 1024 * 1024));
-    }
-
-    #[test]
-    fn parse_size_invalid() {
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("abc"), None);
-        assert_eq!(parse_size("12X"), None);
-        assert_eq!(parse_size("0"), None); // C: size 0 → invalid
-        assert_eq!(parse_size("0M"), None);
-        assert_eq!(parse_size("-5"), None);
-        assert_eq!(parse_size("18446744073709551615G"), None); // overflow
-    }
-
-    #[test]
-    fn parse_disk_spec_ram() {
-        match parse_disk_spec("ram=8M").unwrap() {
-            DiskSpec::Ram(n) => assert_eq!(n, 8 * 1024 * 1024),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(parse_disk_spec("ram=bogus").is_err());
-        assert!(parse_disk_spec("ram=").is_err());
-        assert!(parse_disk_spec("ram=0").is_err());
-    }
-
-    #[test]
-    fn parse_disk_spec_img() {
-        let DiskSpec::Img { path, read_only } = parse_disk_spec("disk.img").unwrap() else {
-            panic!("unexpected spec")
-        };
-        assert_eq!(path, "disk.img");
-        assert!(!read_only);
-        // Bare value and explicit `img=` are equivalent (default key).
-        match parse_disk_spec("img=cool.img").unwrap() {
-            DiskSpec::Img { path, .. } => assert_eq!(path, "cool.img"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        // `.ro`, unknown option ignored (C behavior), empty path rejected.
-        match parse_disk_spec("disk.img,ro").unwrap() {
-            DiskSpec::Img { read_only, .. } => assert!(read_only),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        match parse_disk_spec("disk.img,bogus").unwrap() {
-            DiskSpec::Img { read_only, .. } => assert!(!read_only),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(parse_disk_spec(",ro").is_err());
-    }
-
-    #[test]
-    fn parse_disk_spec_cdrom_key() {
-        match parse_disk_spec("cd=disc.iso").unwrap() {
-            DiskSpec::Cdrom { path } => assert_eq!(path, "disc.iso"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(parse_disk_spec("cd=").is_err());
-    }
-
-    #[cfg(feature = "bundle")]
-    #[test]
-    fn parse_disk_spec_bundle() {
-        match parse_disk_spec("bundle=tree,chunk=1M,size=4M,sector=2048").unwrap() {
-            DiskSpec::Bundle {
-                dir,
-                chunk_size,
-                virtual_size,
-                sector,
-                read_only,
-            } => {
-                assert_eq!(dir, "tree");
-                assert_eq!(chunk_size, Some(1 << 20));
-                assert_eq!(virtual_size, Some(4 << 20));
-                assert_eq!(sector, 2048);
-                assert!(!read_only);
-            }
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(matches!(
-            parse_disk_spec("bundle=tree,ro"),
-            Ok(DiskSpec::Bundle {
-                read_only: true,
-                ..
-            })
-        ));
-        match parse_disk_spec("bundle=tree").unwrap() {
-            DiskSpec::Bundle {
-                chunk_size,
-                virtual_size,
-                sector,
-                ..
-            } => {
-                assert_eq!(chunk_size, None);
-                assert_eq!(virtual_size, None);
-                assert_eq!(sector, 512);
-            }
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(parse_disk_spec("bundle=").is_err());
-        assert!(parse_disk_spec("bundle=tree,bogus=1").is_err());
-        assert!(parse_disk_spec("bundle=tree,size=zz").is_err());
-        assert!(parse_disk_spec("bundle=tree,size=1M,size=2M").is_err());
-        assert!(parse_disk_spec("bundle=tree,sector=1024").is_err());
-        // `bundle=` wins over the `img=` default key.
-        assert!(matches!(
-            parse_disk_spec("bundle=x"),
-            Ok(DiskSpec::Bundle { .. })
-        ));
-    }
-
-    #[cfg(feature = "bundle")]
-    #[test]
-    fn dual_mount_bundle_dir_collected() {
-        let disk = [
-            DiskSpec::Bundle {
-                dir: "d".to_string(),
-                chunk_size: None,
-                virtual_size: None,
-                sector: 512,
-                read_only: false,
-            },
-            DiskSpec::Bundle {
-                dir: "d".to_string(),
-                chunk_size: None,
-                virtual_size: None,
-                sector: 512,
-                read_only: false,
-            },
-        ];
-        let d = dual_mount_specs(&disk, &[]);
-        assert_eq!(d, vec![(DeviceKind::Block, "d"), (DeviceKind::Block, "d")]);
-        // Two bundles over one directory = two writers to the same tree.
-        assert_eq!(check_dual_mount(&d).len(), 1);
-    }
-
-    #[test]
-    fn parse_cdrom_spec_flat_iso() {
-        match parse_cdrom_spec("boot.iso").unwrap() {
-            CdromSpec::Flat { path } => assert_eq!(path, "boot.iso"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        // Case-insensitive suffix.
-        match parse_cdrom_spec("BOOT.ISO").unwrap() {
-            CdromSpec::Flat { path } => assert_eq!(path, "BOOT.ISO"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_cdrom_spec_explicit_keys() {
-        match parse_cdrom_spec("img=boot.iso").unwrap() {
-            CdromSpec::Flat { path } => assert_eq!(path, "boot.iso"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        match parse_cdrom_spec("live=tree").unwrap() {
-            CdromSpec::Live { dir } => assert_eq!(dir, "tree"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_cdrom_spec_unsupported_modes() {
-        // Bundle: explicit keys and old-style plain directory / `.d` suffix.
-        assert!(parse_cdrom_spec("bundle=rw.d").is_err());
-        assert!(parse_cdrom_spec("rw.d").is_err());
-        assert!(parse_cdrom_spec("tree").is_err());
-        assert!(parse_cdrom_spec("tree,recovery=delete").is_err());
-        // RAM mode (not yet implemented).
-        assert!(parse_cdrom_spec("ram=64M").is_err());
-    }
-
-    #[test]
-    fn parse_cdrom_spec_ignores_unknown_option() {
-        match parse_cdrom_spec("boot.iso,whatever").unwrap() {
-            CdromSpec::Flat { path } => assert_eq!(path, "boot.iso"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        assert!(parse_cdrom_spec("").is_err());
-        assert!(parse_cdrom_spec(",live").is_err());
-    }
-
-    #[cfg(feature = "udf_void")]
-    #[test]
-    fn parse_udfrw_spec_file_and_ram() {
-        match parse_cdrom_spec("udfrw=disk.img").unwrap() {
-            CdromSpec::UdfRw {
-                path: Some(p),
-                size: None,
-                mkfs: false,
-            } => assert_eq!(p, "disk.img"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        match parse_cdrom_spec("udfrw=disk.img,size=4G").unwrap() {
-            CdromSpec::UdfRw {
-                path: Some(p),
-                size: Some(s),
-                mkfs: false,
-            } => {
-                assert_eq!(p, "disk.img");
-                assert_eq!(s, 4 << 30);
-            }
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        match parse_cdrom_spec("udfrw=disk.img,mkfs=true").unwrap() {
-            CdromSpec::UdfRw {
-                path: Some(p),
-                size: None,
-                mkfs: true,
-            } => assert_eq!(p, "disk.img"),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-        match parse_cdrom_spec("udfrw=ram:64M").unwrap() {
-            CdromSpec::UdfRw {
-                path: None,
-                size: Some(s),
-                mkfs: false,
-            } => assert_eq!(s, 64 << 20),
-            other => panic!("unexpected spec: {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "udf_void")]
-    #[test]
-    fn parse_udfrw_spec_rejects_conflicts() {
-        // size= (new file) and mkfs=true (existing file) are exclusive.
-        assert!(parse_cdrom_spec("udfrw=a.img,size=1M,mkfs=true").is_err());
-        // ram: takes no options.
-        assert!(parse_cdrom_spec("udfrw=ram:64M,size=1M").is_err());
-        // Empty / unknown / bad size.
-        assert!(parse_cdrom_spec("udfrw=").is_err());
-        assert!(parse_cdrom_spec("udfrw=a.img,bogus=1").is_err());
-        assert!(parse_cdrom_spec("udfrw=a.img,size=zz").is_err());
-    }
-
-    #[cfg(feature = "udf_void")]
-    #[test]
-    fn parse_byte_size_suffixes() {
-        assert_eq!(parse_byte_size("512").unwrap(), 512);
-        assert_eq!(parse_byte_size("4K").unwrap(), 4 << 10);
-        assert_eq!(parse_byte_size("16m").unwrap(), 16 << 20);
-        assert_eq!(parse_byte_size("1G").unwrap(), 1 << 30);
-        assert!(parse_byte_size("").is_err());
-        assert!(parse_byte_size("zz").is_err());
-        assert!(parse_byte_size("999999999999999999999999G").is_err());
-    }
-
-    #[test]
     fn parse_work_size_defaults_and_validation() {
         assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
         assert_eq!(parse_work_size(Some("128K")).unwrap(), 128 * 1024);
@@ -2394,121 +1764,16 @@ mod tests {
     }
 
     #[test]
-    fn dual_mount_same_path_twice_warns() {
-        let w = check_dual_mount(&[(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains("a.img"));
-        assert!(w[0].starts_with("warning:"));
-    }
-
-    #[test]
-    fn dual_mount_distinct_paths_do_not_warn() {
-        let w = check_dual_mount(&[(DeviceKind::Block, "a.img"), (DeviceKind::Block, "b.img")]);
-        assert!(w.is_empty());
-    }
-
-    #[test]
-    fn dual_mount_single_spec_does_not_warn() {
-        let w = check_dual_mount(&[(DeviceKind::Block, "a.img")]);
-        assert!(w.is_empty());
-    }
-
-    #[test]
-    fn dual_mount_specs_collects_disk_paths_only() {
-        let specs = [
-            DiskSpec::Ram(1024),
-            DiskSpec::Img {
-                path: "a.img".to_string(),
-                read_only: false,
-            },
-            DiskSpec::Img {
-                path: "a.img".to_string(),
-                read_only: true,
-            },
-        ];
-        let d = dual_mount_specs(&specs, &[]);
-        assert_eq!(
-            d,
-            vec![(DeviceKind::Block, "a.img"), (DeviceKind::Block, "a.img")]
-        );
-        let w = check_dual_mount(&d);
-        assert_eq!(w.len(), 1);
-    }
-
-    #[test]
-    fn dual_mount_cdrom_key_paths_are_collected() {
-        let disk = [DiskSpec::Cdrom {
-            path: "boot.iso".to_string(),
-        }];
-        let d = dual_mount_specs(&disk, &[]);
-        assert_eq!(d, vec![(DeviceKind::CdBlock, "boot.iso")]);
-        assert!(check_dual_mount(&d).is_empty());
-    }
-
-    #[test]
-    fn dual_mount_img_and_cdrom_same_path_warns() {
-        let disk = [DiskSpec::Img {
-            path: "boot.iso".to_string(),
-            read_only: false,
-        }];
-        let cd = [DiskSpec::Cdrom {
-            path: "boot.iso".to_string(),
-        }];
-        let d = dual_mount_specs(&disk, &[]);
-        let e = dual_mount_specs(&cd, &[]);
-        let mut all = d;
-        all.extend(e);
-        let w = check_dual_mount(&all);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains("boot.iso"));
-        assert!(w[0].starts_with("warning:"));
-    }
-
-    #[test]
-    fn dual_mount_cdrom_specs_are_collected() {
-        let cdrom = vec![
-            CdromSpec::Flat {
-                path: "boot.iso".to_string(),
-            },
-            CdromSpec::Live {
-                dir: "tree".to_string(),
-            },
-        ];
-        let d = dual_mount_specs(&[], &cdrom);
-        assert_eq!(
-            d,
-            vec![(DeviceKind::Cdrom, "boot.iso"), (DeviceKind::Cdrom, "tree")]
-        );
-        assert!(check_dual_mount(&d).is_empty());
-    }
-
-    #[test]
-    fn dual_mount_disk_and_cdrom_same_path_warns() {
-        let disk = [DiskSpec::Img {
-            path: "boot.iso".to_string(),
-            read_only: false,
-        }];
-        let cdrom = vec![CdromSpec::Flat {
-            path: "boot.iso".to_string(),
-        }];
-        let d = dual_mount_specs(&disk, &cdrom);
-        let w = check_dual_mount(&d);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains("boot.iso"));
-        assert!(w[0].starts_with("warning:"));
-    }
-
-    #[test]
-    fn cli_accepts_multiple_disk_and_cdrom_specs() {
+    fn cli_accepts_multiple_block_and_cdrom_specs() {
         let cli = Cli::try_parse_from([
             "snowdrive",
             "serve",
-            "--disk",
+            "--block",
             "ram=1M",
-            "--disk",
+            "--block",
             "img=disk.img,ro",
-            "--disk",
-            "cd=legacy.iso",
+            "--block",
+            "img=boot.iso,profile=cd",
             "--cdrom",
             "img=boot.iso",
             "--cdrom",
@@ -2523,11 +1788,11 @@ mod tests {
         match cli {
             Cli::Serve(a) => {
                 assert_eq!(
-                    a.disk,
+                    a.block,
                     vec![
                         "ram=1M".to_string(),
                         "img=disk.img,ro".to_string(),
-                        "cd=legacy.iso".to_string()
+                        "img=boot.iso,profile=cd".to_string()
                     ]
                 );
                 assert_eq!(
@@ -2543,15 +1808,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_legacy_flags() {
-        // `--block` / `--cdblock` were removed in the dual-plane redesign.
-        assert!(Cli::try_parse_from(["snowdrive", "serve", "--block", "ram=1M"]).is_err());
+    fn cli_rejects_removed_flags() {
+        // `--disk` / `--cdblock` were removed in the device/backing split.
+        assert!(Cli::try_parse_from(["snowdrive", "serve", "--disk", "ram=1M"]).is_err());
         assert!(Cli::try_parse_from(["snowdrive", "serve", "--cdblock", "x.iso"]).is_err());
     }
 
     #[test]
     fn cli_usb_transport_parses() {
-        match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--disk", "ram=1M"]).unwrap() {
+        match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--block", "ram=1M"]).unwrap() {
             Cli::Serve(a) => {
                 // `--usb` without a value defaults to the `auto` selector.
                 assert_eq!(a.usb.as_deref(), Some("auto"));
@@ -2575,7 +1840,7 @@ mod tests {
 
     #[test]
     fn cli_iscsi_auto_parses() {
-        match Cli::try_parse_from(["snowdrive", "serve", "--iscsi", "auto", "--disk", "ram=1M"])
+        match Cli::try_parse_from(["snowdrive", "serve", "--iscsi", "auto", "--block", "ram=1M"])
             .unwrap()
         {
             Cli::Serve(a) => assert_eq!(a.iscsi.as_deref(), Some("auto")),
@@ -2586,7 +1851,7 @@ mod tests {
     #[test]
     fn cli_requires_a_transport() {
         // serve without `--iscsi`/`--usb` fails at parse time.
-        assert!(Cli::try_parse_from(["snowdrive", "serve", "--disk", "ram=1M"]).is_err());
+        assert!(Cli::try_parse_from(["snowdrive", "serve", "--block", "ram=1M"]).is_err());
     }
 
     #[test]
