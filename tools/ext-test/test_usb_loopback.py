@@ -20,21 +20,25 @@ failed first bulk transfer.
 """
 
 import os
-import shutil
 import signal
 import subprocess
 import tempfile
-import time
 import unittest
 
-from harness import find_binary, have_tool, is_root
+from harness import (
+    device_size,
+    find_binary,
+    have_tool,
+    is_root,
+    mount_ext4,
+    sd_snapshot,
+    sh,
+    unmount,
+    wait_new_sd,
+)
 
 # Backend image: 32 MiB (enough for ext4), matching the iSCSI loopback RAM size.
 IMG_SIZE = 32 * 1024 * 1024
-
-
-def sh(*argv, check=True, timeout=120, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kw)
 
 
 def _usb_udc_present():
@@ -95,8 +99,9 @@ class UsbLoopbackTest(unittest.TestCase):
 
     def setUp(self):
         # Snapshot the block devices before the server binds, so the device
-        # usb-storage creates is unambiguously ours.
-        self.before = set(n for n in os.listdir("/sys/class/block") if n.startswith("sd"))
+        # usb-storage creates is unambiguously ours. Keep this snapshot for
+        # the whole test: after a rebind the same device name may reappear.
+        self.before = sd_snapshot()
         fd, self.img = tempfile.mkstemp(prefix="snowdrive-usb-", suffix=".img")
         os.close(fd)
         os.truncate(self.img, IMG_SIZE)
@@ -104,9 +109,8 @@ class UsbLoopbackTest(unittest.TestCase):
         self.mount = None
 
     def tearDown(self):
-        if self.mount and _is_mounted(self.mount):
-            sh("umount", self.mount, check=False)
-            time.sleep(0.5)
+        unmount(self.mount)
+        self.mount = None
         log_path = getattr(self.server, "log_path", None)
         if self.server:
             try:
@@ -123,16 +127,7 @@ class UsbLoopbackTest(unittest.TestCase):
     # ── helpers ─────────────────────────────────────────────────────
 
     def _wait_device(self, timeout=20):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            now = set(n for n in os.listdir("/sys/class/block") if n.startswith("sd"))
-            new = sorted(now - self.before)
-            if new:
-                return f"/dev/{new[0]}"
-            time.sleep(0.2)
-        raise AssertionError(
-            f"no /dev/sdX appeared after bind; server stderr:\n{self.server.log_tail()}"
-        )
+        return wait_new_sd(self.before, timeout=timeout)
 
     # ── test ────────────────────────────────────────────────────────
 
@@ -140,37 +135,34 @@ class UsbLoopbackTest(unittest.TestCase):
         dev = self._wait_device()
 
         # Capacity must match the backend file.
-        actual = int(sh("blockdev", "--getsize64", dev).stdout.strip())
-        self.assertEqual(actual, IMG_SIZE, "device capacity must match the backend")
+        self.assertEqual(
+            device_size(dev), IMG_SIZE, "device capacity must match the backend"
+        )
 
         # Full-disk destructive pattern test (like the iSCSI loopback).
         if have_tool("badblocks"):
-            sh("badblocks", "-wsv", dev, timeout=300, check=True)
+            sh("badblocks", "-wsv", dev, timeout=300)
         else:
             print("  (badblocks not installed; skipping full-disk pattern test)")
 
         # Format as ext4, mount, write/read through the real filesystem.
-        sh("mkfs.ext4", "-q", dev, check=True)
-        self.mount = _make_mountpoint()
-        sh("mount", dev, self.mount, check=True)
-        self.assertTrue(_is_mounted(self.mount))
+        self.mount = mount_ext4(dev)
         payload = os.urandom(1 << 20)  # 1 MiB
         with open(os.path.join(self.mount, "payload.bin"), "wb") as f:
             f.write(payload)
         sh("sync")
         with open(os.path.join(self.mount, "payload.bin"), "rb") as f:
             self.assertEqual(f.read(), payload)
-        sh("umount", self.mount, check=True)
+        unmount(self.mount, check=True)
         self.mount = None
-        time.sleep(0.5)
-        sh("fsck.ext4", "-fn", dev, check=True)
+        sh("fsck.ext4", "-fn", dev)
 
         # Read-only backend: rebind the same image read-only, verify reads
         # work and writes are rejected.
         self.server.stop()
         self.server = UsbServer(self.img, read_only=True)
         dev = self._wait_device()
-        sh("dd", f"if={dev}", "of=/dev/null", "bs=1M", "count=1", check=True)
+        sh("dd", f"if={dev}", "of=/dev/null", "bs=1M", "count=1")
         # Direct I/O so the write error (WRITE PROTECTED) surfaces in dd's
         # write() instead of being absorbed by the page cache.
         r = sh(
@@ -236,17 +228,6 @@ class UsbServer:
         finally:
             self.log.close()
             self.proc = None
-
-
-def _make_mountpoint():
-    path = f"/mnt/snowdrive-usb-{os.getpid()}"
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _is_mounted(mount):
-    r = sh("findmnt", "-n", "-o", "SOURCE", mount, check=False)
-    return r.returncode == 0 and r.stdout.strip() != ""
 
 
 if __name__ == "__main__":
