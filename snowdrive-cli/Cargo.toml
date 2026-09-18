@@ -16,7 +16,7 @@ doc = false
 
 [features]
 default = ["full"]
-full = ["std", "scsi", "iscsi", "udf_void", "cdrom", "livefs", "usb", "log",
+full = ["std", "scsi", "iscsi", "udf_void", "cdrom", "livefs", "usb", "bundle", "log",
         "dep:clap", "dep:ctrlc", "dep:env_logger"]
 std = ["snowdrive-scsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 scsi = ["snowdrive-scsi/scsi"]
@@ -25,6 +25,7 @@ iscsi = ["snowdrive-scsi/iscsi"]
 cdrom = ["snowdrive-scsi/cdrom"]
 livefs = ["snowdrive-scsi/livefs"]
 usb = ["snowdrive-scsi/usb"]
+bundle = ["snowdrive-scsi/bundle"]
 log = ["snowdrive-scsi/log", "dep:log"]
 defmt = ["snowdrive-scsi/defmt"]
 

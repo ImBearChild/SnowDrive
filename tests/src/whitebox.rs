@@ -457,6 +457,77 @@ fn out_of_range_sense_is_consumed() {
     teardown(&iscsi, server);
 }
 
+/// FlatBundle backend over the real iSCSI wire with mkfs-like scattered and
+/// large (R2T) writes — reproduces the `WRITE(10)` Medium Error seen with the
+/// kernel initiator without needing root.
+#[test]
+fn bundle_scattered_writes_over_iscsi() {
+    use snowdrive_scsi::common::block_storage::RwRef;
+    use snowdrive_scsi::common::flat_bundle::FlatBundle;
+    use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
+
+    let size: u64 = 32 << 20;
+    let dir = std::env::temp_dir().join(format!(
+        "snowdrive_wb_bundle_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_for_thread = dir.to_string_lossy().into_owned();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (stream, _peer) = listener.accept().expect("target accept");
+        let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut session = IscsiSession::new();
+        let mut bundle = FlatBundle::new(
+            StdFsBackend::new(&dir_for_thread),
+            1 << 20,
+            size,
+            BLOCK_SIZE,
+        )
+        .expect("bundle");
+        let dev = BlockDevice::disk(RwRef::new(&mut bundle), BLOCK_SIZE).expect("device");
+        let mut devs = [dev];
+        serve_conn(&mut conn, &mut work, &mut session, &mut devs)
+    });
+
+    let iscsi = connect(port);
+
+    // Every 4 KiB block, visited in a deterministic shuffled order (holes,
+    // cross-chunk, LRU churn), written as a single immediate WRITE(10).
+    let mut lbas: Vec<u32> = (0..(size / 4096) as u32).map(|i| i * 8).collect();
+    lbas.sort_by_key(|l| l.wrapping_mul(2654435761) ^ 0x9E37_79B9);
+    for &lba in &lbas {
+        let buf = vec![(lba & 0xFF) as u8; 4096];
+        let t = iscsi.write10(0, lba, &buf, BLOCK_SIZE as c_int);
+        assert_eq!(
+            t.status(),
+            SCSI_STATUS_GOOD,
+            "4 KiB WRITE lba={lba}: {}",
+            iscsi.error()
+        );
+    }
+
+    // Large multi-R2T writes (mkfs' 4 MiB runs).
+    for &lba in &[0u32, 8192, 16384, 32768, 49152, 57344] {
+        let buf = vec![0x5Au8; 4 * 1024 * 1024];
+        let t = iscsi.write10(0, lba, &buf, BLOCK_SIZE as c_int);
+        assert_eq!(
+            t.status(),
+            SCSI_STATUS_GOOD,
+            "4 MiB WRITE lba={lba}: {}",
+            iscsi.error()
+        );
+    }
+
+    teardown(&iscsi, handle);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Multi-LUN: the target is configured with three independent LUNs.
 /// libiscsi's `iscsi_full_connect_sync` issues a TEST UNIT READY at LUN 0
 /// (and implicitly relies on REPORT LUNS to populate its internal map). The

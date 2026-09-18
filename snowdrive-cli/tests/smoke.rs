@@ -9,6 +9,77 @@ fn run(args: &[&str]) -> Output {
         .expect("run snowdrive")
 }
 
+/// Spawn `snowdrive serve`, wait for the `listening` line, SIGINT, assert exit 0.
+#[cfg(unix)]
+fn run_serve_until_ready_then_sigint(args: &[&str]) {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowdrive");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("listening") {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+                line.clear();
+            }
+        });
+    }
+
+    if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child.id().to_string())
+            .status();
+        let _ = child.wait();
+        panic!("snowdrive did not announce 'listening' for {args:?}");
+    }
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(
+        status.success(),
+        "expected exit 0 after SIGINT for {args:?}, got {status:?}"
+    );
+}
+
+/// True if this process cannot write to a `0444` file (i.e. not root), so a
+/// read-only medium can actually be simulated.
+#[cfg(unix)]
+fn can_simulate_read_only() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("snowdrive_roprobe_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, b"x").is_err() {
+        return false;
+    }
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let writable = std::fs::OpenOptions::new().write(true).open(&probe).is_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    !writable
+}
+
 #[test]
 fn help_exits_zero_and_lists_serve() {
     let out = run(&["--help"]);
@@ -432,6 +503,171 @@ fn serve_rejects_bundle_cdrom() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not yet supported"));
+}
+
+/// A fresh `--disk bundle=<dir>` without `size=` is rejected: creating a new
+/// bundle needs a virtual size.
+#[cfg(feature = "bundle")]
+#[test]
+fn serve_rejects_bundle_without_size() {
+    let dir = std::env::temp_dir().join(format!("snowdrive_bundlesz_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().to_string();
+
+    let out = run(&[
+        "serve",
+        "--disk",
+        &format!("bundle={path}"),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("size=") || err.contains("virtual_size"),
+        "expected a missing-size error, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `serve --disk bundle=<dir>,size=8M` creates a directory-chunked disk,
+/// announces 'listening' and exits 0 after SIGINT; the BUNDLE header and the
+/// first chunk appear on disk.
+#[cfg(all(unix, feature = "bundle"))]
+#[test]
+fn serve_starts_with_bundle_disk() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!("snowdrive_bundle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowdrive"))
+        .args([
+            "serve",
+            "--disk",
+            &format!("bundle={path},size=8M"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowdrive");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if line.contains("listening") {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+                line.clear();
+            }
+        });
+    }
+
+    if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child.id().to_string())
+            .status();
+        let _ = child.wait();
+        panic!("snowdrive did not announce 'listening'");
+    }
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child.wait().expect("wait for snowdrive");
+    assert!(status.success(), "snowdrive should exit 0 after SIGINT");
+
+    // The directory was created (host-owned) and the BUNDLE header written by
+    // the serve run. Chunks only materialize on first write (no initiator
+    // traffic in this smoke), so only the header is asserted.
+    let header = std::fs::read(dir.join("BUNDLE")).unwrap_or_default();
+    let header = String::from_utf8_lossy(&header);
+    assert!(
+        header.contains("magic = SNOWBND"),
+        "BUNDLE magic missing: {header}"
+    );
+    assert!(
+        header.contains("virtual_size = 8388608"),
+        "BUNDLE size missing: {header}"
+    );
+    assert!(
+        header.contains("sector_size = 512"),
+        "BUNDLE sector missing: {header}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--disk img=<file>,ro` opens the plane read-only: on a read-only file the
+/// old `r+b` open would fail outright, so `listening` proves the fix. Skipped
+/// when running as root (permissions are not enforced for root).
+#[cfg(unix)]
+#[test]
+fn serve_starts_with_read_only_img() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !can_simulate_read_only() {
+        eprintln!("skipping: cannot simulate read-only media (running as root)");
+        return;
+    }
+    let img = std::env::temp_dir().join(format!("snowdrive_ro_img_{}.img", std::process::id()));
+    std::fs::write(&img, [0u8; 512]).unwrap();
+    std::fs::set_permissions(&img, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let spec = format!("img={},ro", img.to_string_lossy());
+
+    run_serve_until_ready_then_sigint(&["serve", "--disk", &spec, "--iscsi", "127.0.0.1:0"]);
+
+    let _ = std::fs::set_permissions(&img, std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::remove_file(&img);
+}
+
+/// `--disk bundle=<dir>,ro` opens the plane read-only so it works on a
+/// read-only directory (simulated here). Skipped when running as root.
+#[cfg(all(unix, feature = "bundle"))]
+#[test]
+fn serve_starts_with_read_only_bundle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !can_simulate_read_only() {
+        eprintln!("skipping: cannot simulate read-only media (running as root)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("snowdrive_ro_bundle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+
+    // Materialize the bundle + header with a writable run.
+    let rw = format!("bundle={path},size=8M");
+    run_serve_until_ready_then_sigint(&["serve", "--disk", &rw, "--iscsi", "127.0.0.1:0"]);
+    assert!(dir.join("BUNDLE").is_file());
+
+    // Simulate read-only media.
+    std::fs::set_permissions(dir.join("BUNDLE"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let ro = format!("bundle={path},ro");
+    run_serve_until_ready_then_sigint(&["serve", "--disk", &ro, "--iscsi", "127.0.0.1:0"]);
+
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `serve --cdrom udfrw=ram:<size>` materializes an in-memory UDF 2.01

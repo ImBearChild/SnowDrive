@@ -76,6 +76,19 @@ impl OpenOptions {
         }
     }
 
+    /// Open an **existing** file read-write (no create, no truncate).
+    ///
+    /// Used by read-write bundles so every cached chunk handle is writable:
+    /// a read must never cache a handle that a later write cannot use.
+    pub const fn read_write() -> Self {
+        Self {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+        }
+    }
+
     /// Create or truncate; read-write.
     pub const fn create_or_truncate() -> Self {
         Self {

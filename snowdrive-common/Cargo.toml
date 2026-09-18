@@ -10,9 +10,11 @@ default = ["std"]
 std = ["embedded-io/std"]
 log = ["dep:log"]
 defmt = ["dep:defmt"]
+bundle = ["dep:ini_core"]
 
 [dependencies]
 embedded-io = "0.7"
 heapless = "0.8"
+ini_core = { version = "0.2", default-features = false, optional = true }
 log = { version = "0.4", optional = true, default-features = false }
 defmt = { version = "1", optional = true }

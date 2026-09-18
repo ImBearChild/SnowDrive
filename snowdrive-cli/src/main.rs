@@ -12,7 +12,8 @@
 //!
 //! - `--disk` (block plane): `ram=<size>` (K/M/G suffixes), `cd=<path>`
 //!   (read-only ISO as a lazy CD-ROM, PDT=0x05), or `[img=]<path>[,ro]`
-//!   (file, default key `img=`).
+//!   (file, default key `img=`); `bundle=<dir>[,chunk=…][,size=…][,sector=…]`
+//!   (directory-chunked disk, `bundle` feature).
 //! - `--cdrom` (CD plane): `img=<iso>` (flat full MMC), `live=<dir>` (live
 //!   ISO9660 over a directory); bare `.iso` maps to `img=`. Other bare
 //!   values are rejected (no auto-typing by suffix). `bundle=` (not yet implemented)
@@ -47,11 +48,14 @@ use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
 #[cfg(feature = "udf_void")]
 use snowdrive_scsi::cdrom::udfrw::{OpenMode, UdfRwMedia, UdfRwOptions};
 use snowdrive_scsi::common::block_storage::RwRef;
+use snowdrive_scsi::common::flat_bundle::FlatBundle;
+#[cfg(feature = "bundle")]
+use snowdrive_scsi::common::fs_storage::OpenOptions;
 use snowdrive_scsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowdrive_scsi::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
 use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::ScsiDevice;
-use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
+use snowdrive_scsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowdrive_scsi::MIN_DATA_LEN;
 
 #[cfg(target_os = "linux")]
@@ -106,8 +110,9 @@ enum Cli {
 #[command(group = clap::ArgGroup::new("transport").required(true).multiple(false))]
 struct ServeArgs {
     /// Block plane device: `[img=]<path>[,ro]` (file, `img=` default),
-    /// `ram=<size>` (K/M/G suffixes), or `cd=<path>` (read-only ISO as a
-    /// lazy CD-ROM). Repeatable; `--disk` LUNs come first in order.
+    /// `ram=<size>` (K/M/G suffixes), `cd=<path>` (read-only ISO as a
+    /// lazy CD-ROM), or `bundle=<dir>[,chunk=…][,size=…][,sector=…]`
+    /// (directory-chunked disk). Repeatable; `--disk` LUNs come first in order.
     #[arg(long = "disk", value_name = "SPEC")]
     disk: Vec<String>,
 
@@ -201,6 +206,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
+    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
     let mut disks: Vec<BlockDevice<RwRef>> = Vec::new();
     let mut drives: Vec<CdromDrive> = Vec::new();
     if build_devices(
@@ -208,6 +214,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         &mut ram_disks,
         &mut backends,
         &mut lives,
+        &mut bundles,
         &mut disks,
         &mut drives,
     )
@@ -691,6 +698,7 @@ fn build_devices<'a>(
     ram_disks: &'a mut Vec<Vec<u8>>,
     backends: &'a mut Vec<BlockBackend<'a>>,
     lives: &'a mut Vec<LiveData<StdFsBackend>>,
+    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
     disks: &mut Vec<BlockDevice<RwRef<'a>>>,
     drives: &mut Vec<CdromDrive<'a>>,
 ) -> Result<(), ()> {
@@ -766,10 +774,65 @@ fn build_devices<'a>(
     }
     backends.clear();
     lives.clear();
+    bundles.clear();
     let mut ram_cursor: &'a mut [Vec<u8>] = ram_disks;
 
     for spec in &any_specs {
         match spec {
+            #[cfg(feature = "bundle")]
+            AnySpec::Disk(DiskSpec::Bundle {
+                dir,
+                chunk_size,
+                virtual_size,
+                sector,
+                read_only,
+            }) => {
+                if !Path::new(dir).is_dir() {
+                    if *read_only {
+                        eprintln!("snowdrive: bundle: read-only directory not found: {dir}");
+                        return Err(());
+                    }
+                    // The FsStorage seam has no mkdir — the host (CLI) owns
+                    // directory creation (__FLAT_BUN.md §4.2/§5.2).
+                    std::fs::create_dir_all(dir).map_err(|e| {
+                        eprintln!("snowdrive: bundle: failed to create directory {dir}: {e}");
+                    })?;
+                }
+                let mut fs = StdFsBackend::new(dir);
+                let bundle = if *read_only {
+                    // Data-plane RO (works on read-only media); never writes a
+                    // header here.
+                    FlatBundle::open_read_only(fs, *chunk_size, *virtual_size, Some(*sector))
+                        .map_err(|e| {
+                            eprintln!("snowdrive: bundle: failed to open read-only {dir}: {e}")
+                        })?
+                } else {
+                    // Headless directory (empty / chunk files only) → create a
+                    // new bundle (writes the BUNDLE header); otherwise open +
+                    // override.
+                    let has_header = fs.open("BUNDLE", OpenOptions::read_only()).is_ok();
+                    if !has_header {
+                        let sz = virtual_size.ok_or_else(|| {
+                            eprintln!(
+                                "snowdrive: bundle: size= required to create a new bundle in {dir}"
+                            );
+                        })?;
+                        FlatBundle::create(
+                            fs,
+                            chunk_size
+                                .unwrap_or(snowdrive_scsi::common::flat_bundle::DEFAULT_CHUNK_SIZE),
+                            sz,
+                            *sector,
+                        )
+                        .map_err(|e| eprintln!("snowdrive: bundle: failed to create {dir}: {e}"))?
+                    } else {
+                        FlatBundle::open(fs, *chunk_size, *virtual_size, Some(*sector)).map_err(
+                            |e| eprintln!("snowdrive: bundle: failed to open {dir}: {e}"),
+                        )?
+                    }
+                };
+                bundles.push(bundle);
+            }
             AnySpec::Disk(DiskSpec::Ram(size)) => {
                 let bytes = usize::try_from(*size).map_err(|_| {
                     eprintln!("snowdrive: RAM size {size} too large for this platform");
@@ -779,12 +842,15 @@ fn build_devices<'a>(
                 slot.resize(bytes, 0);
                 backends.push(BlockBackend::Ram(RamBackend::new(slot)));
             }
-            AnySpec::Disk(DiskSpec::Img { path, .. }) => {
+            AnySpec::Disk(DiskSpec::Img { path, read_only }) => {
                 if !Path::new(path).is_file() {
                     eprintln!("snowdrive: file not found: {path}");
                     return Err(());
                 }
-                let b = FileBackend::open(path, true).map_err(|e| {
+                // Read-only is enforced at BOTH layers: the plane is opened
+                // `rb` (so it works on read-only media; never `r+b`), and the
+                // LUN is locked below (`set_writable(false)`).
+                let b = FileBackend::open(path, !*read_only).map_err(|e| {
                     eprintln!("snowdrive: failed to open file block device {path}: {e}")
                 })?;
                 backends.push(BlockBackend::File(b));
@@ -863,8 +929,32 @@ fn build_devices<'a>(
     drives.clear();
     let mut be_iter = backends.iter_mut();
     let mut live_iter = lives.iter_mut();
+    #[cfg(feature = "bundle")]
+    let mut bundle_iter = bundles.iter_mut();
     for (lun, spec) in any_specs.iter().enumerate() {
         match spec {
+            #[cfg(feature = "bundle")]
+            AnySpec::Disk(DiskSpec::Bundle {
+                dir,
+                sector,
+                read_only,
+                ..
+            }) => {
+                let be = bundle_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowdrive: internal: bundle pool exhausted"))?;
+                let cap = be.capacity();
+                let mut dev = BlockDevice::disk(RwRef::new(be), *sector).map_err(|e| {
+                    eprintln!("snowdrive: bundle: invalid geometry for {dir}: {e}");
+                })?;
+                if *read_only {
+                    // Device layer RO (immediate DATA PROTECT); the plane is
+                    // already read-only, so both layers agree.
+                    dev.set_writable(false);
+                }
+                log::debug!("LUN {lun}: bundle block device ({cap} bytes, sector {sector})");
+                disks.push(dev);
+            }
             AnySpec::Disk(ds) => {
                 let be = be_iter
                     .next()
@@ -1648,6 +1738,18 @@ enum DiskSpec {
     Img { path: String, read_only: bool },
     /// `cd=<path>` → lazy CD-ROM (PDT=0x05, 2048B sectors, read-only).
     Cdrom { path: String },
+    /// `bundle=<dir>[,chunk=…][,size=…][,sector=…][,ro]` → directory-chunked
+    /// disk (`FlatBundle`). `size=` is required to create a new bundle; each
+    /// option overrides the `BUNDLE` header when present. `ro` opens the plane
+    /// read-only (works on read-only media) and locks the LUN.
+    #[cfg(feature = "bundle")]
+    Bundle {
+        dir: String,
+        chunk_size: Option<u64>,
+        virtual_size: Option<u64>,
+        sector: u32,
+        read_only: bool,
+    },
 }
 
 /// A parsed `--cdrom` spec (CD plane).
@@ -1689,6 +1791,8 @@ fn dual_mount_specs<'a>(
             DiskSpec::Img { path, .. } => Some((DeviceKind::Block, path.as_str())),
             DiskSpec::Cdrom { path } => Some((DeviceKind::CdBlock, path.as_str())),
             DiskSpec::Ram(_) => None,
+            #[cfg(feature = "bundle")]
+            DiskSpec::Bundle { dir, .. } => Some((DeviceKind::Block, dir.as_str())),
         })
         .collect();
     out.extend(cdrom_specs.iter().filter_map(|s| match s {
@@ -1734,6 +1838,10 @@ fn check_dual_mount(specs: &[(DeviceKind, &str)]) -> Vec<String> {
 ///
 /// Unknown options are ignored with a warning (C behavior).
 fn parse_disk_spec(spec: &str) -> Result<DiskSpec, String> {
+    #[cfg(feature = "bundle")]
+    if let Some(rest) = spec.strip_prefix("bundle=") {
+        return parse_bundle_spec(rest);
+    }
     if let Some(size) = spec.strip_prefix("ram=") {
         return match parse_size(size) {
             Some(n) => Ok(DiskSpec::Ram(n)),
@@ -1767,6 +1875,61 @@ fn parse_disk_spec(spec: &str) -> Result<DiskSpec, String> {
     }
     Ok(DiskSpec::Img {
         path: path.to_string(),
+        read_only,
+    })
+}
+
+/// Parse the `bundle=` value: `<dir>[,chunk=…][,size=…][,sector=…][,ro]`.
+///
+/// `size=` is required to *create* a new bundle (no `BUNDLE` header) and
+/// always overrides a header value when present; `chunk=` / `sector=` override
+/// the header too. `ro` opens the plane read-only (the LUN is also locked).
+/// Unknown options are rejected (unlike the `img=` default-key path which
+/// warns and ignores).
+#[cfg(feature = "bundle")]
+fn parse_bundle_spec(spec: &str) -> Result<DiskSpec, String> {
+    let (dir, opts) = match spec.split_once(',') {
+        Some((d, o)) => (d, o),
+        None => (spec, ""),
+    };
+    if dir.is_empty() {
+        return Err("empty bundle directory".to_string());
+    }
+    let mut chunk_size = None;
+    let mut virtual_size = None;
+    let mut sector = 512u32;
+    let mut read_only = false;
+    for opt in opts.split(',') {
+        if opt.is_empty() {
+            continue;
+        }
+        if let Some(v) = opt.strip_prefix("chunk=") {
+            if chunk_size.is_some() {
+                return Err("duplicate chunk=".to_string());
+            }
+            chunk_size = Some(parse_byte_size(v)?);
+        } else if let Some(v) = opt.strip_prefix("size=") {
+            if virtual_size.is_some() {
+                return Err("duplicate size=".to_string());
+            }
+            virtual_size = Some(parse_byte_size(v)?);
+        } else if let Some(v) = opt.strip_prefix("sector=") {
+            let s: u32 = v.parse().map_err(|_| format!("invalid sector '{v}'"))?;
+            if s != 512 && s != 2048 {
+                return Err(format!("invalid sector size {s} (512 or 2048)"));
+            }
+            sector = s;
+        } else if opt == "ro" {
+            read_only = true;
+        } else {
+            return Err(format!("unknown bundle option '{opt}'"));
+        }
+    }
+    Ok(DiskSpec::Bundle {
+        dir: dir.to_string(),
+        chunk_size,
+        virtual_size,
+        sector,
         read_only,
     })
 }
@@ -2033,6 +2196,82 @@ mod tests {
             other => panic!("unexpected spec: {other:?}"),
         }
         assert!(parse_disk_spec("cd=").is_err());
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn parse_disk_spec_bundle() {
+        match parse_disk_spec("bundle=tree,chunk=1M,size=4M,sector=2048").unwrap() {
+            DiskSpec::Bundle {
+                dir,
+                chunk_size,
+                virtual_size,
+                sector,
+                read_only,
+            } => {
+                assert_eq!(dir, "tree");
+                assert_eq!(chunk_size, Some(1 << 20));
+                assert_eq!(virtual_size, Some(4 << 20));
+                assert_eq!(sector, 2048);
+                assert!(!read_only);
+            }
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        assert!(matches!(
+            parse_disk_spec("bundle=tree,ro"),
+            Ok(DiskSpec::Bundle {
+                read_only: true,
+                ..
+            })
+        ));
+        match parse_disk_spec("bundle=tree").unwrap() {
+            DiskSpec::Bundle {
+                chunk_size,
+                virtual_size,
+                sector,
+                ..
+            } => {
+                assert_eq!(chunk_size, None);
+                assert_eq!(virtual_size, None);
+                assert_eq!(sector, 512);
+            }
+            other => panic!("unexpected spec: {other:?}"),
+        }
+        assert!(parse_disk_spec("bundle=").is_err());
+        assert!(parse_disk_spec("bundle=tree,bogus=1").is_err());
+        assert!(parse_disk_spec("bundle=tree,size=zz").is_err());
+        assert!(parse_disk_spec("bundle=tree,size=1M,size=2M").is_err());
+        assert!(parse_disk_spec("bundle=tree,sector=1024").is_err());
+        // `bundle=` wins over the `img=` default key.
+        assert!(matches!(
+            parse_disk_spec("bundle=x"),
+            Ok(DiskSpec::Bundle { .. })
+        ));
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn dual_mount_bundle_dir_collected() {
+        let disk = [
+            DiskSpec::Bundle {
+                dir: "d".to_string(),
+                chunk_size: None,
+                virtual_size: None,
+                sector: 512,
+                read_only: false,
+            },
+            DiskSpec::Bundle {
+                dir: "d".to_string(),
+                chunk_size: None,
+                virtual_size: None,
+                sector: 512,
+                read_only: false,
+            },
+        ];
+        let d = dual_mount_specs(&disk, &[]);
+        assert_eq!(d, vec![(DeviceKind::Block, "d"), (DeviceKind::Block, "d")]);
+        // Two bundles over one directory = two writers to the same tree.
+        assert_eq!(check_dual_mount(&d).len(), 1);
     }
 
     #[test]

@@ -6,5 +6,6 @@
 #![deny(unsafe_code)]
 
 pub mod block_storage;
+pub mod flat_bundle;
 pub mod fs_storage;
 pub mod logging;

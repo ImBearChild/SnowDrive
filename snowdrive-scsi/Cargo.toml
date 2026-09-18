@@ -14,6 +14,7 @@ iscsi = ["scsi"]
 cdrom = ["scsi"]
 livefs = ["cdrom"]
 usb = ["scsi"]
+bundle = ["snowdrive-common/bundle"]
 log = ["dep:log", "snowdrive-common/log"]
 defmt = ["dep:defmt", "snowdrive-common/defmt"]
 
