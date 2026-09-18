@@ -46,12 +46,12 @@ use snowdrive_scsi::cdrom::drive::CdromDrive;
 use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
 #[cfg(feature = "udf_void")]
 use snowdrive_scsi::cdrom::udfrw::{OpenMode, UdfRwMedia, UdfRwOptions};
-use snowdrive_scsi::common::block_storage::RwRef;
 use snowdrive_scsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowdrive_scsi::common::fs_storage::OpenOptions;
+use snowdrive_scsi::common::seekable_storage::RwRef;
 use snowdrive_scsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
-use snowdrive_scsi::scsi::backend::{BlockBackend, BlockStorage, FileBackend, RamBackend};
+use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
 use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::ScsiDevice;
 use snowdrive_scsi::scsi::fs_backend::{FsStorage, StdFsBackend};

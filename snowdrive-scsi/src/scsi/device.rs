@@ -1,7 +1,7 @@
 //! Device abstraction: result outcome types, the SCSI device seam, and
 //! the forwarding impls that let transports drive any LUN type.
 
-use crate::scsi::backend::BlockStorageError;
+use crate::scsi::backend::StorageError;
 use crate::scsi::scsi::Sense;
 
 /// Device type reported via INQUIRY (device.h).
@@ -99,7 +99,7 @@ pub struct PendingXfer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XferError {
     /// Backend storage failure.
-    Storage(BlockStorageError),
+    Storage(StorageError),
     /// No prior `do_cmd` (target misuse).
     NoCommand,
     /// Direction mismatch (READ called xfer_in, etc.).
@@ -176,7 +176,7 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// else:
 ///
 /// ```
-/// use snowdrive_scsi::common::block_storage::{FlatData, RwRef};
+/// use snowdrive_scsi::common::seekable_storage::{FlatData, RwRef};
 /// use snowdrive_scsi::scsi::backend::{BlockBackend, RamBackend};
 /// use snowdrive_scsi::scsi::block::BlockDevice;
 /// use snowdrive_scsi::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice, XferOutcome};
@@ -215,7 +215,7 @@ pub fn data_capacity(work_len: usize) -> usize {
 ///     fn device_type(&self) -> DeviceType {
 ///         self.inner.device_type()
 ///     }
-///     fn sync(&mut self) -> Result<(), snowdrive_scsi::common::block_storage::BlockStorageError> {
+///     fn sync(&mut self) -> Result<(), snowdrive_scsi::common::seekable_storage::StorageError> {
 ///         self.inner.sync()
 ///     }
 /// }
@@ -295,8 +295,8 @@ pub trait ScsiDevice {
     ///
     /// Default no-op for compute-only LUNs; storage-backed devices forward
     /// to their backend/media. Errors use the device-level storage error
-    /// domain ([`BlockStorageError`]).
-    fn sync(&mut self) -> Result<(), BlockStorageError> {
+    /// domain ([`StorageError`]).
+    fn sync(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -345,7 +345,7 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
         (**self).complete_param(cdb, data)
     }
 
-    fn sync(&mut self) -> Result<(), BlockStorageError> {
+    fn sync(&mut self) -> Result<(), StorageError> {
         (**self).sync()
     }
 

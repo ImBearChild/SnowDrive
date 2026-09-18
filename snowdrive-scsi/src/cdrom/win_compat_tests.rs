@@ -13,7 +13,7 @@
 use crate::cdrom::drive::CdromDrive;
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
-use crate::common::block_storage::RwRef;
+use crate::common::seekable_storage::RwRef;
 use crate::scsi::backend::{BlockBackend, RamBackend};
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::spc::SpcDevice as _;

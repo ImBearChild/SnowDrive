@@ -18,7 +18,7 @@ use std::ffi::{c_int, CStr, CString};
 use std::net::TcpListener;
 use std::thread;
 
-use snowdrive_scsi::common::block_storage::RamBackend;
+use snowdrive_scsi::common::seekable_storage::RamBackend;
 use snowdrive_scsi::iscsi::pdu::BHS_SIZE;
 use snowdrive_scsi::iscsi::target::{serve_conn, IscsiSession, TargetError};
 use snowdrive_scsi::iscsi::transport::TcpConn;
@@ -462,8 +462,8 @@ fn out_of_range_sense_is_consumed() {
 /// kernel initiator without needing root.
 #[test]
 fn bundle_scattered_writes_over_iscsi() {
-    use snowdrive_scsi::common::block_storage::RwRef;
     use snowdrive_scsi::common::flat_bundle::FlatBundle;
+    use snowdrive_scsi::common::seekable_storage::RwRef;
     use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
 
     let size: u64 = 32 << 20;

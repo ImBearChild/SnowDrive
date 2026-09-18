@@ -34,7 +34,7 @@
 //! and the driver drops both connection and session.
 //!
 //! ```
-//! use snowdrive_scsi::common::block_storage::RamBackend;
+//! use snowdrive_scsi::common::seekable_storage::RamBackend;
 //! use snowdrive_scsi::iscsi::pdu::BHS_SIZE;
 //! use snowdrive_scsi::iscsi::target::{IscsiSession, StepResult};
 //! use snowdrive_scsi::scsi::block::BlockDevice;

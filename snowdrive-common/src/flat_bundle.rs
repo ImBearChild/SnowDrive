@@ -11,7 +11,7 @@
 //!   as `LiveData`'s scanner. The bundle holds **no `dir` field**.
 //! - The bundle implements [`FlatData`] (read) + [`WritableFlatData`]
 //!   (write+sync) directly — it deliberately does **not** implement
-//!   [`BlockStorage`](crate::block_storage::BlockStorage) (no embedded-io cursor semantics; addressing is explicit
+//!   [`SeekableStorage`](crate::seekable_storage::SeekableStorage) (no embedded-io cursor semantics; addressing is explicit
 //!   via the `off` argument).
 //! - **Sparse/hole semantics:** a chunk file only extends to the highest byte
 //!   ever written. The read path treats physical EOF inside a chunk as a hole
@@ -33,8 +33,8 @@ use embedded_io::Error as _;
 use embedded_io::ErrorKind as IoErrorKind;
 use heapless::Vec as HeaplessVec;
 
-use crate::block_storage::{BlockStorageError, FlatData, WritableFlatData};
 use crate::fs_storage::{FsError, FsStorage, OpenOptions};
+use crate::seekable_storage::{FlatData, StorageError, WritableFlatData};
 
 /// Default chunk size when the `BUNDLE` header is absent (100 MiB).
 pub const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024;
@@ -103,7 +103,7 @@ pub struct FlatBundle<F: FsStorage> {
     chunk_size: u64,
     virtual_size: u64,
     sector_size: u32,
-    /// Read-only mode: `write_at` returns [`BlockStorageError::NotWritable`]
+    /// Read-only mode: `write_at` returns [`StorageError::NotWritable`]
     /// and chunk files are opened read-only. The data plane and the device
     /// policy must agree (read-only media cannot even be opened `r+b`).
     read_only: bool,
@@ -130,7 +130,7 @@ impl<F: FsStorage> FlatBundle<F> {
     /// Construct a **read-only** bundle with explicit geometry.
     ///
     /// Same as [`Self::new`], but the plane rejects every write with
-    /// [`BlockStorageError::NotWritable`] and opens chunk files read-only, so
+    /// [`StorageError::NotWritable`] and opens chunk files read-only, so
     /// it works on read-only media (read-only filesystem / mount) where even
     /// `r+b` would fail.
     pub fn new_read_only(
@@ -238,7 +238,7 @@ impl<F: FsStorage> FlatBundle<F> {
     }
 
     /// Like [`Self::open`], but read-only: no header is created and every
-    /// write is rejected with [`BlockStorageError::NotWritable`]. Use for
+    /// write is rejected with [`StorageError::NotWritable`]. Use for
     /// bundles on read-only media.
     #[cfg(feature = "bundle")]
     pub fn open_read_only(
@@ -362,12 +362,12 @@ impl<F: FsStorage> Drop for FlatBundle<F> {
 }
 
 impl<F: FsStorage> FlatData for FlatBundle<F> {
-    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         let end = off
             .checked_add(buf.len() as u64)
-            .ok_or(BlockStorageError::OutOfBounds)?;
+            .ok_or(StorageError::OutOfBounds)?;
         if end > self.virtual_size {
-            return Err(BlockStorageError::OutOfBounds);
+            return Err(StorageError::OutOfBounds);
         }
         let mut pos = off;
         let mut dst = buf;
@@ -387,13 +387,11 @@ impl<F: FsStorage> FlatData for FlatBundle<F> {
                     let file = &mut self.open_chunks[i].file;
                     use embedded_io::{Read, Seek};
                     file.seek(embedded_io::SeekFrom::Start(chunk_off))
-                        .map_err(|e| BlockStorageError::Io(e.kind()))?;
+                        .map_err(|e| StorageError::Io(e.kind()))?;
                     // Zero-fill holes past physical EOF (never an error).
                     let mut sub = chunk_dst;
                     while !sub.is_empty() {
-                        let n = file
-                            .read(sub)
-                            .map_err(|e| BlockStorageError::Io(e.kind()))?;
+                        let n = file.read(sub).map_err(|e| StorageError::Io(e.kind()))?;
                         if n == 0 {
                             sub.fill(0);
                             break;
@@ -402,7 +400,7 @@ impl<F: FsStorage> FlatData for FlatBundle<F> {
                     }
                 }
                 Ok(None) => chunk_dst.fill(0),
-                Err(e) => return Err(BlockStorageError::from(e)),
+                Err(e) => return Err(StorageError::from(e)),
             }
             pos += take as u64;
             dst = rest;
@@ -416,16 +414,16 @@ impl<F: FsStorage> FlatData for FlatBundle<F> {
 }
 
 impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
-    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
         if self.read_only {
             // Data-plane policy rejection; the device maps this to DATA PROTECT.
-            return Err(BlockStorageError::NotWritable);
+            return Err(StorageError::NotWritable);
         }
         let end = off
             .checked_add(buf.len() as u64)
-            .ok_or(BlockStorageError::OutOfBounds)?;
+            .ok_or(StorageError::OutOfBounds)?;
         if end > self.virtual_size {
-            return Err(BlockStorageError::OutOfBounds);
+            return Err(StorageError::OutOfBounds);
         }
         let mut pos = off;
         let mut src = buf;
@@ -442,15 +440,15 @@ impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
             let (chunk_src, rest) = src.split_at(take);
             let i = self
                 .ensure_chunk(pos / self.chunk_size, true)
-                .map_err(BlockStorageError::from)?
-                .ok_or(BlockStorageError::Io(IoErrorKind::Other))?;
+                .map_err(StorageError::from)?
+                .ok_or(StorageError::Io(IoErrorKind::Other))?;
             let file = &mut self.open_chunks[i].file;
             use embedded_io::Seek;
             file.seek(embedded_io::SeekFrom::Start(chunk_off))
-                .map_err(|e| BlockStorageError::Io(e.kind()))?;
+                .map_err(|e| StorageError::Io(e.kind()))?;
             embedded_io::Write::write_all(file, chunk_src).map_err(|e| match e.kind() {
-                IoErrorKind::PermissionDenied => BlockStorageError::NotWritable,
-                kind => BlockStorageError::Io(kind),
+                IoErrorKind::PermissionDenied => StorageError::NotWritable,
+                kind => StorageError::Io(kind),
             })?;
             pos += take as u64;
             src = rest;
@@ -458,16 +456,15 @@ impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), BlockStorageError> {
+    fn sync(&mut self) -> Result<(), StorageError> {
         if self.read_only {
             // Nothing was ever written; nothing to flush.
             return Ok(());
         }
         for slot in self.open_chunks.iter_mut() {
-            embedded_io::Write::flush(&mut slot.file)
-                .map_err(|e| BlockStorageError::Io(e.kind()))?;
+            embedded_io::Write::flush(&mut slot.file).map_err(|e| StorageError::Io(e.kind()))?;
         }
-        self.fs.sync().map_err(BlockStorageError::from)?;
+        self.fs.sync().map_err(StorageError::from)?;
         Ok(())
     }
 }
@@ -813,10 +810,7 @@ mod tests {
         b.read_at(0, &mut out).unwrap();
         assert_eq!(out, vec![0u8; 512]);
         // ... writes are refused with the policy error, not an I/O error ...
-        assert_eq!(
-            b.write_at(0, &[0x11; 512]),
-            Err(BlockStorageError::NotWritable)
-        );
+        assert_eq!(b.write_at(0, &[0x11; 512]), Err(StorageError::NotWritable));
         // ... and neither created a chunk file.
         assert!(store.borrow().is_empty());
     }
@@ -900,22 +894,10 @@ mod tests {
         let (fs, _store) = MockFs::new();
         let mut b = mk(fs, 1 << 20, 4096);
         let mut out = vec![0u8; 16];
-        assert_eq!(
-            b.read_at(4096, &mut out),
-            Err(BlockStorageError::OutOfBounds)
-        );
-        assert_eq!(
-            b.read_at(4090, &mut out),
-            Err(BlockStorageError::OutOfBounds)
-        );
-        assert_eq!(
-            b.write_at(4096, &[0; 1]),
-            Err(BlockStorageError::OutOfBounds)
-        );
-        assert_eq!(
-            b.write_at(4090, &[0; 16]),
-            Err(BlockStorageError::OutOfBounds)
-        );
+        assert_eq!(b.read_at(4096, &mut out), Err(StorageError::OutOfBounds));
+        assert_eq!(b.read_at(4090, &mut out), Err(StorageError::OutOfBounds));
+        assert_eq!(b.write_at(4096, &[0; 1]), Err(StorageError::OutOfBounds));
+        assert_eq!(b.write_at(4090, &[0; 16]), Err(StorageError::OutOfBounds));
         // In-bounds reads still work at the very end of the volume.
         let mut tail = vec![0u8; 8];
         assert_eq!(b.read_at(4096 - 8, &mut tail), Ok(()));

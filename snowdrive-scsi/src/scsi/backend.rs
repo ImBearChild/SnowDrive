@@ -1,11 +1,11 @@
-//! Block storage backends + re-exports from [`crate::common`].
+//! Seekable storage backends + re-exports from [`crate::common`].
 //!
-//! [`BlockStorage`], [`BlockStorageError`], and [`RamBackend`] live in
-//! `crate::common::block_storage`. This module adds the std file backend
+//! [`SeekableStorage`], [`StorageError`], and [`RamBackend`] live in
+//! `crate::common::seekable_storage`. This module adds the std file backend
 //! ([`FileBackend`]) and the aggregating [`BlockBackend`] enum
 //! (`Ram` | `File`).
 
-pub use crate::common::block_storage::{BlockStorage, BlockStorageError, RamBackend};
+pub use crate::common::seekable_storage::{RamBackend, SeekableStorage, StorageError};
 
 /// Map `std::io::ErrorKind` → `embedded_io::ErrorKind`.
 #[cfg(feature = "std")]
@@ -30,10 +30,10 @@ pub(crate) fn map_io_err(kind: std::io::ErrorKind) -> embedded_io::ErrorKind {
     }
 }
 
-/// Aggregating block storage enum.
+/// Aggregating seekable-storage enum.
 ///
 /// Wraps [`RamBackend`] (borrowed memory, no_std) and [`FileBackend`]
-/// (std). Implements [`BlockStorage`] (`Read + Write + Seek + capacity +
+/// (std). Implements [`SeekableStorage`] (`Read + Write + Seek + capacity +
 /// sync`).
 #[derive(Debug)]
 pub enum BlockBackend<'a> {
@@ -84,20 +84,20 @@ impl embedded_io::Seek for BlockBackend<'_> {
     }
 }
 
-impl BlockStorage for BlockBackend<'_> {
+impl SeekableStorage for BlockBackend<'_> {
     fn capacity(&self) -> u64 {
         match self {
-            Self::Ram(b) => BlockStorage::capacity(b),
+            Self::Ram(b) => SeekableStorage::capacity(b),
             #[cfg(feature = "std")]
-            Self::File(b) => BlockStorage::capacity(b),
+            Self::File(b) => SeekableStorage::capacity(b),
         }
     }
 
     fn sync(&mut self) -> Result<(), Self::Error> {
         match self {
-            Self::Ram(b) => BlockStorage::sync(b),
+            Self::Ram(b) => SeekableStorage::sync(b),
             #[cfg(feature = "std")]
-            Self::File(b) => BlockStorage::sync(b),
+            Self::File(b) => SeekableStorage::sync(b),
         }
     }
 }
@@ -105,7 +105,7 @@ impl BlockStorage for BlockBackend<'_> {
 /// File backend (std feature, `std::fs`).
 ///
 /// Wraps `std::fs::File` with cursor-state random access. Implements
-/// [`BlockStorage`] (`Read + Write + Seek + capacity + sync`).
+/// [`SeekableStorage`] (`Read + Write + Seek + capacity + sync`).
 #[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct FileBackend {
@@ -119,7 +119,7 @@ pub struct FileBackend {
 impl FileBackend {
     /// Open `path`. `writable` = open `r+b` (creating if absent); else
     /// open `rb`. Missing file on a read-only open → error.
-    pub fn open(path: &str, writable: bool) -> Result<Self, BlockStorageError> {
+    pub fn open(path: &str, writable: bool) -> Result<Self, StorageError> {
         let mut opts = std::fs::OpenOptions::new();
         if writable {
             opts.read(true).write(true).create(true);
@@ -128,10 +128,10 @@ impl FileBackend {
         }
         let file = opts
             .open(path)
-            .map_err(|e| BlockStorageError::Io(map_io_err(e.kind())))?;
+            .map_err(|e| StorageError::Io(map_io_err(e.kind())))?;
         let size = file
             .metadata()
-            .map_err(|e| BlockStorageError::Io(map_io_err(e.kind())))?
+            .map_err(|e| StorageError::Io(map_io_err(e.kind())))?
             .len();
         Ok(Self {
             file,
@@ -172,7 +172,7 @@ impl embedded_io::Write for FileBackend {
         if !self.writable {
             // Write-policy rejection convention: report
             // PermissionDenied, which the `WritableFlatData` blanket maps
-            // to `BlockStorageError::NotWritable` → SCSI DATA PROTECT
+            // to `StorageError::NotWritable` → SCSI DATA PROTECT
             // instead of a bare I/O error.
             return Err(embedded_io::ErrorKind::PermissionDenied);
         }
@@ -222,7 +222,7 @@ impl embedded_io::Seek for FileBackend {
 }
 
 #[cfg(feature = "std")]
-impl BlockStorage for FileBackend {
+impl SeekableStorage for FileBackend {
     fn capacity(&self) -> u64 {
         self.size
     }
@@ -243,7 +243,7 @@ mod tests {
     fn block_backend_ram_roundtrip() {
         let mut ram = [0u8; 4096];
         let mut b = BlockBackend::Ram(RamBackend::new(&mut ram));
-        assert_eq!(BlockStorage::capacity(&b), 4096);
+        assert_eq!(SeekableStorage::capacity(&b), 4096);
 
         use embedded_io::Write;
         embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::Start(0)).unwrap();
@@ -253,7 +253,7 @@ mod tests {
         use embedded_io::Read;
         b.read_exact(&mut out).unwrap();
         assert_eq!(out, [1, 2, 3, 4]);
-        BlockStorage::sync(&mut b).unwrap();
+        SeekableStorage::sync(&mut b).unwrap();
 
         assert_eq!(ram[0..4], [1, 2, 3, 4]);
     }
@@ -262,7 +262,7 @@ mod tests {
     fn block_backend_ram_out_of_bounds() {
         let mut ram = [0u8; 16];
         let b = BlockBackend::Ram(RamBackend::new(&mut ram));
-        assert_eq!(BlockStorage::capacity(&b), 16);
+        assert_eq!(SeekableStorage::capacity(&b), 16);
     }
 
     #[test]
@@ -276,11 +276,11 @@ mod tests {
         f.flush().unwrap();
 
         let mut b = BlockBackend::File(FileBackend::open(&path.to_string_lossy(), true).unwrap());
-        assert_eq!(BlockStorage::capacity(&b), 1024 * 1024);
+        assert_eq!(SeekableStorage::capacity(&b), 1024 * 1024);
         use embedded_io::Write;
         embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::Start(0)).unwrap();
         b.write_all(&[0xAA; 512]).unwrap();
-        BlockStorage::sync(&mut b).unwrap();
+        SeekableStorage::sync(&mut b).unwrap();
         let mut out = [0u8; 512];
         embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::Start(0)).unwrap();
         use embedded_io::Read;
@@ -301,7 +301,7 @@ mod tests {
         f.flush().unwrap();
 
         let mut b = FileBackend::open(&path.to_string_lossy(), true).unwrap();
-        assert_eq!(BlockStorage::capacity(&b), 1024 * 1024);
+        assert_eq!(SeekableStorage::capacity(&b), 1024 * 1024);
 
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
         use embedded_io::Write;
@@ -312,7 +312,7 @@ mod tests {
         b.read_exact(&mut out).unwrap();
         assert_eq!(out.to_vec(), pattern);
 
-        BlockStorage::sync(&mut b).unwrap();
+        SeekableStorage::sync(&mut b).unwrap();
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[..512], pattern.as_slice());
@@ -327,7 +327,7 @@ mod tests {
         std::fs::write(&path, [0u8; 512]).unwrap();
 
         let mut b = FileBackend::open(&path.to_string_lossy(), false).unwrap();
-        assert_eq!(BlockStorage::capacity(&b), 512);
+        assert_eq!(SeekableStorage::capacity(&b), 512);
         use embedded_io::Write;
         let r = b.write_all(&[1u8; 16]);
         assert!(r.is_err());

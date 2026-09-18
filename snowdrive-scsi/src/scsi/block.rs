@@ -5,8 +5,8 @@
 //! [`crate::scsi::spc`]; READ commands return an empty `immediate` and
 //! the target fetches the data via `xfer_out`.
 
-use crate::common::block_storage::{FlatData, WritableFlatData};
-use crate::scsi::backend::BlockStorageError;
+use crate::common::seekable_storage::{FlatData, WritableFlatData};
+use crate::scsi::backend::StorageError;
 use crate::scsi::device::{
     CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
 };
@@ -37,8 +37,8 @@ pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
 /// never reach the write path.
 #[derive(Debug)]
 pub(crate) struct WriteOps<D> {
-    write_at: fn(&mut D, u64, &[u8]) -> Result<(), BlockStorageError>,
-    sync: fn(&mut D) -> Result<(), BlockStorageError>,
+    write_at: fn(&mut D, u64, &[u8]) -> Result<(), StorageError>,
+    sync: fn(&mut D) -> Result<(), StorageError>,
 }
 
 // Hand-written (NOT derived): `derive(Copy)` would add a `D: Copy` bound,
@@ -204,12 +204,12 @@ impl<D: FlatData> BlockDevice<D> {
         CommandOutcome::CheckCondition
     }
 
-    fn check_bounds(&self, offset: u64, len: usize) -> Result<(), BlockStorageError> {
+    fn check_bounds(&self, offset: u64, len: usize) -> Result<(), StorageError> {
         let end = offset
             .checked_add(len as u64)
-            .ok_or(BlockStorageError::OutOfBounds)?;
+            .ok_or(StorageError::OutOfBounds)?;
         if end > self.backend.capacity() {
-            return Err(BlockStorageError::OutOfBounds);
+            return Err(StorageError::OutOfBounds);
         }
         Ok(())
     }
@@ -219,7 +219,7 @@ impl<D: FlatData> BlockDevice<D> {
     /// `Absent` ⇒ nothing was ever writable, always clean. `Locked` still
     /// flushes: the lock is *policy*, not capability — dirty pages written
     /// during an Open window must stay reachable after `set_writable(false)`.
-    pub(crate) fn sync_backend(&mut self) -> Result<(), BlockStorageError> {
+    pub(crate) fn sync_backend(&mut self) -> Result<(), StorageError> {
         match self.write_path {
             WritePath::Absent => Ok(()),
             WritePath::Locked(ops) | WritePath::Open(ops) => (ops.sync)(&mut self.backend),
@@ -274,7 +274,7 @@ impl<D: FlatData> BlockDevice<D> {
     /// Rejection order: transfer bookkeeping first, then the write path
     /// gate (`WritePath::Open` only; `Absent | Locked` are both DATA
     /// PROTECT), then bounds, then the actual plane write. A backend that
-    /// reports [`BlockStorageError::NotWritable`] at write time (policy
+    /// reports [`StorageError::NotWritable`] at write time (policy
     /// bit bypassed by a direct `disk()` over a read-only plane) is
     /// mapped to DATA PROTECT too.
     pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
@@ -323,7 +323,7 @@ impl<D: FlatData> BlockDevice<D> {
             // Read-only plane masquerading as writable through the
             // blanket impl: the backend's policy rejection
             // surfaces as NotWritable, not a medium fault.
-            if e == BlockStorageError::NotWritable {
+            if e == StorageError::NotWritable {
                 self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
                 return XferOutcome::Error(XferError::WriteProtected);
             }
@@ -758,7 +758,7 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
         CommandOutcome::Status
     }
 
-    fn sync(&mut self) -> Result<(), BlockStorageError> {
+    fn sync(&mut self) -> Result<(), StorageError> {
         self.sync_backend()
     }
 
@@ -774,7 +774,7 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::block_storage::FlatData;
+    use crate::common::seekable_storage::FlatData;
     use crate::scsi::backend::RamBackend;
     use crate::scsi::scsi::op;
 
@@ -1387,7 +1387,7 @@ mod tests {
     }
 
     impl FlatData for CountingBackend {
-        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
             let off = off as usize;
             buf.copy_from_slice(&self.data[off..off + buf.len()]);
             Ok(())
@@ -1399,13 +1399,13 @@ mod tests {
     }
 
     impl WritableFlatData for CountingBackend {
-        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
             let off = off as usize;
             self.data[off..off + buf.len()].copy_from_slice(buf);
             Ok(())
         }
 
-        fn sync(&mut self) -> Result<(), BlockStorageError> {
+        fn sync(&mut self) -> Result<(), StorageError> {
             self.syncs.set(self.syncs.get() + 1);
             Ok(())
         }

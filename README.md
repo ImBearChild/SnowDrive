@@ -10,7 +10,7 @@ Storage (Bulk-Only Transport, FunctionFS gadget on Linux).
 
 | Component | Crate | Description |
 |-----------|-------|-------------|
-| **Common** | `snowdrive-common` | Zero-alloc `BlockStorage` / `FsStorage` seams + unified logging macros |
+| **Common** | `snowdrive-common` | Zero-alloc `SeekableStorage` / `FsStorage` seams + unified logging macros |
 | **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
 | **SCSI core** | `snowdrive-scsi` | SCSI emulation, block/CD-ROM devices, iSCSI target, USB MSC (BOT) core, UDF skeleton |
 | **CLI** | `snowdrive-cli` | `snowdrive serve` runs the iSCSI target or the USB MSC gadget; `snowdrive mkisofs` generates an ISO image from a directory |

@@ -5,7 +5,7 @@
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]
 
-pub mod block_storage;
 pub mod flat_bundle;
 pub mod fs_storage;
 pub mod logging;
+pub mod seekable_storage;

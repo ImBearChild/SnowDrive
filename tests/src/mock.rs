@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod tests {
     use crate::mock_conn::MockConn;
-    use snowdrive_scsi::common::block_storage::RamBackend;
+    use snowdrive_scsi::common::seekable_storage::RamBackend;
     use snowdrive_scsi::iscsi::pdu::{
         flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE,
     };
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn mixed_lun_block_and_cdblock_dispatch() {
-        use snowdrive_scsi::common::block_storage::FlatRef;
+        use snowdrive_scsi::common::seekable_storage::FlatRef;
         use snowdrive_scsi::scsi::backend::{BlockBackend, FileBackend};
 
         let dir = std::env::temp_dir();

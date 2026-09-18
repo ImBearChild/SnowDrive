@@ -43,8 +43,8 @@
 use core::cmp::Ordering;
 use heapless::{String, Vec};
 
-use snowdrive_common::block_storage::{BlockStorageError, FlatData};
 use snowdrive_common::fs_storage::{DirEntry, FsError, FsStorage, OpenOptions};
+use snowdrive_common::seekable_storage::{FlatData, StorageError};
 
 /// Sector size for ISO 9660.
 pub const SECTOR_SIZE: u32 = 2048;
@@ -1423,7 +1423,7 @@ impl<F: FsStorage> LiveData<F> {
 // ── FlatData: slot-usable read-only plane ──────────────────
 
 impl<F: FsStorage> FlatData for LiveData<F> {
-    fn read_at(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    fn read_at(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         use embedded_io::{Read, Seek};
         let mut off = byte_offset;
         let mut dst = buf;
@@ -1435,11 +1435,11 @@ impl<F: FsStorage> FlatData for LiveData<F> {
             self.seek(embedded_io::SeekFrom::Start(
                 lba as u64 * u64::from(crate::SECTOR_SIZE),
             ))
-            .map_err(|_| BlockStorageError::OutOfBounds)?;
+            .map_err(|_| StorageError::OutOfBounds)?;
             // read_exact, not read: a short read at the EOF tail would
             // otherwise silently zero-fill the rest of the sector and
             // corrupt the generated image.
-            Read::read_exact(self, &mut tmp).map_err(|_| BlockStorageError::OutOfBounds)?;
+            Read::read_exact(self, &mut tmp).map_err(|_| StorageError::OutOfBounds)?;
             dst[..n].copy_from_slice(&tmp[within..within + n]);
             off += n as u64;
             dst = &mut dst[n..];

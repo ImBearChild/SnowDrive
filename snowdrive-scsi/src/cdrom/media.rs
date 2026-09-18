@@ -15,8 +15,8 @@
 use crate::cdrom::common::{CurrentProfile, MediaState};
 #[cfg(feature = "udf_void")]
 use crate::cdrom::udfrw::UdfRwMedia;
-use crate::common::block_storage::{FlatData, FlatRef, RwRef};
-use crate::scsi::backend::BlockStorageError;
+use crate::common::seekable_storage::{FlatData, FlatRef, RwRef};
+use crate::scsi::backend::StorageError;
 
 // ── Geometry constants ─────────────────────────────────
 
@@ -174,7 +174,7 @@ pub struct SessionInfo {
 /// - `WriteProtected` → 07h/00h (DATA PROTECT) / 27h/00h (WRITE PROTECTED)
 /// - `OutOfBounds` → 21h/00h (LOGICAL BLOCK ADDRESS OUT OF RANGE)
 /// - `Io(kind)` → sense passthrough (`kind` preserved from the plane's
-///   [`BlockStorageError`], never collapsed to `Other`)
+///   [`StorageError`], never collapsed to `Other`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaError {
     /// Invalid field in CDB (NWA mismatch, reservation size < 300, etc.).
@@ -200,12 +200,12 @@ impl core::fmt::Display for MediaError {
 
 impl core::error::Error for MediaError {}
 
-impl From<BlockStorageError> for MediaError {
-    fn from(e: BlockStorageError) -> Self {
+impl From<StorageError> for MediaError {
+    fn from(e: StorageError) -> Self {
         match e {
-            BlockStorageError::OutOfBounds => Self::OutOfBounds,
-            BlockStorageError::NotWritable => Self::WriteProtected,
-            BlockStorageError::Io(kind) => Self::Io(kind),
+            StorageError::OutOfBounds => Self::OutOfBounds,
+            StorageError::NotWritable => Self::WriteProtected,
+            StorageError::Io(kind) => Self::Io(kind),
         }
     }
 }
@@ -360,7 +360,7 @@ impl<'a> CdMedia<'a> {
     // ── Data plane ─────────────────────────────────────
 
     /// Read data from the medium (target data path).
-    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         match self {
             Self::Ro(m) => m.read_data(offset, buf),
             #[cfg(feature = "udf_void")]
@@ -437,7 +437,7 @@ impl<'a> CdMedia<'a> {
 
 // ── FlatMedia ───────────────────────────────────────────────
 
-// `FlatData`/`WritableFlatData` live in `snowdrive-common::block_storage`
+// `FlatData`/`WritableFlatData` live in `snowdrive-common::seekable_storage`
 // (the capability ladder); block backends are lifted by blanket impl and
 // generated sources implement `FlatData` directly.
 
@@ -523,7 +523,7 @@ impl<D: FlatData> FlatMedia<D> {
         &mut self.data
     }
 
-    pub fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    pub fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         self.data.read_at(byte_offset, buf)
     }
 

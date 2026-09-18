@@ -8,10 +8,10 @@ the `snowdrive` binary lives in `snowdrive-cli`.
 
 | Component | Crate | Description |
 |-----------|-------|-------------|
-| **Common** | `snowdrive-common` | Zero-alloc `BlockStorage` / `FsStorage` seams + unified logging macros (always available, no feature gate) |
+| **Common** | `snowdrive-common` | Zero-alloc `SeekableStorage` / `FsStorage` seams + unified logging macros (always available, no feature gate) |
 | **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
 | **SCSI core** | `snowdrive-scsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, UDF volume skeleton |
-| — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `BlockStorage`/`FsStorage` + logging macros |
+| — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `SeekableStorage`/`FsStorage` + logging macros |
 | — SCSI | `snowdrive-scsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
 | — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `UdfRwMedia`), full MMC |
 | — iSCSI | `snowdrive-scsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
@@ -26,7 +26,7 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 ├── Cargo.toml                      # workspace: members listed below
 ├── snowdrive-common/               # crate: storage seams + logging macros
 │   ├── Cargo.toml
-│   └── src/{lib.rs, block_storage.rs, fs_storage.rs, logging.rs}
+│   └── src/{lib.rs, seekable_storage.rs, fs_storage.rs, logging.rs}
 ├── snowdrive-disc/                 # crate: ISO9660/Joliet live-generation algorithms
 │   ├── Cargo.toml
 │   └── src/{lib.rs, mod.rs, live.rs}
@@ -299,7 +299,7 @@ breaking; we still keep changes reviewable:
   `BotTargetError` — deliberately carry **no** `#[non_exhaustive]`: driver
   code matches them totally, and a new variant must be a conscious,
   compiler-enforced migration for every downstream driver.
-- Error domains (`MediaError`, `BlockStorageError`, …) may gain variants in
+- Error domains (`MediaError`, `StorageError`, …) may gain variants in
   a minor release; consider `#[non_exhaustive]` when stabilizing toward 1.0.
 - Trait additions (new required or default methods on `ScsiDevice`,
   `SpcDevice`, `FlatData`, …) are breaking while `0.x`; batch them and

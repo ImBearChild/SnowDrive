@@ -21,7 +21,7 @@
 //! writes it later. This layer never parses UDF contents.
 
 use crate::cdrom::common::SECTOR_SIZE;
-use crate::common::block_storage::{BlockStorageError, FlatData, WritableFlatData};
+use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
 use crate::udf_void::{
     compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError,
 };
@@ -164,17 +164,17 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
     }
 
     /// Read from the byte plane (target data path).
-    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         self.backend.read_at(offset, buf)
     }
 
     /// Write to the byte plane (target data path).
-    pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+    pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
         self.backend.write_at(offset, buf)
     }
 
     /// Flush the byte plane.
-    pub fn sync(&mut self) -> Result<(), BlockStorageError> {
+    pub fn sync(&mut self) -> Result<(), StorageError> {
         self.backend.sync()
     }
 
@@ -183,7 +183,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
     /// Clears all logical blocks (zero-fill). Does **not** create or rebuild
     /// any file system — UDF volume creation is the host OS's responsibility
     /// and is triggered only by `mkfs=true` at CLI device open time.
-    pub fn format_unit(&mut self) -> Result<(), BlockStorageError> {
+    pub fn format_unit(&mut self) -> Result<(), StorageError> {
         self.clear()
     }
 
@@ -191,7 +191,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
     /// Formatting is completed logically by the command handler; the host
     /// writes the filesystem structures afterwards.
     #[allow(dead_code)] // called by FORMAT UNIT in CdromDrive
-    fn clear(&mut self) -> Result<(), BlockStorageError> {
+    fn clear(&mut self) -> Result<(), StorageError> {
         let zeroes = [0u8; 8192];
         let mut offset = 0u64;
         while offset < self.capacity() {
@@ -229,15 +229,15 @@ fn write_sector<D: WritableFlatData>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdfRwError {
     /// Backend storage failure.
-    Block(BlockStorageError),
+    Block(StorageError),
     /// UDF void layout failure (capacity too small / scratch too small).
     Layout(UdfError),
     /// Backend capacity exceeds the UDF void address space.
     CapacityTooLarge,
 }
 
-impl From<BlockStorageError> for UdfRwError {
-    fn from(e: BlockStorageError) -> Self {
+impl From<StorageError> for UdfRwError {
+    fn from(e: StorageError) -> Self {
         Self::Block(e)
     }
 }

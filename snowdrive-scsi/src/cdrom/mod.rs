@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use snowdrive_scsi::cdrom::{CdMedia, CdromDrive};
-//! use snowdrive_scsi::common::block_storage::RamBackend;
+//! use snowdrive_scsi::common::seekable_storage::RamBackend;
 //! use snowdrive_scsi::scsi::device::{CommandOutcome, ScsiDevice};
 //! use snowdrive_scsi::MIN_DATA_LEN;
 //!
@@ -63,6 +63,6 @@ pub use common::{
 };
 pub use drive::CdromDrive;
 pub use media::{CdLiveFsError, CdMedia, FlatMedia, LiveData, LiveDataBuilder, MediaError, Tray};
-pub use snowdrive_common::block_storage::FlatData;
+pub use snowdrive_common::seekable_storage::FlatData;
 #[cfg(feature = "udf_void")]
 pub use udfrw::{UdfRwError, UdfRwMedia};

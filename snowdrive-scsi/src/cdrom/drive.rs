@@ -87,13 +87,13 @@ impl<'a> CdromDrive<'a> {
     /// Disc-pool usage (runtime media swap across ANY backend kinds):
     ///
     /// ```text
-    /// use snowdrive_scsi::common::block_storage::{FlatRef, RwRef};
+    /// use snowdrive_scsi::common::seekable_storage::{FlatRef, RwRef};
     /// use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
     /// use snowdrive_scsi::cdrom::drive::CdromDrive;
     /// # fn demo(
     /// #     img_file: &mut [u8],
     /// #     my_fs: impl snowdrive_common::fs_storage::FsStorage,
-    /// #     sd_card: impl snowdrive_common::block_storage::WritableFlatData,
+    /// #     sd_card: impl snowdrive_common::seekable_storage::WritableFlatData,
     /// # ) -> Result<(), Box<dyn core::error::Error>> {
     /// let mut drive = CdromDrive::new();
     ///
@@ -314,14 +314,14 @@ impl<'a> CdromDrive<'a> {
         let res = if let Some(m) = self.loaded_mut() {
             m.read_data(actual, buf)
         } else {
-            Err(crate::scsi::backend::BlockStorageError::OutOfBounds)
+            Err(crate::scsi::backend::StorageError::OutOfBounds)
         };
         if let Err(e) = res {
             match e {
-                crate::scsi::backend::BlockStorageError::OutOfBounds => {
+                crate::scsi::backend::StorageError::OutOfBounds => {
                     self.set_sense(SenseKey::MediumError, 0x11, 0);
                 }
-                crate::scsi::backend::BlockStorageError::Io(_) => {
+                crate::scsi::backend::StorageError::Io(_) => {
                     self.set_sense(SenseKey::MediumError, 0x11, 0);
                 }
                 _ => {
@@ -376,22 +376,22 @@ impl<'a> CdromDrive<'a> {
                 crate::cdrom::media::MediaError::OutOfBounds => {
                     self.set_sense(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0);
                     XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::BlockStorageError::OutOfBounds,
+                        crate::scsi::backend::StorageError::OutOfBounds,
                     ))
                 }
                 crate::cdrom::media::MediaError::IllegalField => {
                     self.set_sense(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
                     // Payload is transport-diagnostic only; the sense above
                     // carries INVALID_FIELD (B9).
-                    XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::BlockStorageError::Io(embedded_io::ErrorKind::Other),
-                    ))
+                    XferOutcome::Error(XferError::Storage(crate::scsi::backend::StorageError::Io(
+                        embedded_io::ErrorKind::Other,
+                    )))
                 }
                 crate::cdrom::media::MediaError::Io(kind) => {
                     self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-                    XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::BlockStorageError::Io(kind),
-                    ))
+                    XferOutcome::Error(XferError::Storage(crate::scsi::backend::StorageError::Io(
+                        kind,
+                    )))
                 }
             },
         }
@@ -1484,14 +1484,14 @@ impl SpcDevice for CdromDrive<'_> {
 // ── ScsiDevice impl ─────────────────────────────────────────────────
 
 impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
-    fn sync(&mut self) -> Result<(), crate::scsi::backend::BlockStorageError> {
+    fn sync(&mut self) -> Result<(), crate::scsi::backend::StorageError> {
         // MediaError → device-level storage error domain (`Io` keeps the
         // plane's error kind — no `Other` fabrication).
-        use crate::scsi::backend::BlockStorageError;
+        use crate::scsi::backend::StorageError;
         self.sync_media().map_err(|e| match e {
-            MediaError::OutOfBounds => BlockStorageError::OutOfBounds,
-            MediaError::WriteProtected | MediaError::IllegalField => BlockStorageError::NotWritable,
-            MediaError::Io(kind) => BlockStorageError::Io(kind),
+            MediaError::OutOfBounds => StorageError::OutOfBounds,
+            MediaError::WriteProtected | MediaError::IllegalField => StorageError::NotWritable,
+            MediaError::Io(kind) => StorageError::Io(kind),
         })
     }
 
@@ -1665,9 +1665,9 @@ pub(crate) fn hex_of<'o>(out: &'o mut [u8], data: &[u8]) -> &'o [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::block_storage::RwRef;
+    use crate::common::seekable_storage::RwRef;
     #[cfg(feature = "udf_void")]
-    use crate::common::block_storage::{BlockStorageError, FlatData, WritableFlatData};
+    use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
     use crate::scsi::backend::{BlockBackend, RamBackend};
     use crate::scsi::device::{ScsiDevice, XferOutcome};
 
@@ -2206,7 +2206,7 @@ mod tests {
 
     #[cfg(feature = "udf_void")]
     impl FlatData for CountingSyncBackend {
-        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), BlockStorageError> {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
             let off = off as usize;
             buf.copy_from_slice(&self.data[off..off + buf.len()]);
             Ok(())
@@ -2219,13 +2219,13 @@ mod tests {
 
     #[cfg(feature = "udf_void")]
     impl WritableFlatData for CountingSyncBackend {
-        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), BlockStorageError> {
+        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
             let off = off as usize;
             self.data[off..off + buf.len()].copy_from_slice(buf);
             Ok(())
         }
 
-        fn sync(&mut self) -> Result<(), BlockStorageError> {
+        fn sync(&mut self) -> Result<(), StorageError> {
             self.syncs.set(self.syncs.get() + 1);
             Ok(())
         }

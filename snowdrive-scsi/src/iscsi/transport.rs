@@ -126,7 +126,7 @@ pub fn serve<D: ScsiDevice>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::block_storage::RamBackend;
+    use crate::common::seekable_storage::RamBackend;
     use crate::iscsi::conn::{read_exact, write_all};
     use crate::iscsi::pdu::{flag, op, stage};
     use crate::scsi::block::BlockDevice;

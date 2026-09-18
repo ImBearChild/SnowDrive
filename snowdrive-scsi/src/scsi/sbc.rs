@@ -5,7 +5,7 @@
 //! wraps the SPC fall-through as [`SbcCommand::Spc`] so a device's
 //! `do_cmd` is a single `parse_sbc` + two-arm dispatch.
 
-use crate::common::block_storage::FlatData;
+use crate::common::seekable_storage::FlatData;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{

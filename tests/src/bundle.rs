@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use snowdrive_scsi::common::block_storage::{BlockStorageError, FlatData, RwRef, WritableFlatData};
 use snowdrive_scsi::common::flat_bundle::FlatBundle;
+use snowdrive_scsi::common::seekable_storage::{FlatData, RwRef, StorageError, WritableFlatData};
 use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
 use snowdrive_scsi::scsi::fs_backend::StdFsBackend;
@@ -289,10 +289,7 @@ fn bundle_read_only_plane() {
     let mut out = vec![0u8; 4096];
     b.read_at(0, &mut out).unwrap();
     assert_eq!(out, vec![0x5A; 4096]);
-    assert_eq!(
-        b.write_at(0, &[0x11; 4096]),
-        Err(BlockStorageError::NotWritable)
-    );
+    assert_eq!(b.write_at(0, &[0x11; 4096]), Err(StorageError::NotWritable));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

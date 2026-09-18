@@ -17,7 +17,7 @@
 //! A complete no-data transaction (TEST UNIT READY) is two steps:
 //!
 //! ```
-//! use snowdrive_scsi::common::block_storage::RamBackend;
+//! use snowdrive_scsi::common::seekable_storage::RamBackend;
 //! use snowdrive_scsi::scsi::block::BlockDevice;
 //! use snowdrive_scsi::usb::{
 //!     BotSession, BotStepResult, SessionEvent, SessionStep, CBW_LEN,

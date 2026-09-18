@@ -11,9 +11,9 @@
 //!   USB BOT core (`usb`), UDF skeleton ([`udf_void`]).
 //! - [`snowdrive_common`] — the storage seams everything is written
 //!   against: the capability ladder
-//!   [`common::block_storage::FlatData`] →
-//!   [`common::block_storage::WritableFlatData`] →
-//!   [`common::block_storage::BlockStorage`], the FS seam
+//!   [`common::seekable_storage::FlatData`] →
+//!   [`common::seekable_storage::WritableFlatData`] →
+//!   [`common::seekable_storage::SeekableStorage`], the FS seam
 //!   [`common::fs_storage::FsStorage`], and the unified logging macros.
 //! - [`snowdrive_disc`] — ISO9660 + Joliet live generation
 //!   ([`LiveData`](snowdrive_disc::live::LiveData),
