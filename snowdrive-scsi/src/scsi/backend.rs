@@ -106,6 +106,16 @@ impl SeekableStorage for BlockBackend<'_> {
 ///
 /// Wraps `std::fs::File` with cursor-state random access. Implements
 /// [`SeekableStorage`] (`Read + Write + Seek + capacity + sync`).
+///
+/// Portable: plain `seek` + `read` / `write` on the shared handle (no
+/// `FileExt`, so `std` builds on non-Unix too). A writable backend
+/// grows the file on write — [`SeekableStorage::capacity`] tracks the
+/// current size — so opening a *new* file then writing just works.
+/// `seek` clamps to the current size, therefore growth is always a
+/// contiguous append (no sparse holes). Block-device callers that need
+/// fixed geometry must still pre-size (e.g. `set_len`); the
+/// `FlatData` blanket — and hence every SCSI device — bounds I/O to
+/// the capacity observed per call.
 #[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct FileBackend {
@@ -119,6 +129,9 @@ pub struct FileBackend {
 impl FileBackend {
     /// Open `path`. `writable` = open `r+b` (creating if absent); else
     /// open `rb`. Missing file on a read-only open → error.
+    ///
+    /// A newly created file has capacity 0; writing through a writable
+    /// handle extends it (see the type-level docs).
     pub fn open(path: &str, writable: bool) -> Result<Self, StorageError> {
         let mut opts = std::fs::OpenOptions::new();
         if writable {
@@ -150,16 +163,18 @@ impl embedded_io::ErrorType for FileBackend {
 #[cfg(feature = "std")]
 impl embedded_io::Read for FileBackend {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        use std::os::unix::fs::FileExt;
-        let start = self.pos as usize;
-        let available = (self.size as usize).saturating_sub(start);
-        let to_read = buf.len().min(available);
+        use std::io::{Read as _, Seek as _};
+        let available = self.size.saturating_sub(self.pos);
+        let to_read = (buf.len() as u64).min(available) as usize;
         if to_read == 0 {
             return Ok(0);
         }
+        self.file
+            .seek(std::io::SeekFrom::Start(self.pos))
+            .map_err(|e| map_io_err(e.kind()))?;
         let n = self
             .file
-            .read_at(&mut buf[..to_read], self.pos)
+            .read(&mut buf[..to_read])
             .map_err(|e| map_io_err(e.kind()))?;
         self.pos += n as u64;
         Ok(n)
@@ -176,18 +191,19 @@ impl embedded_io::Write for FileBackend {
             // instead of a bare I/O error.
             return Err(embedded_io::ErrorKind::PermissionDenied);
         }
-        use std::os::unix::fs::FileExt;
-        let start = self.pos as usize;
-        let available = (self.size as usize).saturating_sub(start);
-        let to_write = buf.len().min(available);
-        if to_write == 0 {
+        use std::io::{Seek as _, Write as _};
+        if buf.is_empty() {
             return Ok(0);
         }
-        let n = self
-            .file
-            .write_at(&buf[..to_write], self.pos)
+        // Growable: write the whole buffer, extending the file (and
+        // `size`) past the previous end. `seek` clamps `pos <= size`,
+        // so this can only append contiguously — never punch holes.
+        self.file
+            .seek(std::io::SeekFrom::Start(self.pos))
             .map_err(|e| map_io_err(e.kind()))?;
+        let n = self.file.write(buf).map_err(|e| map_io_err(e.kind()))?;
         self.pos += n as u64;
+        self.size = self.size.max(self.pos);
         Ok(n)
     }
 
@@ -316,6 +332,51 @@ mod tests {
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[..512], pattern.as_slice());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn file_backend_new_file_grows_on_write() {
+        // B3: a freshly created (0-byte) writable file must accept
+        // writes and grow, instead of reporting Ok(0) forever.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("snowscsi_fb_new_{}.img", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut b = FileBackend::open(&path.to_string_lossy(), true).unwrap();
+        assert_eq!(SeekableStorage::capacity(&b), 0);
+
+        let first = [0x5Au8; 512];
+        let second = [0xA5u8; 512];
+        use embedded_io::Write;
+        b.write_all(&first).unwrap();
+        assert_eq!(SeekableStorage::capacity(&b), 512);
+        // `SeekFrom::End` tracks the grown size; the second write appends.
+        embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::End(0)).unwrap();
+        b.write_all(&second).unwrap();
+        assert_eq!(SeekableStorage::capacity(&b), 1024);
+
+        let mut out = [0u8; 1024];
+        embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::Start(0)).unwrap();
+        use embedded_io::Read;
+        b.read_exact(&mut out).unwrap();
+        assert_eq!(&out[..512], &first);
+        assert_eq!(&out[512..], &second);
+
+        // The offset-addressed plane still enforces per-call geometry:
+        // writes past the observed capacity are OutOfBounds, not growth
+        // (SCSI devices keep fixed geometry; pre-size with `set_len`).
+        use crate::common::seekable_storage::WritableFlatData;
+        assert_eq!(
+            b.write_at(2048, &[0u8; 512]),
+            Err(StorageError::OutOfBounds)
+        );
+
+        SeekableStorage::sync(&mut b).unwrap();
+        drop(b);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024);
+        assert_eq!(&std::fs::read(&path).unwrap()[..512], &first);
 
         std::fs::remove_file(&path).unwrap();
     }
