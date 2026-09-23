@@ -9,7 +9,7 @@
 //! - [`CdMedia::Ro`]([`media::CdMedia::Ro`]) — read-only disc over any
 //!   [`FlatData`] source (image, RAM, or live-generated ISO9660 via
 //!   [`LiveData`]);
-//! - [`CdMedia::Rw`]([`media::CdMedia::Rw`]) (feature `udf_void`) — a
+//! - [`CdMedia::Rw`]([`media::CdMedia::Rw`]) (feature `udfrw`) — a
 //!   random-writable DVD-RAM: [`UdfRwMedia`] over any writable plane.
 //!
 //! Discs are loaded/ejected at runtime through the drive's media slot;
@@ -48,12 +48,12 @@
 pub mod common;
 pub mod drive;
 pub mod media;
-#[cfg(feature = "udf_void")]
+#[cfg(feature = "udfrw")]
 pub mod udfrw;
 
-// Windows-compatibility regression tests require UDF-RW media (udf_void)
+// Windows-compatibility regression tests require UDF-RW media (udfrw)
 // to exercise the DVD-RAM profile that the captured traffic targets.
-#[cfg(all(test, feature = "usb", feature = "udf_void"))]
+#[cfg(all(test, feature = "usb", feature = "udfrw"))]
 mod win_compat_tests;
 
 pub use common::{
@@ -64,5 +64,5 @@ pub use common::{
 pub use drive::CdromDrive;
 pub use media::{CdLiveFsError, CdMedia, FlatMedia, LiveData, LiveDataBuilder, MediaError, Tray};
 pub use snowdrive_common::seekable_storage::FlatData;
-#[cfg(feature = "udf_void")]
+#[cfg(feature = "udfrw")]
 pub use udfrw::{UdfRwError, UdfRwMedia};

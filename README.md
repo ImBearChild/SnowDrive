@@ -84,7 +84,7 @@ login/logout itself.)
 - [x] `snowdrive-cli serve`: `--block` / `--cdrom` device planes + multi-LUN + graceful shutdown
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
-- [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udf_void`): random-writable UDF-backed medium
+- [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udfrw`): random-writable UDF-backed medium
 - [ ] Phase 3: Writable optical drive (CD-R) + disc bundle export
 - [ ] Phase 4: Rewritable optical drive (CD-RW)
 - [ ] Phase 5: Advanced features (audio tracks, multi-session, READ CD)
@@ -97,7 +97,7 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 ├── snowdrive-common/               # storage seams + logging macros
 ├── snowdrive-disc/                 # ISO9660/Joliet live-generation algorithms
 ├── snowdrive-scsi/                 # SCSI core + iSCSI + USB MSC + CD-ROM + UDF
-│   └── src/{scsi, cdrom, iscsi, usb, udf_void.rs}
+│   └── src/{scsi, cdrom, iscsi, usb, udfrw.rs}
 ├── snowdrive-cli/                  # `snowdrive` binary (src/main.rs)
 ├── tests/                          # snowdrive-tests (integration tests)
 ├── tools/                          # NOT a cargo member: ext-test/ + libvirt-usb-helper
@@ -124,7 +124,7 @@ snowdrive-scsi = { version = "0.1", default-features = false, features = ["usb"]
 snowdrive-scsi = { version = "0.1", default-features = false, features = ["std", "cdrom", "livefs"] }
 
 # Full feature set (note: `snowdrive-scsi` default is just `std`; opt in explicitly)
-snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "iso9660", "udf_void", "cdrom", "livefs", "usb"] }
+snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "iso9660", "udfrw", "cdrom", "livefs", "usb"] }
 ```
 
 ## Legacy C Code

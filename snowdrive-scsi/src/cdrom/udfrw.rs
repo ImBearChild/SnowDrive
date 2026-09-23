@@ -1,11 +1,11 @@
 //! UdfRw media layer (UDF RW).
 //!
 //! A random-writable DVD-RAM over any [`WritableFlatData`] byte plane,
-//! built on the pure volume skeleton of [`crate::udf_void`].
+//! built on the pure volume skeleton of [`crate::udfrw`].
 //!
 //! - **Materialize** an empty UDF 2.01 volume into the backend (only when
 //!   `mkfs=true` is specified at CLI open time) by streaming the structured
-//!   sectors from `udf_void::gen_sector` and patching the multi-sector SBD
+//!   sectors from `udfrw::gen_sector` and patching the multi-sector SBD
 //!   CRC.
 //! - **Detect** an existing UDF volume (valid AVDP at sector 256) via
 //!   [`UdfRwMedia::has_udf`](crate::cdrom::udfrw::UdfRwMedia::has_udf)
@@ -22,9 +22,7 @@
 
 use crate::cdrom::common::SECTOR_SIZE;
 use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
-use crate::udf_void::{
-    compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError,
-};
+use crate::udfrw::{compute_layout, gen_sector, is_avdp, patch_sbd_crc, sbd_crc, Layout, UdfError};
 
 /// A random-writable DVD-RAM (UDF 2.01 plain build) over a byte plane.
 #[derive(Debug)]
@@ -61,7 +59,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
     /// to materialize a new UDF volume.
     pub fn has_udf(backend: &mut D) -> bool {
         let mut sector = [0u8; SECTOR_SIZE as usize];
-        let off = u64::from(crate::udf_void::AVDP_LBA) * u64::from(SECTOR_SIZE);
+        let off = u64::from(crate::udfrw::AVDP_LBA) * u64::from(SECTOR_SIZE);
         backend.read_at(off, &mut sector).is_ok() && is_avdp(&sector)
     }
 
@@ -105,7 +103,7 @@ impl<D: WritableFlatData> UdfRwMedia<D> {
         let mut sector = [0u8; SECTOR_SIZE as usize];
 
         // VRS (3 sectors), main anchor.
-        for lba in [16u32, 17, 18, crate::udf_void::AVDP_LBA] {
+        for lba in [16u32, 17, 18, crate::udfrw::AVDP_LBA] {
             write_sector(&mut backend, &layout, lba, &mut sector)?;
         }
         // Main VDS (PVD, IUVD, PD, LVD, USD, TD).

@@ -11,7 +11,7 @@
 //! pending-sense gate in [`CdromDrive::do_cmd`].
 
 use crate::cdrom::drive::CdromDrive;
-#[cfg(feature = "udf_void")]
+#[cfg(feature = "udfrw")]
 use crate::cdrom::udfrw::UdfRwMedia;
 use crate::common::seekable_storage::RwRef;
 use crate::scsi::backend::{BlockBackend, RamBackend};
@@ -36,12 +36,12 @@ fn rfc_formattable_descriptor_tdp_is_block_length() {
     let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udf_void")]
+    #[cfg(feature = "udfrw")]
     {
         let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udf_void"))]
+    #[cfg(not(feature = "udfrw"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -73,12 +73,12 @@ fn win_single_cmds_diag() {
     let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udf_void")]
+    #[cfg(feature = "udfrw")]
     {
         let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udf_void"))]
+    #[cfg(not(feature = "udfrw"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     // consume initial UA
@@ -161,12 +161,12 @@ fn win_rejected_probe_does_not_poison_next_command() {
     let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udf_void")]
+    #[cfg(feature = "udfrw")]
     {
         let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udf_void"))]
+    #[cfg(not(feature = "udfrw"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -226,12 +226,12 @@ fn win_ua_still_reports_once() {
     let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udf_void")]
+    #[cfg(feature = "udfrw")]
     {
         let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udf_void"))]
+    #[cfg(not(feature = "udfrw"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -374,12 +374,12 @@ mod enumeration_sequence {
         let mut scratch = [0u8; 256];
         let mut dev = CdromDrive::new();
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-        #[cfg(feature = "udf_void")]
+        #[cfg(feature = "udfrw")]
         {
             let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
             dev.load_quiet(CdMedia::Rw(media));
         }
-        #[cfg(not(feature = "udf_void"))]
+        #[cfg(not(feature = "udfrw"))]
         dev.load_quiet(CdMedia::ro(&mut bb));
 
         let mut session = BotSession::new();

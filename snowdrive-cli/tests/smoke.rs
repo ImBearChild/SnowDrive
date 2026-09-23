@@ -680,7 +680,7 @@ fn serve_starts_with_read_only_bundle() {
 
 /// `serve --cdrom udfrw=ram:<size>` materializes an in-memory UDF 2.01
 /// DVD+RW, announces 'listening' and exits 0 after SIGINT.
-#[cfg(all(unix, feature = "udf_void"))]
+#[cfg(all(unix, feature = "udfrw"))]
 #[test]
 fn serve_starts_with_udfrw_ram() {
     use std::io::BufRead;
@@ -740,7 +740,7 @@ fn serve_starts_with_udfrw_ram() {
 
 /// `udfrw=<file>` on a blank existing file opens as-is (no UDF detection);
 /// `mkfs=true` materializes a fresh UDF volume.
-#[cfg(all(unix, feature = "udf_void"))]
+#[cfg(all(unix, feature = "udfrw"))]
 #[test]
 fn serve_udfrw_file_opens_as_is() {
     use std::io::BufRead;
@@ -864,7 +864,7 @@ fn serve_udfrw_file_opens_as_is() {
 
 /// `udfrw=<file>,mkfs=true` on an already-formatted volume is accepted
 /// (forced rewrite — the UDF volume is re-materialized).
-#[cfg(all(unix, feature = "udf_void"))]
+#[cfg(all(unix, feature = "udfrw"))]
 #[test]
 fn serve_udfrw_mkfs_forced_rewrite() {
     use std::io::BufRead;

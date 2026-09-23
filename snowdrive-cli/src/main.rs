@@ -44,7 +44,7 @@ use std::time::Duration;
 use clap::{Args, Parser};
 use snowdrive_scsi::cdrom::drive::CdromDrive;
 use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
-#[cfg(feature = "udf_void")]
+#[cfg(feature = "udfrw")]
 use snowdrive_scsi::cdrom::udfrw::{OpenMode, UdfRwMedia, UdfRwOptions};
 use snowdrive_scsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
@@ -726,7 +726,7 @@ fn build_devices<'a>(
     for spec in specs {
         let size = match &spec.backing {
             Backing::Ram { size } => Some(*size),
-            #[cfg(feature = "udf_void")]
+            #[cfg(feature = "udfrw")]
             Backing::UdfRw { path: None } => spec.plane.size,
             _ => None,
         };
@@ -843,7 +843,7 @@ fn build_devices<'a>(
                 })?;
                 lives.push(live);
             }
-            #[cfg(feature = "udf_void")]
+            #[cfg(feature = "udfrw")]
             Backing::UdfRw { path } => match path.as_deref() {
                 Some(path) => {
                     let existed = Path::new(path).exists();
@@ -880,9 +880,9 @@ fn build_devices<'a>(
                     backends.push(BlockBackend::Ram(RamBackend::new(slot)));
                 }
             },
-            #[cfg(not(feature = "udf_void"))]
+            #[cfg(not(feature = "udfrw"))]
             Backing::UdfRw { .. } => {
-                eprintln!("snowdrive: udfrw= requires the `udf_void` feature");
+                eprintln!("snowdrive: udfrw= requires the `udfrw` feature");
                 return Err(());
             }
         }
@@ -980,7 +980,7 @@ fn build_devices<'a>(
                 log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
                 drives.push(drive);
             }
-            #[cfg(feature = "udf_void")]
+            #[cfg(feature = "udfrw")]
             (DeviceRole::MmcCd, Backing::UdfRw { path }) => {
                 let be = be_iter
                     .next()

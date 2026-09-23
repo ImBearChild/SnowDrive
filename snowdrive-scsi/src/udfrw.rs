@@ -1,13 +1,14 @@
-//! Empty UDF void volume generation — UDF void volume generation.
+//! UDF-RW empty ("void") volume generation — the pure UDF 2.01 skeleton.
 //!
 //! Pure algorithms: **no storage, no FS, no alloc** — mirror of
 //! `iso9660::live`. The media layer ([`CdMedia::Rw`](crate::cdrom::media::CdMedia::Rw))
 //! materializes an empty volume by calling [`gen_sector`] for every structured LBA into a
 //! writable byte plane (all other sectors stay zero).
 //!
-//! "Void" = this module only produces the empty skeleton; it is **not** a
-//! UDF filesystem implementation (that name is reserved for the media layer,
-//! [`CdMedia::Rw`](crate::cdrom::media::CdMedia::Rw)). It generates the
+//! The volume this module emits is a **void** (empty) skeleton: it is
+//! **not** a UDF filesystem implementation — that layer lives in the media
+//! type [`CdMedia::Rw`](crate::cdrom::media::CdMedia::Rw) (module
+//! `cdrom::udfrw`, which shares this module's name). It generates the
 //! smallest structure that Windows Live File System ("U 盘模式") and Linux
 //! `udf` mount as an empty rewritable disc: a **UDF 2.01 plain-build**
 //! volume. There is no

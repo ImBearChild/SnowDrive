@@ -8,7 +8,7 @@
 //!
 //! - **this crate** — SPC/SBC/MMC command layers, `BlockDevice` /
 //!   [`CdromDrive`](cdrom::CdromDrive), iSCSI target (`iscsi`),
-//!   USB BOT core (`usb`), UDF skeleton ([`udf_void`]).
+//!   USB BOT core (`usb`), UDF skeleton ([`udfrw`]).
 //! - [`snowdrive_common`] — the storage seams everything is written
 //!   against: the capability ladder
 //!   [`common::seekable_storage::FlatData`] →
@@ -45,8 +45,8 @@ pub mod iscsi;
 #[cfg(feature = "usb")]
 pub mod usb;
 
-#[cfg(feature = "udf_void")]
-pub mod udf_void;
+#[cfg(feature = "udfrw")]
+pub mod udfrw;
 
 /// Minimum data-area size for `ScsiDevice::do_cmd`: 8192 bytes.
 ///
