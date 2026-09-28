@@ -100,7 +100,7 @@ class BundleLoopbackTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(header), "BUNDLE header missing")
         with open(header, encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("magic = SNOWBND", content)
+        self.assertIn("magic = snow_flat_bnd", content)
 
         dev = self.session.login(expected_bytes=SIZE_BYTES)
         self.assertTrue(os.path.exists(dev), f"device {dev} missing")

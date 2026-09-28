@@ -52,7 +52,7 @@ pub enum BundleError {
     Fs(FsError),
     /// `BUNDLE` header is not valid UTF-8 / INI / numeric field.
     BadHeader,
-    /// `BUNDLE` header exists but the `magic` value is not `SNOWBND`.
+    /// `BUNDLE` header exists but the `magic` value is not `snow_flat_bnd`.
     BadMagic,
     /// `BUNDLE` header exists but lacks a `magic` key.
     MissingMagic,
@@ -204,7 +204,7 @@ impl<F: FsStorage> FlatBundle<F> {
         use core::fmt::Write as _;
         write!(
             hdr,
-            "magic = SNOWBND\r\nversion = 1\r\nchunk_size = {}\r\nvirtual_size = {}\r\nsector_size = {}\r\n",
+            "magic = snow_flat_bnd\r\nversion = 1\r\nchunk_size = {}\r\nvirtual_size = {}\r\nsector_size = {}\r\n",
             chunk_size, virtual_size, sector_size
         )
         .map_err(|_| BundleError::BadHeader)?;
@@ -540,7 +540,7 @@ fn parse_bundle_header(input: &[u8]) -> Result<BundleHeader, BundleError> {
             ini_core::Item::Property(key, Some(value)) => match key {
                 "magic" => {
                     magic_seen = true;
-                    if value != "SNOWBND" {
+                    if value != "snow_flat_bnd" {
                         return Err(BundleError::BadMagic);
                     }
                 }
@@ -919,7 +919,7 @@ mod tests {
     #[cfg(feature = "bundle")]
     #[test]
     fn header_parse_comments_and_order() {
-        let input = b"; comment\r\nmagic = SNOWBND\r\nversion = 1\r\nchunk_size = 1048576\r\nvirtual_size = 2097152\r\nsector_size = 512\r\n";
+        let input = b"; comment\r\nmagic = snow_flat_bnd\r\nversion = 1\r\nchunk_size = 1048576\r\nvirtual_size = 2097152\r\nsector_size = 512\r\n";
         let h = parse_bundle_header(input).unwrap();
         assert_eq!(h.chunk_size, 1 << 20);
         assert_eq!(h.virtual_size, 2 << 20);
@@ -952,7 +952,7 @@ mod tests {
         let mut f = fs
             .open("BUNDLE", OpenOptions::create_or_truncate())
             .unwrap();
-        embedded_io::Write::write_all(&mut f, b"magic = SNOWBND\r\n").unwrap();
+        embedded_io::Write::write_all(&mut f, b"magic = snow_flat_bnd\r\n").unwrap();
         fs.close(f);
         assert!(matches!(
             FlatBundle::create(fs, 1 << 20, 4 << 20, 512),

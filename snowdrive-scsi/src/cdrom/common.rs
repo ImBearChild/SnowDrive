@@ -1190,7 +1190,7 @@ pub struct DiscInfo {
     /// State of Last Session (MMC-6 Table 366): 0=empty, 1=incomplete,
     /// 3=complete. Valid for `disc_status` = 2/3.
     pub state_of_last_session: u8,
-    /// Erasable bit (byte 2 bit 3): set for CD-RW media.
+    /// Erasable bit (byte 2 bit 4): set for CD-RW media.
     pub erasable: bool,
     /// Number of sessions (byte 4/9).
     pub sessions: u8,

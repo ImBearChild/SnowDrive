@@ -609,7 +609,7 @@ fn serve_starts_with_bundle_disk() {
     let header = std::fs::read(dir.join("BUNDLE")).unwrap_or_default();
     let header = String::from_utf8_lossy(&header);
     assert!(
-        header.contains("magic = SNOWBND"),
+        header.contains("magic = snow_flat_bnd"),
         "BUNDLE magic missing: {header}"
     );
     assert!(
